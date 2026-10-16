@@ -23,6 +23,10 @@ window.__ModuleLoader__.load({
 			pressureTokensHint: "Context size that starts compaction decisions.",
 			retainTokens: "Retained tokens",
 			retainTokensHint: "Recent tokens always kept during compaction.",
+			economyGuidance: "Execution economy note",
+			economyGuidanceHint: "Append one note before the root task's first request asking for batched, narrow tool use.",
+			keepRatio: "Keep ratio",
+			keepRatioHint: "Share of a compacted region's tokens kept by budgeted selection (0.1–0.8).",
 			yamlNote: "Routes, strategy and weights stay in the profile's cordis.patch.yml.",
 			unavailable: "This plugin is not available for configuration.",
 			readOnly: "This deployment stores settings read-only.",
@@ -66,6 +70,10 @@ window.__ModuleLoader__.load({
 			pressureTokensHint: "上下文达到该规模时开始压缩决策。",
 			retainTokens: "保留 tokens",
 			retainTokensHint: "压缩时始终保留的近期 tokens。",
+			economyGuidance: "执行经济提示",
+			economyGuidanceHint: "在根任务首次请求前追加一条提示，要求批量、精准地使用工具。",
+			keepRatio: "保留比例",
+			keepRatioHint: "预算选择保留被压缩区域 tokens 的比例（0.1–0.8）。",
 			yamlNote: "路由、策略与权重仍在 profile 的 cordis.patch.yml 里维护。",
 			unavailable: "该插件当前无法配置。",
 			readOnly: "本部署的设置为只读。",
@@ -93,10 +101,23 @@ window.__ModuleLoader__.load({
 		const NS = "plugins.dshAutoctx";
 		const CONFIG_KEY = "dsh-autoctx#dsh-autoctx";
 		const inject = ["slots", "locale"];
-		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "retainTokens"];
+		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "retainTokens", "keepRatio"];
+		const BOOLEAN_FIELDS = ["economyGuidance"];
+		const booleanField = (field) => ({
+			field,
+			format: (value) => value === true ? "true" : value === false ? "false" : "",
+			parse: (text) => {
+				const trimmed = text.trim();
+				if (trimmed === "") return { kind: "clear" };
+				if (trimmed === "true") return { kind: "set", value: true };
+				if (trimmed === "false") return { kind: "set", value: false };
+				return undefined;
+			}
+		});
 		const specs = Object.fromEntries([
 			ui.settingsTextField("mode"), ui.settingsTextField("jevModel"),
-			...NUMERIC_FIELDS.map((name) => ui.settingsNumberField(name))
+			...NUMERIC_FIELDS.map((name) => ui.settingsNumberField(name)),
+			...BOOLEAN_FIELDS.map(booleanField)
 		].map((spec) => [spec.field, spec]));
 		function AutoConfigCard({ t, view, form }) {
 			if (view === "summary") return t("summary");
@@ -167,6 +188,17 @@ window.__ModuleLoader__.load({
 					}, value)) }),
 					jsx("div", { className: "dac-hint", children: props.hint })
 				] }, name);
+				if (BOOLEAN_FIELDS.includes(name)) return jsxs("div", { className: "dac-toggle", children: [
+					jsxs("div", { className: "dac-toggleRow", children: [
+						jsx("span", { className: "dac-label", children: props.label }),
+						jsx(ui.Switch, {
+							checked: props.text === "true", label: props.label, disabled,
+							onChange: (next) => props.onEdit(next ? "true" : "false")
+						})
+					] }),
+					props.overridden ? jsx("button", { type: "button", className: "dac-link", disabled, onClick: props.onReset, children: props.resetLabel }) : null,
+					jsx("div", { className: "dac-hint", children: props.hint })
+				] }, name);
 				return jsx(ui.SettingsValueField, { ...props, numeric: NUMERIC_FIELDS.includes(name) }, name);
 			};
 			const section = (key) => jsx("h3", { className: "dac-sectionTitle", children: t(key) }, key);
@@ -186,6 +218,7 @@ window.__ModuleLoader__.load({
 					field("jevModel"), field("maxDecisions"),
 					section("sectionSubagents"), field("maxChildren"), field("maxConcurrent"),
 					section("sectionContext"), field("pressureTokens"), field("retainTokens"),
+					field("keepRatio"), field("economyGuidance"),
 					jsx("div", { className: "dac-hint", children: t("yamlNote") })
 				] })
 			});
@@ -227,6 +260,8 @@ window.__ModuleLoader__.load({
 .dac-form{display:flex;flex-direction:column;gap:6px;max-width:560px}
 .dac-mode{display:flex;flex-direction:column;gap:6px;padding:4px 0 8px}
 .dac-modeHead{display:flex;align-items:baseline;justify-content:space-between}
+.dac-toggle{display:flex;flex-direction:column;gap:6px;padding:4px 0 8px}
+.dac-toggleRow{display:flex;align-items:center;justify-content:space-between;gap:16px}
 .dac-label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}
 .dac-link{font:inherit;font-size:12px;color:var(--dsw-alias-state-business-primary);background:none;border:0;padding:0;cursor:pointer}
 .dac-seg{display:inline-flex;align-self:flex-start;gap:2px;padding:2px;border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-3);border:.5px solid var(--dsw-alias-border-l3)}

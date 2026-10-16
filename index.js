@@ -10,6 +10,8 @@ import { validateJsonSchemaValue, ToolArgsError } from "@deepseek-ai/dsh-tools";
 import { toolPairingBalancedBefore, toolPairingBalancedAfter } from "@deepseek-ai/dsh-compaction";
 import {
   scoreContext,
+  budgetedSelection,
+  droppedUnitLine,
   selectionBatch,
   extendTask,
   createDecisionMemo,
@@ -115,6 +117,18 @@ export const Config = z.object({
     .default(8000)
     .volatile()
     .description("Recent tokens always kept during compaction"),
+  economyGuidance: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description("Append one execution-economy note before the root task's first model request"),
+  keepRatio: z
+    .number()
+    .min(0.1)
+    .max(0.8)
+    .default(0.35)
+    .volatile()
+    .description("Share of a compacted region's tokens kept by budgeted selection"),
   nativeThresholdRatio: z.number().min(0.01).max(1).default(0.8),
   recordFile: z.string(),
 });
@@ -127,8 +141,14 @@ const text = (m) =>
 const note = (value) =>
   createUserMessage({
     content: [{ type: "text", text: value }],
-    source: { kind: "plugin", plugin: "dsh-autoctx" },
+    source: { kind: "dsh-autoctx" },
   });
+const ECONOMY_GUIDANCE =
+  "Execution economy: every model request is budgeted. Put independent tool calls (reads, searches, listings, test runs) in the same step. Read only the needed ranges; search before opening files; do not re-read content already shown. Run the narrowest relevant tests first, and stop once the fix is verified.";
+const isEconomyGuidance = (message) =>
+  message?.role === "user" &&
+  message.source.kind === "dsh-autoctx" &&
+  text(message) === ECONOMY_GUIDANCE;
 const redact = (value, secret) => (secret ? value.split(secret).join("[redacted]") : value);
 const boundedEvidence = (units) => {
   const currentEvidence = [],
@@ -139,6 +159,23 @@ const boundedEvidence = (units) => {
     else recentEvidenceOutsideBudget.push(unit.id);
   }
   return { currentEvidence, recentEvidenceOutsideBudget };
+};
+// The salient argument is the one a compact dropped-unit line can carry:
+// the path, pattern or command a later step must not blindly repeat.
+const ARGUMENT_KEYS = ["file_path", "path", "pattern", "command", "query", "url", "agent_id"];
+const salientArgument = (raw) => {
+  let args;
+  try {
+    args = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!args || typeof args !== "object") return undefined;
+  for (const key of ARGUMENT_KEYS) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) return value.trim().replace(/\s+/g, " ");
+  }
+  return undefined;
 };
 // Auto needs at least one route; the session's configured native model is the safe default.
 export const buildDefaultRoute = (options) => ({
@@ -169,8 +206,7 @@ export function apply(ctx, options) {
   const active = new Map(),
     settled = new Map(),
     waiters = new Map(),
-    prepared = new Map(),
-    nextPressure = new Map();
+    prepared = new Map();
   const pressureAnchors = new Map(),
     memos = new Map();
   const declinedDelegation = new Set();
@@ -903,10 +939,31 @@ export function apply(ctx, options) {
       }
     }
     if (agent.session.requestHeader() !== undefined) {
-      if (modeOf(agent) !== "auto") await getCompactor().compactIfNeeded(agent, "pressure", signal);
-      else await selectUnderPressure(agent, signal);
+      if (modeOf(agent) !== "auto") {
+        try {
+          await getCompactor().compactIfNeeded(agent, "pressure", signal);
+        } catch (error) {
+          if (signal.aborted) throw error;
+          record({ kind: "context_unshrinkable", session: id, error: String(error) });
+        }
+      } else await selectUnderPressure(agent, signal);
     }
-    return next();
+    const admitted = await next();
+    if (admitted.kind === "reject" || isChild) return admitted;
+    const guidance = agent.session
+      .snapshotEvents()
+      .filter(
+        (event) =>
+          event.type === "user/message" &&
+          isEconomyGuidance(agent.session.deriveEventMessage(event)),
+      );
+    if (
+      (!config.economyGuidance && guidance.length === 0) ||
+      guidance.some((event) => agent.session.surface.nodes.includes(event.seq))
+    )
+      return admitted;
+    record({ kind: "economy_guidance", session: id });
+    return { ...admitted, messages: [...(admitted.messages ?? []), note(ECONOMY_GUIDANCE)] };
   });
   ctx.on("llm/stream", async function* (options, next) {
     const agent = options.sessionId ? ctx.agents.get(options.sessionId) : undefined;
@@ -969,14 +1026,7 @@ export function apply(ctx, options) {
       ? anchor.input + Math.max(0, measured.totalTokens - anchor.estimate)
       : measured.totalTokens;
     const ceiling = Math.ceil(config.pressureTokens * config.ceilingRatio);
-    if (
-      pressure <
-      Math.min(
-        ceiling,
-        Math.max(config.pressureTokens, nextPressure.get(id) ?? config.pressureTokens),
-      )
-    )
-      return;
+    if (pressure < config.pressureTokens) return;
     record({
       kind: "context_pressure",
       session: id,
@@ -1010,12 +1060,12 @@ export function apply(ctx, options) {
     // The head (system + first user task) and the recent tail stay untouched, so
     // the cached prompt prefix survives the replacement.
     const fullEnd = end;
-    const compactRegion = async (reason, regionEnd = fullEnd) => {
+    const compactRegion = async (reason) => {
       signal.throwIfAborted();
       try {
         const result = await getCompactor().compactRegion(
           nodes[start],
-          nodes[regionEnd],
+          nodes[fullEnd],
           agent,
           signal,
         );
@@ -1023,18 +1073,17 @@ export function apply(ctx, options) {
           kind: "context_replaced",
           session: id,
           start: nodes[start],
-          end: nodes[regionEnd],
+          end: nodes[fullEnd],
           reason,
           sourceCount: result.shadowedSeqs.length,
         });
-        nextPressure.delete(id);
       } catch (error) {
         if (signal.aborted) throw error;
         record({
           kind: "context_unshrinkable",
           session: id,
           start: nodes[start],
-          end: nodes[regionEnd],
+          end: nodes[fullEnd],
           pressure,
           ceiling,
           reason,
@@ -1046,11 +1095,19 @@ export function apply(ctx, options) {
       await compactRegion("ceiling_reduced_retention");
       return;
     }
-    const units = (items) =>
-      items.flatMap(({ seq, message }) => {
+    const units = (items) => {
+      // The dropped index names the tool a unit came from, so a tool result is
+      // linked back to its call through the provider-issued call id.
+      const calls = new Map();
+      for (const { message } of items)
+        for (const block of message.content)
+          if (block.type === "tool-call")
+            calls.set(block.id, { tool: block.name, argument: salientArgument(block.arguments) });
+      return items.flatMap(({ seq, message }) => {
         const required =
           message.role === "system" ||
           message.source.kind === "user" ||
+          isEconomyGuidance(message) ||
           (agent.session.header.parentSession !== undefined &&
             message.source.kind === "agent-message" &&
             message.source.senderSessionId === rootOf(agent));
@@ -1065,14 +1122,24 @@ export function apply(ctx, options) {
           ];
         // Logical blocks keep final evidence separate from speculative reasoning.
         // Every block is complete; the original full messages stay in the journal.
-        return message.content.map((block, i) => ({
-          id: "event_" + seq + "_block_" + i,
-          kind: message.role + "/" + block.type,
-          text: JSON.stringify(block),
-          required: false,
-        }));
+        return message.content.map((block, i) => {
+          const call =
+            block.type === "tool-call"
+              ? { tool: block.name, argument: salientArgument(block.arguments) }
+              : message.source.kind === "tool"
+                ? calls.get(message.source.callId)
+                : undefined;
+          return {
+            id: "event_" + seq + "_block_" + i,
+            kind: message.role + "/" + block.type,
+            text: JSON.stringify(block),
+            required: false,
+            ...(call ?? {}),
+          };
+        });
       });
-    let history = units(region(nodes, start, end, agent));
+    };
+    const history = units(region(nodes, start, end, agent));
     const recent = units(region(nodes, end + 1, nodes.length - 1, agent))
       .filter((x) => !x.kind.endsWith("/reasoning"))
       .slice(-3);
@@ -1103,30 +1170,6 @@ export function apply(ctx, options) {
       await compactRegion("decision_budget");
       return;
     }
-    const covered = new Set(batch.history.map((unit) => unit.id));
-    let coveredEnd = start - 1;
-    for (let index = start; index <= end; index++) {
-      if (
-        units(region(nodes, index, index, agent)).some(
-          (unit) => !unit.required && !covered.has(unit.id),
-        )
-      )
-        break;
-      if (toolPairingBalancedAfter(agent.session, nodes[index])) coveredEnd = index;
-    }
-    if (coveredEnd < start) {
-      await compactRegion("selection_does_not_fit");
-      return;
-    }
-    end = coveredEnd;
-    history = units(region(nodes, start, end, agent));
-    const sourceIds = new Set(history.map((unit) => unit.id));
-    batch.history = batch.history.filter((unit) => sourceIds.has(unit.id));
-    if (!batch.history.length) {
-      await compactRegion("selection_does_not_fit");
-      return;
-    }
-    const weights = roots.get(rootOf(agent))?.policy?.weights ?? { quality: 0.5, cache: 0.5 };
     let selection;
     try {
       const children = await ctx.subagents.listChildren(rootOf(agent), signal);
@@ -1138,9 +1181,7 @@ export function apply(ctx, options) {
       selection = await scoreContext(
         (request) => decide(agent, request, signal),
         batch,
-        history,
         owners,
-        0.4 + 0.2 * weights.quality,
       );
     } catch (error) {
       if (signal.aborted) throw error;
@@ -1149,45 +1190,45 @@ export function apply(ctx, options) {
       return;
     }
     signal.throwIfAborted();
-    const selected = new Set(selection.selectedIds);
+    const unitText = (unit) => unit.kind + ":\n" + unit.text;
+    const tokensOf = (unit) => ctx.tokenMeter.estimateMessage(note(unitText(unit)));
+    const regionTokens = measured.nodes.slice(start, end + 1).reduce((n, node) => n + node.tokens, 0);
+    const budgeted = budgetedSelection(
+      history,
+      selection.judgments,
+      config.keepRatio * regionTokens,
+      tokensOf,
+    );
+    const kept = new Set(budgeted.keptIds);
+    const dropped = history.filter((unit) => !kept.has(unit.id));
     const summary = history
-      .filter((x) => selected.has(x.id))
-      .map((x) => ({ type: "text", text: x.kind + ":\n" + x.text }));
-    if (!summary.length)
+      .filter((unit) => kept.has(unit.id))
+      .map((unit) => ({ type: "text", text: unitText(unit) }));
+    if (dropped.length)
       summary.push({
         type: "text",
-        text: "Earlier unrelated evidence was archived; the complete original events remain in this session journal.",
+        text:
+          "Archived units (already examined; listed for avoidance, content removed):\n" +
+          dropped.map(droppedUnitLine).join("\n"),
       });
-    const removedTokens = measured.nodes
-      .slice(start, end + 1)
-      .reduce((n, node) => n + node.tokens, 0);
     const replacementTokens =
       ctx.tokenMeter.estimateMessage(note(summary.map((x) => x.text).join("\n"))) + 200;
     record({
       kind: "context_scores",
       session: id,
       judgments: selection.judgments,
-      estimatedBefore: removedTokens,
+      kept: kept.size,
+      dropped: dropped.length,
+      estimatedBefore: regionTokens,
       estimatedAfter: replacementTokens,
     });
-    const minimumReduction = 0.1 + 0.1 * weights.cache;
-    if (replacementTokens >= removedTokens * (1 - minimumReduction)) {
-      if (pressure >= ceiling) {
-        await compactRegion("ceiling_native");
-        return;
-      }
-      record({
-        kind: "context_kept",
-        session: id,
-        reason: "Scored sources do not offer a meaningful reduction",
-        estimatedContextTokens: measured.totalTokens,
-      });
-      nextPressure.set(id, Math.min(ceiling, Math.ceil(pressure * (1.25 + 0.5 * weights.cache))));
+    if (replacementTokens > regionTokens * 0.8) {
+      await compactRegion(pressure >= ceiling ? "ceiling_native" : "selection_shortfall");
       return;
     }
     prepared.set(id, { summary, model: selection.model });
     try {
-      await compactRegion("replacement", end);
+      await compactRegion("replacement");
     } finally {
       prepared.delete(id);
     }

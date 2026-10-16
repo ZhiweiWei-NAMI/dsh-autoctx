@@ -7,6 +7,8 @@ import {
   STATE_BYTES,
   selectionBatch,
   scoreContext,
+  budgetedSelection,
+  droppedUnitLine,
   extendTask,
   createDecisionMemo,
 } from "../decisions.js";
@@ -282,7 +284,7 @@ test("continued user requirements preserve complete tails and update the decisio
   assert.ok(!updated.includes("transient plugin"));
 });
 
-test("a batch keeps the oldest complete candidates without truncating text or skipping reasoning", () => {
+test("a batch requires all complete candidates to fit without truncating text or skipping reasoning", () => {
   const history = [
     { id: "oldest", kind: "assistant/reasoning", text: "Evidence " + "x".repeat(1600) },
     ...Array.from({ length: 32 }, (_, i) => ({
@@ -291,7 +293,8 @@ test("a batch keeps the oldest complete candidates without truncating text or sk
       text: "Evidence " + i,
     })),
   ];
-  const batch = selectionBatch("Task", history);
+  assert.equal(selectionBatch("Task", history), null);
+  const batch = selectionBatch("Task", history.slice(0, 32));
   assert.deepEqual(batch.history, history.slice(0, 32));
   assert.ok(Buffer.byteLength(JSON.stringify(batch)) <= STATE_BYTES);
   assert.equal(
@@ -340,7 +343,7 @@ test("identical decision requests reuse one response and retry after failure", a
   assert.equal(retried, 1);
 });
 
-test("a judged complete unit selects the whole original source", async () => {
+test("complete sources receive relevance and ownership judgments in one call", async () => {
   const full = "实验记录😃\n".repeat(500) + "USEFUL_REQUIREMENT";
   const history = [
     { id: "instruction", kind: "user", text: "Keep the public API.", required: true },
@@ -364,14 +367,14 @@ test("a judged complete unit selects the whole original source", async () => {
       return { model: "jev-1.13-free", answers };
     },
     selectionBatch("Fix the public API.", history),
-    history,
     {},
   );
   assert.equal(calls, 1);
-  assert.deepEqual(result.selectedIds, ["instruction", "long"]);
+  assert.deepEqual(result.judgments.map((judgment) => judgment.source), ["long", "old"]);
+  assert.deepEqual(result.judgments.map((judgment) => judgment.importance.score), [2, 0]);
 });
 
-test("no uncertain context score is treated as evidence to discard the source", async () => {
+test("uncertain context scores are returned unchanged for budgeted selection", async () => {
   const history = [{ id: "evidence", text: "Potentially essential evidence", required: false }];
   const result = await scoreContext(
     async () => ({
@@ -382,10 +385,14 @@ test("no uncertain context score is treated as evidence to discard the source", 
       },
     }),
     selectionBatch("Task", history),
-    history,
     {},
   );
-  assert.deepEqual(result.selectedIds, ["evidence"]);
+  assert.deepEqual(result.judgments, [{
+    source: "evidence",
+    part: "evidence",
+    importance: { score: 0.2, confidence: 0.1 },
+    owner: { choice: "archive", confidence: 0.9 },
+  }]);
 });
 
 test("a failed primitive request is not retried or replaced with a synthetic keep", async () => {
@@ -398,7 +405,6 @@ test("a failed primitive request is not retried or replaced with a synthetic kee
         throw new Error("HTTP 401");
       },
       selectionBatch("Task", history),
-      history,
       {},
     ),
     /HTTP 401/,
@@ -435,6 +441,8 @@ function autoComposition(options = {}) {
     pressureTokens: 2000,
     ceilingRatio: 1.5,
     retainTokens: 1024,
+    economyGuidance: true,
+    keepRatio: 0.35,
     ...options,
   };
   const events = [
@@ -655,22 +663,32 @@ function nativeCompaction(t) {
   return { summarize, compact };
 }
 
-test("lowering the live ceiling forces native shrink of a single old message after Jev keeps it", async (t) => {
-  const native = nativeCompaction(t);
+test("a budgeted selection replaces the old region with the kept subset and a dropped index", async (t) => {
+  const native = nativeCompaction(t),
+    records = [];
+  t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
   const fetch = t.mock.method(globalThis, "fetch", async (url, { body }) => jevReply(body));
-  const app = autoComposition({ pressure: true, pressureTokens: 3000 });
+  const app = autoComposition({
+    pressure: true,
+    pressureTokens: 3000,
+    recordFile: "context-decisions.jsonl",
+  });
   const original = app.agent.session.snapshotEvents().map((event) => JSON.stringify(event));
   await app.step();
-  assert.equal(native.compact.mock.callCount(), 0);
-  app.config.pressureTokens = 2000;
-  await app.step();
   assert.equal(native.compact.mock.callCount(), 1);
-  assert.equal(native.summarize.mock.callCount(), 1);
   assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 2]);
+  assert.equal(fetch.mock.callCount(), 1);
+  const scored = records.find((record) => record.kind === "context_scores");
+  assert.equal(scored.dropped, 1);
+  assert.equal(scored.kept, 0);
+  assert.ok(
+    records.some((record) => record.kind === "context_replaced" && record.reason === "replacement"),
+  );
   const after = app.agent.session.snapshotEvents().map((event) => JSON.stringify(event));
   assert.ok(after[2].length < original[2].length);
+  assert.match(after[2], /Archived units/);
+  assert.match(after[2], /assistant\/text/);
   assert.deepEqual([after[0], after[1], after[3]], [original[0], original[1], original[3]]);
-  assert.equal(fetch.mock.callCount(), 1);
 });
 
 test("a Jev HTTP failure below the ceiling uses the native summarizer", async (t) => {
@@ -872,48 +890,28 @@ function contextHistory(app, contents) {
   return events;
 }
 
-function archiveReply(body) {
-  const response = jevReply(body);
-  return {
-    ...response,
-    text: async () => {
-      const result = JSON.parse(await response.text());
-      for (const answer of Object.values(result.answers)) {
-        if (answer.type === "score") answer.score = 0;
-        if (answer.type === "choice") answer.choice = "archive";
-      }
-      return JSON.stringify(result);
-    },
-  };
-}
-
-test("33 candidates replace only the 32 oldest judged events", async (t) => {
-  const native = nativeCompaction(t),
-    requests = [];
-  t.mock.method(globalThis, "fetch", async (url, { body }) => {
-    requests.push(JSON.parse(JSON.parse(body).state));
-    return archiveReply(body);
+test("33 candidates use native compaction for the full region without Jev", async (t) => {
+  const native = nativeCompaction(t);
+  const fetch = t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("Unexpected Jev call");
   });
   const app = autoComposition({ pressure: true });
   const events = contextHistory(
     app,
     Array.from({ length: 33 }, (_, i) => [{ type: "text", text: "Source " + i }]),
   );
-  const remaining = JSON.stringify(events.slice(34));
+  const remaining = JSON.stringify(events.slice(35));
   await app.step();
-  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 33]);
-  assert.equal(requests[0].history.length, 32);
-  assert.equal(requests[0].history[0].id, "event_2_block_0");
-  assert.equal(requests[0].history.at(-1).id, "event_33_block_0");
-  assert.equal(JSON.stringify(events.slice(34)), remaining);
+  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 34]);
+  assert.equal(native.summarize.mock.callCount(), 1);
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(JSON.stringify(events.slice(35)), remaining);
 });
 
-test("a partial tool result leaves the whole tool exchange outside the replacement", async (t) => {
-  const native = nativeCompaction(t),
-    requests = [];
-  t.mock.method(globalThis, "fetch", async (url, { body }) => {
-    requests.push(JSON.parse(JSON.parse(body).state));
-    return archiveReply(body);
+test("a tool exchange that exceeds one batch is included in full native compaction", async (t) => {
+  const native = nativeCompaction(t);
+  const fetch = t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("Unexpected Jev call");
   });
   const app = autoComposition({ pressure: true });
   const events = contextHistory(app, [
@@ -926,11 +924,12 @@ test("a partial tool result leaves the whole tool exchange outside the replaceme
   ]);
   events[33].type = "tool/result";
   events[33].data.message.role = "tool";
-  const remaining = JSON.stringify(events.slice(32));
+  const remaining = JSON.stringify(events.slice(34));
   await app.step();
-  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 31]);
-  assert.equal(requests[0].history.length, 30);
-  assert.equal(JSON.stringify(events.slice(32)), remaining);
+  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 33]);
+  assert.equal(native.summarize.mock.callCount(), 1);
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(JSON.stringify(events.slice(34)), remaining);
 });
 
 test("an oversized candidate goes intact to the native summarizer", async (t) => {
@@ -956,12 +955,10 @@ test("an oversized candidate goes intact to the native summarizer", async (t) =>
   assert.equal(fetch.mock.callCount(), 0);
 });
 
-test("ceiling fallback compacts an oversized event after a tiny judged prefix", async (t) => {
-  const native = nativeCompaction(t),
-    requests = [];
-  t.mock.method(globalThis, "fetch", async (url, { body }) => {
-    requests.push(JSON.parse(JSON.parse(body).state));
-    return jevReply(body);
+test("ceiling fallback compacts a tiny prefix and oversized event without Jev", async (t) => {
+  const native = nativeCompaction(t);
+  const fetch = t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("Unexpected Jev call");
   });
   const app = autoComposition({ pressure: true });
   const full = "x".repeat(STATE_BYTES) + "ESSENTIAL_TAIL";
@@ -971,11 +968,7 @@ test("ceiling fallback compacts an oversized event after a tiny judged prefix", 
   app.ctx.tokenMeter.measure = () => ({ totalTokens, nodes });
   assert.ok(totalTokens > app.config.pressureTokens * app.config.ceilingRatio);
   await app.step();
-  assert.equal(requests.length, 1);
-  assert.deepEqual(
-    requests[0].history.map((unit) => unit.id),
-    ["event_2_block_0"],
-  );
+  assert.equal(fetch.mock.callCount(), 0);
   assert.equal(native.compact.mock.callCount(), 1);
   assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 3]);
   assert.equal(native.summarize.mock.callCount(), 1);
@@ -1008,7 +1001,7 @@ test("a native failure after Jev fails records the error and continues", async (
   );
 });
 
-test("a native ceiling failure continues but a signal abort still propagates", async (t) => {
+test("a replacement failure continues but a signal abort still propagates", async (t) => {
   const records = [];
   t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
   t.mock.method(globalThis, "fetch", async (url, { body }) => jevReply(body));
@@ -1021,7 +1014,7 @@ test("a native ceiling failure continues but a signal abort still propagates", a
     records.some(
       (record) =>
         record.kind === "context_unshrinkable" &&
-        record.reason === "ceiling_native" &&
+        record.reason === "replacement" &&
         /Connection closed/.test(record.error),
     ),
   );
@@ -1032,4 +1025,218 @@ test("a native ceiling failure continues but a signal abort still propagates", a
   });
   await assert.rejects(app.step(controller.signal), /cancelled native compaction/);
   assert.equal(records.filter((record) => record.kind === "context_unshrinkable").length, 1);
+});
+
+const guidanceText = (messages = []) =>
+  messages
+    .filter((m) => m.source.kind === "dsh-autoctx")
+    .map((m) => m.content[0].text)
+    .join("\n");
+
+function commitGuidance(app, message) {
+  const events = app.agent.session.snapshotEvents();
+  const seq = events.length;
+  events.push({ seq, type: "user/message", data: { message } });
+  app.agent.session.surface.nodes.push(seq);
+}
+
+test("resumed roots tolerate native compaction errors but propagate cancellation", async (t) => {
+  const records = [];
+  t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
+  const compact = t.mock.method(BasicCompactionEngine.prototype, "compactIfNeeded", async () => {
+    throw new Error("compacted context remains above threshold");
+  });
+  const app = autoComposition({
+    mode: "single",
+    pressure: true,
+    recordFile: "context-decisions.jsonl",
+  });
+  assert.equal((await app.step()).kind, "continue");
+  assert.match(
+    records.find((record) => record.kind === "context_unshrinkable").error,
+    /above threshold/,
+  );
+  compact.mock.mockImplementation(async () => {
+    throw new DOMException("Connection closed", "AbortError");
+  });
+  const native = autoComposition({
+    mode: "native",
+    pressure: true,
+    recordFile: "context-decisions.jsonl",
+  });
+  assert.equal((await native.step()).kind, "continue");
+  assert.match(
+    records.filter((record) => record.kind === "context_unshrinkable").at(-1).error,
+    /Connection closed/,
+  );
+  const controller = new AbortController();
+  compact.mock.mockImplementation(async () => {
+    controller.abort(new Error("cancelled native compaction"));
+    throw controller.signal.reason;
+  });
+  await assert.rejects(app.step(controller.signal), /cancelled native compaction/);
+  assert.equal(records.filter((record) => record.kind === "context_unshrinkable").length, 2);
+});
+
+test("the economy note is appended exactly once for a root and never for a child", async (t) => {
+  const records = [];
+  t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
+  t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("Unexpected Jev call");
+  });
+  const app = autoComposition({ recordFile: "context-decisions.jsonl" });
+  const first = await app.step();
+  assert.match(guidanceText(first.messages), /Execution economy/);
+  assert.ok(records.some((record) => record.kind === "economy_guidance"));
+  commitGuidance(app, first.messages[0]);
+  const second = await app.step();
+  assert.equal(guidanceText(second.messages), "");
+  assert.equal(records.filter((record) => record.kind === "economy_guidance").length, 1);
+  const child = {
+    session: {
+      id: "child",
+      header: { parentSession: "root" },
+      snapshotEvents: () => [],
+      requestHeader: () => undefined,
+    },
+  };
+  app.agents.set("child", child);
+  const admitted = await app.handlers.get("agent/pre-step")(
+    { agent: child, messages: [], turn: "turn", signal: new AbortController().signal },
+    async () => ({ kind: "enter", messages: [] }),
+  );
+  assert.equal(guidanceText(admitted.messages), "");
+});
+
+test("uncommitted guidance is retried and committed guidance survives a plugin restart", async () => {
+  const app = autoComposition({ mode: "single" });
+  const first = await app.step();
+  const retry = await app.step();
+  assert.equal(guidanceText(retry.messages), guidanceText(first.messages));
+  assert.equal(retry.messages[0].role, "user");
+  assert.deepEqual(retry.messages[0].source, { kind: "dsh-autoctx" });
+  commitGuidance(app, retry.messages[0]);
+  apply(app.ctx, app.config);
+  assert.equal(guidanceText((await app.step()).messages), "");
+});
+
+test("native compaction restores guidance once despite a post-replacement error", async (t) => {
+  const app = autoComposition({ mode: "native" });
+  const first = await app.step();
+  commitGuidance(app, first.messages[0]);
+  app.agent.session.requestHeader = () => ({});
+  t.mock.method(BasicCompactionEngine.prototype, "compactIfNeeded", async () => {
+    app.agent.session.surface.nodes = [];
+    throw new Error("compacted context remains above threshold");
+  });
+  const restored = await app.step();
+  assert.equal(guidanceText(restored.messages), guidanceText(first.messages));
+  assert.equal(restored.messages.length, 1);
+  commitGuidance(app, restored.messages[0]);
+  app.agent.session.requestHeader = () => undefined;
+  assert.equal(guidanceText((await app.step()).messages), "");
+});
+
+test("region selection requires guidance and restores its message after replacement", async (t) => {
+  const app = autoComposition();
+  const first = await app.step();
+  const events = contextHistory(app, [
+    first.messages[0].content,
+    [{ type: "text", text: "e".repeat(10000) }],
+  ]);
+  events[2].type = "user/message";
+  events[2].data.message = first.messages[0];
+  app.config.keepRatio = 0;
+  app.agent.session.requestHeader = () => ({});
+  const fetch = t.mock.method(globalThis, "fetch", async (url, { body }) => {
+    const state = JSON.parse(JSON.parse(body).state);
+    assert.deepEqual(state.history.map((unit) => unit.id), ["event_3_block_0"]);
+    return jevReply(body);
+  });
+  const compact = t.mock.method(
+    BasicCompactionEngine.prototype,
+    "compactRegion",
+    async function (start, end, agent, signal) {
+      const result = await this.summarize({}, agent, signal);
+      assert.ok(result.summary.some((block) => block.text.includes(guidanceText(first.messages))));
+      const shadowedSeqs = agent.session.surface.nodes.filter((seq) => seq >= start && seq <= end);
+      agent.session.surface.nodes = agent.session.surface.nodes.filter(
+        (seq) => !shadowedSeqs.includes(seq),
+      );
+      return { shadowedSeqs };
+    },
+  );
+  const restored = await app.step();
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(compact.mock.callCount(), 1);
+  assert.equal(guidanceText(restored.messages), guidanceText(first.messages));
+  assert.equal(restored.messages.length, 1);
+  commitGuidance(app, restored.messages[0]);
+  app.agent.session.requestHeader = () => undefined;
+  assert.equal(guidanceText((await app.step()).messages), "");
+});
+
+test("the economy note is not appended when the setting is disabled", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("Unexpected Jev call");
+  });
+  const admitted = await autoComposition({ economyGuidance: false }).step();
+  assert.equal(guidanceText(admitted.messages), "");
+});
+
+test("budgeted selection keeps top scores in original order and always keeps required units", () => {
+  const history = [
+    { id: "a", required: false },
+    { id: "req", required: true },
+    { id: "b", required: false },
+    { id: "c", required: false },
+  ];
+  const judgments = [
+    { source: "a", importance: { score: 0.9, confidence: 0.9 }, owner: { choice: "current" } },
+    { source: "b", importance: { score: 1, confidence: 0.9 }, owner: { choice: "archive" } },
+    { source: "c", importance: { score: 1.1, confidence: 0.9 }, owner: { choice: "shared" } },
+  ];
+  const costs = { a: 5, req: 10, b: 12, c: 8 };
+  const tokensOf = (unit) => costs[unit.id];
+  const result = budgetedSelection(history, judgments, 30, tokensOf);
+  assert.deepEqual(result.keptIds, ["req", "b", "c"]);
+  assert.deepEqual(result.droppedIds, ["a"]);
+  assert.equal(result.usedTokens, 30);
+});
+
+test("the dropped index names one unit per line and never exceeds its bound", () => {
+  const line = droppedUnitLine({ kind: "assistant/tool-result", tool: "read", argument: "src/x.js" });
+  assert.equal(line, "assistant/tool-result read (src/x.js)");
+  const long = droppedUnitLine({
+    kind: "assistant/tool-call",
+    tool: "bash",
+    argument: "x".repeat(400),
+  });
+  assert.ok(long.length <= 160);
+});
+
+test("a selection under twenty percent reduction falls back to native compaction", async (t) => {
+  const native = nativeCompaction(t),
+    records = [];
+  t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
+  t.mock.method(globalThis, "fetch", async (url, { body }) => jevReply(body));
+  const app = autoComposition({ pressure: true, keepRatio: 0.8, recordFile: "context-decisions.jsonl" });
+  const events = contextHistory(app, [
+    [{ type: "text", text: "r".repeat(3000) }],
+    [{ type: "text", text: "a".repeat(1000) }],
+  ]);
+  events[2].data.message.source = { kind: "user" };
+  events[2].data.message.role = "user";
+  app.ctx.tokenMeter.measure = () => ({
+    totalTokens: 2224,
+    nodes: [100, 100, 750, 250, 1024].map((tokens) => ({ tokens })),
+  });
+  await app.step();
+  assert.equal(native.compact.mock.callCount(), 1);
+  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 3]);
+  assert.ok(
+    records.some(
+      (record) => record.kind === "context_replaced" && record.reason === "selection_shortfall",
+    ),
+  );
 });
