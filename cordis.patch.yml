@@ -2,5 +2,5 @@
 - id: compaction-basic
   disabled: true
 - insert:
-    - id: dsh-auto-context
-      name: dsh-auto-context
+    - id: dsh-autoctx
+      name: dsh-autoctx

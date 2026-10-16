@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-	id: "dsh-auto-context",
+	id: "dsh-autoctx",
 	factory: (require) => {
 		const react = require("react");
 		const { jsx, jsxs } = require("react/jsx-runtime");
@@ -90,8 +90,8 @@ window.__ModuleLoader__.load({
 			statsSaved: "已节省 {n} tokens",
 			statsLastRoute: "最近路由"
 		};
-		const NS = "plugins.dshAutoContext";
-		const CONFIG_KEY = "dsh-auto-context#dsh-auto-context";
+		const NS = "plugins.dshAutoctx";
+		const CONFIG_KEY = "dsh-autoctx#dsh-autoctx";
 		const inject = ["slots", "locale"];
 		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "retainTokens"];
 		const specs = Object.fromEntries([
@@ -108,7 +108,7 @@ window.__ModuleLoader__.load({
 			const [failed, setFailed] = react.useState(false);
 			const [keySet, setKeySet] = react.useState(false);
 			react.useEffect(() => {
-				fetch(new URL("./api/dsh-auto-context/stats", document.baseURI)).then((response) => response.ok ? response.json() : null)
+				fetch(new URL("./api/dsh-autoctx/stats", document.baseURI)).then((response) => response.ok ? response.json() : null)
 					.then((body) => setKeySet(!!body?.apiKeyConfigured)).catch(() => {});
 			}, [saving]);
 			const snapshot = form?.state;
@@ -240,7 +240,7 @@ window.__ModuleLoader__.load({
 			const [open, setOpen] = react.useState(false);
 			react.useEffect(() => {
 				if (!sessionId) return;
-				const url = new URL("./api/dsh-auto-context/stats?session=" + encodeURIComponent(sessionId), document.baseURI);
+				const url = new URL("./api/dsh-autoctx/stats?session=" + encodeURIComponent(sessionId), document.baseURI);
 				let alive = true;
 				setStats(null);
 				const pull = () => {
@@ -308,24 +308,24 @@ window.__ModuleLoader__.load({
 			});
 		}
 		function apply(ctx) {
-			ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-auto-context: dictionaries");
+			ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-autoctx: dictionaries");
 			ctx.effect(() => {
 				const style = document.createElement("style");
 				style.textContent = CSS;
 				document.head.append(style);
 				return () => style.remove();
-			}, "dsh-auto-context: styles");
+			}, "dsh-autoctx: styles");
 			ctx.effect(() => ctx.slots.inject("plugins.row.config", () => ctx.slots.register({
 				name: "plugins.row.config",
 				key: CONFIG_KEY,
 				locale: NS
-			}, AutoConfigCard)), "dsh-auto-context: row config page");
+			}, AutoConfigCard)), "dsh-autoctx: row config page");
 			ctx.effect(() => ctx.slots.inject("conversation.input.right", () => ctx.slots.register({
 				name: "conversation.input.right",
-				id: "dsh-auto-context-stats",
+				id: "dsh-autoctx-stats",
 				order: 30,
 				locale: NS
-			}, StatsChip)), "dsh-auto-context: composer stats chip");
+			}, StatsChip)), "dsh-autoctx: composer stats chip");
 		}
 		return { apply, inject };
 	}

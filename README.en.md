@@ -1,16 +1,16 @@
-# dsh-auto-context (standalone)
+# dsh-autoctx (standalone)
 
 Auto decision plugin for dsh. With your own API key set it calls `jev-1.13-free` directly for structured decisions; the plugin implements those decisions through native dsh sessions, tools and subagents. The main agent and children use the configured execution model. The plugin contains no agent execution runtime and no external gateway. See [README.md](README.md) for the full Chinese documentation.
 
 Requires dsh `0.1.5-rc.1` or `0.2.x` (verified on `0.2.0-rc.2`).
 
-## Upgrading from 0.5.x
+## Upgrading from 0.6.x
 
-From 0.6.0 the plugin is renamed `dsh-auto-context`: rename the `dsh-auto` entry in your profile overrides to `dsh-auto-context`, uninstall the old package (`dsh plugin --profile auto remove dsh-auto`) and install the new one. The storage domain stays `dsh_auto`, so existing policy data keeps working.
+From 0.7.0 the plugin is renamed `dsh-autoctx`: rename the `dsh-auto-context` entry in your profile overrides to `dsh-autoctx`, uninstall the old package (`dsh plugin --profile auto remove dsh-auto-context`) and install the new one. The storage domain stays `dsh_auto`, so existing policy data keeps working.
 
 ## Settings page and composer chip (new in 0.6.0)
 
-The plugin ships a browser page: **Plugins → dsh-auto-context → Configure** edits the mode, Jev API key, Jev model, decision budget, subagent and context fields; routes, strategy and weights remain in YAML. Once a session has been touched by Auto, a small statistics chip appears at the right of the composer: a ring shows context pressure, the numbers are `decisions/budget · running subagents`, and hovering opens a card with mode, decision progress, subagents, context usage, compactions with tokens saved, and the last route.
+The plugin ships a browser page: **Plugins → dsh-autoctx → Configure** edits the mode, Jev API key, Jev model, decision budget, subagent and context fields; routes, strategy and weights remain in YAML. Once a session has been touched by Auto, a small statistics chip appears at the right of the composer: a ring shows context pressure, the numbers are `decisions/budget · running subagents`, and hovering opens a card with mode, decision progress, subagents, context usage, compactions with tokens saved, and the last route.
 
 ## Install
 
@@ -19,15 +19,15 @@ The plugin talks to Jev directly: with `apiKey` set it uses the direct Jev endpo
 ```bash
 # Create a profile, then install from GitHub or npm
 dsh --profile auto --from-default-profile headless --dump-config >/dev/null
-dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto-context#v0.6.0
-# or the npm package dsh-auto-context
-dsh plugin --profile auto add dsh-auto-context
+dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-autoctx#v0.7.0
+# or the npm package dsh-autoctx
+dsh plugin --profile auto add dsh-autoctx
 ```
 
-Give `dsh-auto-context` a minimal config in the profile's own `cordis.patch.yml`. Get `apiKey` from the workspace API Keys page at <https://opencode.ai>:
+Give `dsh-autoctx` a minimal config in the profile's own `cordis.patch.yml`. Get `apiKey` from the workspace API Keys page at <https://opencode.ai>:
 
 ```yaml
-- id: dsh-auto-context
+- id: dsh-autoctx
   config:
     apiKey: <your opencode workspace key>
     routes:
@@ -49,4 +49,4 @@ With no `apiKey` the plugin calls no network service: the session runs in native
 
 ## Upgrading from 0.4.x
 
-Rename `magpie-auto` to `dsh-auto-context` in your profile overrides; the `endpoint` field is gone and should be removed.
+Rename `magpie-auto` to `dsh-autoctx` in your profile overrides; the `endpoint` field is gone and should be removed.

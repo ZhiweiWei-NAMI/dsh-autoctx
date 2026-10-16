@@ -1,5 +1,5 @@
 # Apply at startup with --patch; restore the native service together.
-- id: dsh-auto-context
+- id: dsh-autoctx
   disabled: true
 - id: compaction-basic
   disabled: false
