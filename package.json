@@ -1,11 +1,17 @@
 {
-  "name": "dsh-auto",
-  "version": "0.5.0",
+  "name": "dsh-auto-context",
+  "version": "0.6.0",
   "type": "module",
   "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
   "license": "MIT",
   "files": [
     "index.js",
+    "client.js",
+    "stats.js",
     "decisions.js",
     "routing.js",
     "cordis.patch.yml",
@@ -17,6 +23,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
     }
   },
   "peerDependencies": {
@@ -30,9 +43,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ZhiweiWei-NAMI/dsh-auto.git"
+    "url": "https://github.com/ZhiweiWei-NAMI/dsh-auto-context.git"
   },
   "scripts": {
     "test": "node --test test/*.test.js"
-  }
+  },
+  "description": "Jev-decided auto routing, subagents and context compaction for dsh, with a settings page and a composer statistics chip"
 }

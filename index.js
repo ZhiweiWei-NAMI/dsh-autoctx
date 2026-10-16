@@ -10,13 +10,14 @@ import {validateJsonSchemaValue,ToolArgsError} from '@deepseek-ai/dsh-tools';
 import {toolPairingBalancedBefore,toolPairingBalancedAfter} from '@deepseek-ai/dsh-compaction';
 import {scoreContext,selectionBatches,extendTask,STATE_BYTES} from './decisions.js';
 import {delegationQuestions,selectDelegation,validateJevAnswers} from './routing.js';
+import {newStats,applyStatsRecord} from './stats.js';
 
-export const name='dsh-auto';
+export const name='dsh-auto-context';
 export const inject=['llm','tokenMeter','sessions','subagents','tools','agents','storageDomain'];
 export const Config=z.object({
-  mode:z.union(['auto','single','native']).default('auto'),
-  apiKey:z.string().role('secret'),
-  jevModel:z.string().default('jev-1.13-free'),
+  mode:z.union(['auto','single','native']).default('auto').volatile().description('auto routes decisions through Jev, single keeps one agent, native keeps native compaction'),
+  apiKey:z.string().role('secret').volatile().description('Jev API key; unset runs native mode'),
+  jevModel:z.string().default('jev-1.13-free').volatile().description('Jev model answering the decisions'),
   jevEndpoint:z.string().default('https://opencode.ai/inference/v1/systemone'),
   routes:z.array(z.object({
     id:z.string(),
@@ -35,19 +36,19 @@ export const Config=z.object({
     }).default({quality:0.8,latency:0.5,usage:0.5,cache:0.8}),
     routeWeights:z.dict(z.any()).default({}),
   }),
-  maxChildren:z.number().step(1).min(0).default(2),
-  maxConcurrent:z.number().step(1).min(1).default(2),
+  maxChildren:z.number().step(1).min(0).default(2).volatile().description('Maximum children per root task'),
+  maxConcurrent:z.number().step(1).min(1).default(2).volatile().description('Maximum children running at once'),
   maxChildRequests:z.number().step(1).min(1).default(16),
   maxChildTurnRequests:z.number().step(1).min(2).default(8),
-  maxDecisions:z.number().step(1).min(1).default(12),
-  pressureTokens:z.number().min(1024).default(64000),
-  retainTokens:z.number().min(1024).default(8000),
+  maxDecisions:z.number().step(1).min(1).default(12).volatile().description('Jev decision calls per root task'),
+  pressureTokens:z.number().min(1024).default(64000).volatile().description('Context pressure that starts compaction decisions'),
+  retainTokens:z.number().min(1024).default(8000).volatile().description('Recent tokens always kept during compaction'),
   nativeThresholdRatio:z.number().min(0.01).max(1).default(0.8),
   recordFile:z.string(),
 });
 const delegation=new Set(['subagent','subagent_fork']);
 const text=m=>m.content.filter(b=>b.type==='text').map(b=>b.text).join('\n');
-const note=value=>createUserMessage({content:[{type:'text',text:value}],source:{kind:'plugin',plugin:'dsh-auto'}});
+const note=value=>createUserMessage({content:[{type:'text',text:value}],source:{kind:'plugin',plugin:'dsh-auto-context'}});
 const redact=(value,secret)=>secret?value.split(secret).join('[redacted]'):value;
 const boundedEvidence=units=>{
   const currentEvidence=[],recentEvidenceOutsideBudget=[];
@@ -60,12 +61,18 @@ const boundedEvidence=units=>{
 // Auto needs at least one route; the session's configured native model is the safe default.
 export const buildDefaultRoute=options=>({id:'default',label:'Default',model:options.model,provider:options.provider,description:'General implementation, analysis and verification with the session main model',efforts:[]});
 
-export function apply(ctx,config) {
+// Settings-page fields are volatile: Loader hands them over as live references.
+const live=options=>new Proxy(options,{get:(target,key)=>{
+  const value=target[key];
+  return value && typeof value.get==='function' && !Array.isArray(value) ? value.get() : value;
+}});
+export function apply(ctx,options) {
+  const config=live(options);
   const roots=new Map(),tasks=new Map(),budgets=new Map(),assignments=new Map();
   const active=new Map(),settled=new Map(),waiters=new Map(),prepared=new Map(),nextPressure=new Map();
   const pressureAnchors=new Map();
   const declinedDelegation=new Set();
-  const turnRequests=new Map(),turnIds=new Map(),wrapped=new WeakSet(),collected=new Set(),reports=new Map(),childMessaging=new WeakSet();
+  const turnRequests=new Map(),turnIds=new Map(),routedSessions=new Set(),collected=new Set(),reports=new Map(),reportingChildren=new Set();
   const rootOf=agent=>agent.session.header.parentSession ?? agent.session.id;
   const budget=id=>{
     if (!budgets.has(id)) budgets.set(id,{children:new Set(),pending:new Set(),childRequests:0,decisions:0});
@@ -73,7 +80,31 @@ export function apply(ctx,config) {
   };
   const record=value=>{
     if (config.recordFile) fs.appendFileSync(config.recordFile,JSON.stringify({at:new Date().toISOString(),...value})+'\n',{mode:0o600});
+    applyStats(value);
   };
+  const statsMap=new Map();
+  const statsRoot=id=>ctx.agents.get(id)?.session.header.parentSession??id;
+  const updateStats=(id,value={})=>{
+    const current=statsMap.get(id)??newStats(config.apiKey?config.mode:'native',config.maxDecisions,config.pressureTokens);
+    statsMap.delete(id);
+    statsMap.set(id,{...applyStatsRecord(current,value,budgets.get(id)?.decisions??0),
+      maxDecisions:config.maxDecisions,pressureTokens:config.pressureTokens,updatedAt:Date.now()});
+    if (statsMap.size>200) statsMap.delete(statsMap.keys().next().value);
+  };
+  const applyStats=value=>{
+    const session=value.root??value.parent??value.session;
+    if (!session || !['policy_snapshot','jev','delegation_decision','child_start','child_end','context_pressure','context_scores','context_kept','context_replaced'].includes(value.kind)) return;
+    const id=statsRoot(session);
+    updateStats(id,value);
+  };
+  ctx.inject(['connection'],c=>{c.effect(()=>
+    c.connection.fetch.register({path:'/api/dsh-auto-context/stats',methods:['GET'],requestBody:'buffered',
+      fetch:request=>{
+        const entry=statsMap.get(statsRoot(new URL(request.url).searchParams.get('session')??''));
+        const {pendingSaved,...stats}=entry??{};
+        return new Response(JSON.stringify({stats:entry?stats:null,apiKeyConfigured:!!config.apiKey}),{headers:{'content-type':'application/json','cache-control':'no-store'}});
+      }}),'dsh-auto-context: stats route');});
+  ctx.on('dispose',()=>statsMap.clear());
   const modeOf=agent=>!config.apiKey ? 'native' : config.mode==='auto' ? roots.get(rootOf(agent))?.mode : config.mode;
   let storePromise;
   const storage=()=>storePromise??=ctx.storageDomain.open(defineDomain({name:'dsh_auto',version:1,layout:'per-record',
@@ -84,6 +115,7 @@ export function apply(ctx,config) {
     const state=budget(rootOf(agent));
     if (state.decisions>=config.maxDecisions) throw new Error('Jev task decision budget exhausted.');
     state.decisions++;
+    updateStats(rootOf(agent));
     const started=performance.now();
     const {questions,...decisionState}=request;
     const response=await fetch(config.jevEndpoint,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+config.apiKey},
@@ -102,8 +134,9 @@ export function apply(ctx,config) {
 
   async function initialize(agent,signal) {
     const id=agent.session.id;
+    const configuredMode=config.apiKey?config.mode:'native';
     if (!config.apiKey || config.mode!=='auto') {
-      const state={mode:config.apiKey?config.mode:'native',profiles:[]};
+      const state={configuredMode,mode:configuredMode,profiles:[]};
       roots.set(id,state);
       record({kind:'policy_snapshot',session:id,mode:state.mode,...config.apiKey?{}:{reason:'no-api-key'}});
       return state;
@@ -120,7 +153,7 @@ export function apply(ctx,config) {
       if (!['automatic','single','native'].includes(policy.mode)) throw new Error('Unsupported compiled execution policy.');
       for (const key of ['quality','latency','usage','cache']) if (!Number.isFinite(policy.weights?.[key])) throw new Error('Missing compiled strategy weight: '+key);
     }
-    const state={policy,mode:policy?.mode==='single'?'single':policy?.mode==='native'?'native':'auto',profiles:[],instruction:snapshot.instruction};
+    const state={configuredMode,policy,mode:policy?.mode==='single'?'single':policy?.mode==='native'?'native':'auto',profiles:[],instruction:snapshot.instruction};
     if(state.mode!=='auto'){
       roots.set(id,state);record({kind:'policy_snapshot',session:id,mode:state.mode,policy});return state;
     }
@@ -151,7 +184,7 @@ export function apply(ctx,config) {
     const mode=exec.agent?modeOf(exec.agent):config.mode;
     if (mode==='single') return 'This task permits one main agent only.';
     if (!exec.agent) return 'Delegation requires a native dsh agent.';
-    if (declinedDelegation.has(exec.agent.session.id)) return 'Jev already declined delegation with the current evidence. No child was created. Continue the work in the main agent; do not retry by rewording the proposal. Reconsider only after a new observation or user/child message.';
+    if (mode==='auto' && declinedDelegation.has(exec.agent.session.id)) return 'Jev already declined delegation with the current evidence. No child was created. Continue the work in the main agent; do not retry by rewording the proposal. Reconsider only after a new observation or user/child message.';
     if (exec.agent.session.header.parentSession!==undefined) return 'Nested delegation exceeds this task depth limit.';
     const state=budget(rootOf(exec.agent));
     const running=[...active.values()].filter(x=>x.parent===rootOf(exec.agent)).length;
@@ -259,46 +292,54 @@ export function apply(ctx,config) {
   }
 
   function installRouting(agent) {
-    if (wrapped.has(agent)) return;
-    for (const [name,provider] of [['subagent','spawn'],['subagent_fork','fork']]) {
-      const original=ctx.tools.get(name,agent);
-      if (!original) throw new Error('Required native delegation tool is unavailable: '+name);
-      agent.ctx.tools.register({...original,
-        async execute(args,exec) {
-          const violations=validateJsonSchemaValue(original.parameters,args,'');
-          if (violations.length) throw new ToolArgsError(violations);
-          return routeDelegation(args,exec,provider);
-        }});
+    if (routedSessions.has(agent.session.id)) return;
+    for (const name of delegation) {
+      if (!ctx.tools.get(name,agent)) throw new Error('Required native delegation tool is unavailable: '+name);
     }
-    const messaging=ctx.tools.get('send_message',agent);
-    if(messaging)agent.ctx.tools.register({...messaging,async execute(args,exec){
-      try{return await messaging.execute(args,exec);}
-      catch(error){
-        const causes=[];for(let cause=error;cause;cause=cause.cause)causes.push(String(cause));
-        record({kind:'native_message_error',session:agent.session.id,causes});throw new Error(causes.join(' -> '),{cause:error});
-      }
-    }});
-    wrapped.add(agent);
+    routedSessions.add(agent.session.id);
   }
 
   function installChildReporting(agent) {
-    if(childMessaging.has(agent))return;
-    const original=ctx.tools.get('send_message',agent);
-    if(!original)throw new Error('Native child reporting requires send_message.');
-    agent.ctx.tools.register({...original,async execute(args,exec){
-      const result=await original.execute(args,exec);
-      if(args.agent_id===rootOf(agent) && ((turnRequests.get(agent.session.id)??0)>=config.maxChildTurnRequests || budget(rootOf(agent)).childRequests>=config.maxChildRequests)){
-        const run=active.get(agent.session.id);
+    if(reportingChildren.has(agent.session.id))return;
+    if(!ctx.tools.get('send_message',agent))throw new Error('Native child reporting requires send_message.');
+    reportingChildren.add(agent.session.id);
+  }
+
+  ctx.on('tools/execute',async(exec,next)=>{
+    const agent=exec.agent,session=agent?.session.id;
+    if(routedSessions.has(session) && modeOf(agent)==='auto'){
+      if(delegation.has(exec.name)){
+        try {
+          const violations=validateJsonSchemaValue(ctx.tools.get(exec.name,agent).parameters,exec.arguments,'');
+          if(violations.length)throw new ToolArgsError(violations);
+          const value=await routeDelegation(exec.arguments,exec,exec.name==='subagent'?'spawn':'fork');
+          const content=value.kind==='foreground'?value.output.filter(block=>block.type==='text' || block.type==='image'):
+            [{type:'text',text:`Started subagent ${value.subagentId} in the background; its result arrives as a message.`}];
+          return {isError:false,value,content};
+        } catch(error) {
+          const message=error instanceof Error?error.message:String(error);
+          return {isError:true,error:{message},content:[{type:'text',text:message}]};
+        }
+      }
+      if(exec.name==='send_message'){
+        const result=await next();
+        if(result.isError)record({kind:'native_message_error',session,causes:[result.error.message]});
+        return result;
+      }
+    }
+    if(exec.name==='send_message' && reportingChildren.has(session)){
+      let result=await next();
+      const args=exec.arguments;
+      if(!result.isError && args.agent_id===rootOf(agent) && ((turnRequests.get(session)??0)>=config.maxChildTurnRequests || budget(rootOf(agent)).childRequests>=config.maxChildRequests)){
+        const run=active.get(session);
         if(run)reports.set(run.runId,args.message);
-        // The real native message has been accepted. Conclude this budgeted
-        // reporting turn through the tool runtime, without an extra model call.
-        exec.concludeTurn();
-        record({kind:'child_budget_report',session:agent.session.id,runId:run?.runId});
+        result={...result,concludesTurn:true};
+        record({kind:'child_budget_report',session,runId:run?.runId});
       }
       return result;
-    }});
-    childMessaging.add(agent);
-  }
+    }
+    return next();
+  });
 
   class JevCompaction extends BasicCompactionEngine {
     async summarize(input,agent,signal) {
@@ -306,8 +347,15 @@ export function apply(ctx,config) {
       return selection?{summary:selection.summary,provider:'opencode-console',model:selection.model}:super.summarize(input,agent,signal);
     }
   }
-  const compactor=config.mode==='auto'?new JevCompaction(ctx,{auto:false,thresholdRatio:config.nativeThresholdRatio,
-    retainTokens:config.retainTokens,compactionRetries:0,maxOverflowRetries:0}):undefined;
+  const createCompactor=()=>new JevCompaction(ctx,{auto:false,thresholdRatio:config.nativeThresholdRatio,
+    retainTokens:config.retainTokens,compactionRetries:0,maxOverflowRetries:0});
+  // Built on first use (one Service for the plugin's life); a saved retainTokens is applied in place.
+  let compactor;
+  const getCompactor=()=>{
+    compactor??=createCompactor();
+    if(compactor.config.retainTokens!==config.retainTokens)compactor.config={...compactor.config,retainTokens:config.retainTokens};
+    return compactor;
+  };
 
   ctx.on('agent/pre-step',async(payload,next)=>{
     const {agent,messages,signal}=payload,id=agent.session.id,isChild=agent.session.header.parentSession!==undefined;
@@ -330,7 +378,7 @@ export function apply(ctx,config) {
       if(isChild)for(const message of messages)if(message.source.kind==='agent-message' && message.source.senderSessionId===rootOf(agent))
         tasks.set(id,tasks.get(id)+'\n\nFollow-up assignment:\n'+text(message));
     }
-    if (!isChild && !roots.has(id)) {
+    if (!isChild && (!roots.has(id) || roots.get(id).configuredMode!==(config.apiKey?config.mode:'native'))) {
       const state=await initialize(agent,signal);
       if (state.mode==='auto') installRouting(agent);
       return next();
@@ -349,8 +397,8 @@ export function apply(ctx,config) {
         return {...admitted,messages:[...admitted.messages,note('This is your final model request under the child budget. Return the concrete result, test evidence, and any unfinished work now.')]};
       }
     }
-    if (compactor && agent.session.requestHeader()!==undefined) {
-      if (modeOf(agent)!=='auto') await compactor.compactIfNeeded(agent,'pressure',signal);
+    if (agent.session.requestHeader()!==undefined) {
+      if (modeOf(agent)!=='auto') await getCompactor().compactIfNeeded(agent,'pressure',signal);
       else await selectUnderPressure(agent,signal);
     }
     return next();
@@ -364,6 +412,7 @@ export function apply(ctx,config) {
     }
     const started=performance.now();let usage;
     const dispatchEstimate=agent?ctx.tokenMeter.measure(agent.session).totalTokens:undefined;
+    if (agent) updateStats(rootOf(agent),{nativeEstimate:dispatchEstimate});
     try {
       for await(const chunk of next()){if(chunk.type==='usage')usage=chunk.usage;yield chunk;}
     }finally{
@@ -382,6 +431,7 @@ export function apply(ctx,config) {
 
   async function selectUnderPressure(agent,signal) {
     const id=agent.session.id,measured=ctx.tokenMeter.measure(agent.session);
+    updateStats(rootOf(agent),{nativeEstimate:measured.totalTokens});
     const anchor=pressureAnchors.get(id);
     const pressure=anchor?anchor.input+Math.max(0,measured.totalTokens-anchor.estimate):measured.totalTokens;
     if (pressure<Math.max(config.pressureTokens,nextPressure.get(id)??config.pressureTokens)) return;
@@ -409,7 +459,7 @@ export function apply(ctx,config) {
     const batches=selectionBatches(tasks.get(id),history,observation);
     if(state.decisions+batches.length>config.maxDecisions){
       record({kind:'decision_budget_boundary',session:id,action:'native_compaction',requiredCalls:batches.length,remaining:config.maxDecisions-state.decisions});
-      await compactor.compactIfNeeded(agent,'pressure',signal);return;
+      await getCompactor().compactIfNeeded(agent,'pressure',signal);return;
     }
     const children=await ctx.subagents.listChildren(rootOf(agent),signal);
     const owners=Object.fromEntries(children.filter(x=>x.kind==='child'&&x.id!==id).map(x=>[x.id,'Existing child responsibility: '+x.label]));
@@ -428,7 +478,7 @@ export function apply(ctx,config) {
     }
     prepared.set(id,{summary,model:selection.model});
     try{
-      const result=await compactor.compactRegion(nodes[start],nodes[end],agent,signal);
+      const result=await getCompactor().compactRegion(nodes[start],nodes[end],agent,signal);
       record({kind:'context_replaced',session:id,start:nodes[start],end:nodes[end],sourceCount:result.shadowedSeqs.length});
       nextPressure.delete(id);
     }finally{prepared.delete(id);}

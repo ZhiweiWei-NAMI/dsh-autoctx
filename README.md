@@ -1,8 +1,16 @@
-# dsh-auto
+# dsh-auto-context
 
 dsh 的 Auto 决策插件。填写自己的 API Key 后直连 `jev-1.13-free` 获取结构化决策，插件通过 dsh 原生会话、工具和子代理接口落实决策。主代理和子代理使用配置的执行模型。插件不包含智能体执行运行时。未配置 `apiKey` 时按原生模式运行，不调用任何网络服务。
 
 需要 dsh `0.1.5-rc.1` 或 `0.2.x`（已在 `0.2.0-rc.2` 上实测）。
+
+## 从 0.5.x 升级
+
+0.6.0 起插件改名为 `dsh-auto-context`：把 profile 覆盖里的 `dsh-auto` 条目改名为 `dsh-auto-context`，然后卸载旧包（`dsh plugin --profile auto remove dsh-auto`）再安装新包。存储域名保持 `dsh_auto`，已有策略数据继续可用。
+
+## 设置页与输入框统计（0.6.0 新增）
+
+插件自带浏览器端页面：**Plugins → dsh-auto-context → Configure** 可以编辑模式、Jev API Key、Jev 模型、决策预算、子代理与上下文相关字段；路由、策略与权重仍由 YAML 维护。会话输入框右下角会出现一个统计小徽章（仅在本会话被 Auto 处理过时显示）：圆环表示上下文压力，数字为 `决策/预算 · 运行中的子代理`，悬停展开详情卡片（模式、决策进度、子代理、上下文占用、压缩次数与节省 tokens、最近路由）。
 
 ## 安装
 
@@ -11,15 +19,15 @@ dsh 的 Auto 决策插件。填写自己的 API Key 后直连 `jev-1.13-free` �
 ```bash
 # 新建 profile，然后从 GitHub 或 npm 安装
 dsh --profile auto --from-default-profile headless --dump-config >/dev/null
-dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.5.0
-# 或 npm 包 dsh-auto
-dsh plugin --profile auto add dsh-auto
+dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto-context#v0.6.0
+# 或 npm 包 dsh-auto-context
+dsh plugin --profile auto add dsh-auto-context
 ```
 
-在 profile 自己的 `cordis.patch.yml` 里给 `dsh-auto` 填最小配置。`apiKey` 到 <https://opencode.ai> 的 workspace API Keys 页面获取：
+在 profile 自己的 `cordis.patch.yml` 里给 `dsh-auto-context` 填最小配置。`apiKey` 到 <https://opencode.ai> 的 workspace API Keys 页面获取：
 
 ```yaml
-- id: dsh-auto
+- id: dsh-auto-context
   config:
     apiKey: <你的 opencode workspace key>
     routes:
@@ -41,7 +49,7 @@ dsh plugin --profile auto add dsh-auto
 
 ### 从 0.4.x 升级
 
-profile 覆盖里的 `magpie-auto` 需改名为 `dsh-auto`；`endpoint` 字段已删除，应一并移除。
+profile 覆盖里的 `magpie-auto` 需改名为 `dsh-auto-context`；`endpoint` 字段已删除，应一并移除。
 
 ## 启用
 
@@ -52,7 +60,7 @@ profile 覆盖里的 `magpie-auto` 需改名为 `dsh-auto`；`endpoint` 字段�
 dsh --profile auto "你的编程任务"
 
 # 同一模型连接，关闭 Auto，使用原生 dsh
-dsh --profile auto --patch "$DSH_HOME/profiles/auto/node_modules/dsh-auto/off.patch.yml" "你的编程任务"
+dsh --profile auto --patch "$DSH_HOME/profiles/auto/node_modules/dsh-auto-context/off.patch.yml" "你的编程任务"
 ```
 
 原有 `web`、`headless` 等 profile 保持原配置。`auto` 使用本机 dsh 的会话、工具和存储，不另设运行时或 `DSH_HOME`。以上开关在启动时选择，长任务中不要切换。
@@ -61,17 +69,17 @@ dsh --profile auto --patch "$DSH_HOME/profiles/auto/node_modules/dsh-auto/off.pa
 
 ```bash
 dsh --profile auto --from-default-profile headless --dump-config >/dev/null
-dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.5.0
+dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto-context#v0.6.0
 ```
 
-v0.5.0 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `compaction-basic`，无需手写 `insert`。卸载时先移除 profile 中自定义的 `dsh-auto` 覆盖条目，再运行 `dsh plugin --profile auto remove dsh-auto`，会移除该层并恢复原生压缩。旧版手工添加的插件和压缩开关应先从用户 patch 中移除，避免重复挂载。
+v0.5.0 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `compaction-basic`，无需手写 `insert`。卸载时先移除 profile 中自定义的 `dsh-auto-context` 覆盖条目，再运行 `dsh plugin --profile auto remove dsh-auto-context`，会移除该层并恢复原生压缩。旧版手工添加的插件和压缩开关应先从用户 patch 中移除，避免重复挂载。
 
 执行模型连接仍需配置。服务器 `auto/cordis.patch.yml` 将 `settings` 指向同目录的 `settings.yaml`，其中选择 `deepseek-official` 适配器、`dsh-workbuddy/deepseek-v4.1-flash` 模型和 `http://127.0.0.1:3435/v1` 网关。该 profile 的 `.credentials.yaml` 仅存本机网关所需的非秘密占位值，不含上游账号或 Console 密钥。
 
 需要覆盖插件限制时，在 **profile 自己的** `$DSH_HOME/profiles/auto/cordis.patch.yml` 增加：
 
 ```yaml
-- id: dsh-auto
+- id: dsh-auto-context
   config:
     maxChildren: 2
     maxConcurrent: 2
