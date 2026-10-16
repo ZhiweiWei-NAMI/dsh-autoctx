@@ -1,0 +1,246 @@
+"""Run A/B/C cases in isolated CPU containers and export patches and usage."""
+import argparse
+import concurrent.futures
+import json
+import os
+import shutil
+import subprocess
+import time
+import uuid
+from contextlib import ExitStack
+from pathlib import Path
+
+import yaml
+
+from common import case_paths, child_counts, events, write_json
+from local_relay import LocalRelay
+from observer import CaseObserver
+
+NODE = Path(os.environ.get('DSH_BENCH_NODE', '/opt/node'))
+DSH = NODE / 'lib/node_modules/@deepseek-ai/dsh/lib/bin.js'
+MODEL_IDS = ('deepseek-v4.1-flash', 'deepseek-v4-flash', 'glm-5.3-flash')
+TASK_SECONDS = 600
+REQUEST_LIMIT = 64
+MAX_OUTPUT_TOKENS = 16384
+PRESSURE_TOKENS = 24000
+RETAIN_TOKENS = 8000
+MAX_CHILDREN = 2
+MAX_CONCURRENT = 2
+COMPACTION_THRESHOLD_RATIO = 0.1875
+ARMS = ('A', 'B', 'C')
+
+
+def docker(*args):
+    return subprocess.run(['docker', *map(str, args)], check=True, stdout=subprocess.PIPE).stdout
+
+
+def configure_home(home, model, arm, plugin, relay):
+    home.mkdir(parents=True)
+    shutil.copyfile(Path(__file__).with_name('runtime.mjs'), home / 'runtime.mjs')
+    patch = [{'id': item, 'disabled': True} for item in
+             ('session-title-llm', 'tool-workflow', 'tool-ralph', 'tool-web', 'web-search-deepseek',
+              'repeat-tool-reminder', 'llm-retry')]
+    patch += [
+        {'id': 'agent-default-model', 'config': {'provider': 'workbuddy', 'model': model}},
+        {'id': 'llm-pi-ai', 'config': {'providers': {'workbuddy': {
+            'api': 'openai-completions', 'baseURL': relay + '/v1', 'apiKeyEnv': 'BENCH_RELAY_KEY',
+            'compat': {'maxTokensField': 'max_tokens', 'supportsUsageInStreaming': True},
+            'models': [{'id': model, 'contextWindow': 128000, 'maxTokens': MAX_OUTPUT_TOKENS,
+                        'reasoningEfforts': False}]}}}},
+        {'id': 'subagent', 'config': {'maxDepth': 1, 'maxActiveSubagents': MAX_CONCURRENT}},
+        {'insert': [{'id': 'bench-observation', 'name': str(home / 'runtime.mjs'), 'config': {
+            'arm': arm, 'relay': relay, 'recordFile': str(home / 'native-events.jsonl'),
+            'maxChildren': MAX_CHILDREN, 'maxConcurrent': MAX_CONCURRENT}}]},
+    ]
+    if arm == 'A':
+        patch += [
+            {'id': 'compaction-basic', 'disabled': True},
+            {'insert': [{'id': 'dsh-autoctx', 'name': str(plugin / 'index.js'), 'config': {
+                'mode': 'auto', 'apiKey': 'bench-observer', 'jevEndpoint': relay + '/jev',
+                'maxChildren': MAX_CHILDREN, 'maxConcurrent': MAX_CONCURRENT, 'maxDecisions': 12,
+                'maxChildRequests': REQUEST_LIMIT, 'maxChildTurnRequests': REQUEST_LIMIT,
+                'pressureTokens': PRESSURE_TOKENS, 'retainTokens': RETAIN_TOKENS,
+                'nativeThresholdRatio': COMPACTION_THRESHOLD_RATIO,
+                'recordFile': str(home / 'auto-events.jsonl')}}]},
+        ]
+    else:
+        patch.append({'id': 'compaction-basic', 'disabled': False, 'config': {
+            'thresholdRatio': COMPACTION_THRESHOLD_RATIO, 'retainTokens': RETAIN_TOKENS,
+            'maxTokens': MAX_OUTPUT_TOKENS, 'compactionRetries': 0, 'maxOverflowRetries': 0}})
+    for pid, provider, tool in [('tool-subagent', 'spawn', 'subagent'),
+                                ('tool-subagent-fork', 'fork', 'subagent_fork')]:
+        patch.append({'id': pid, 'disabled': arm == 'B', 'config': {
+            'provider': provider, 'toolName': tool, 'backgroundMode': 'one-shot', 'maxDepth': 1,
+            'agentOptions': {'provider': 'workbuddy', 'model': model, 'maxTokens': MAX_OUTPUT_TOKENS}}})
+    (home / 'cordis.patch.yml').write_text(yaml.safe_dump(patch, sort_keys=False))
+
+
+def stage_plugin(source, target):
+    manifest = json.loads((source / 'package.json').read_text())
+    temporary = target.with_name(target.name + '.tmp')
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True)
+    shutil.copyfile(source / 'package.json', temporary / 'package.json')
+    for pattern in manifest['files']:
+        for path in source.glob(pattern):
+            destination = temporary / path.relative_to(source)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_dir():
+                shutil.copytree(path, destination, dirs_exist_ok=True)
+            else:
+                shutil.copyfile(path, destination)
+    (temporary / 'node_modules').symlink_to(DSH.parent.parent / 'node_modules', target_is_directory=True)
+    temporary.replace(target)
+
+
+def prompt_for(task, arm):
+    prompt = 'Resolve this issue in the repository. Use real tools to inspect and edit code, and run appropriate tests. '
+    if arm == 'B':
+        prompt += 'This run permits only the main agent; do not delegate. '
+    elif arm == 'C':
+        prompt += 'Native subagents are optional; decide whether they help and collect their results. '
+    else:
+        prompt += 'Auto selects collaboration; use the supplied child results. '
+    return prompt + ('Do not read evaluation answers, later releases, fixed upstream tests or reference patches. '
+                     'Only the initial commit and local model service are available. '
+                     'Complete the code fix and report what was tested.\n\n' + task['problem_statement'])
+
+
+def run_case(task, arm, repeat, case, model, plugin):
+    case.mkdir(parents=True, exist_ok=True)
+    home = case / 'trial'
+    if home.exists():
+        shutil.rmtree(home)
+    for name in ('evaluation.json', 'official-report.json', 'official-summary.json'):
+        (case / name).unlink(missing_ok=True)
+    instance = task['instance_id']
+    image = 'swebench/sweb.eval.x86_64.' + instance.replace('__', '_1776_') + ':latest'
+    docker('image', 'inspect', image)
+    outcome = {'instance_id': instance, 'arm': arm, 'repeat': repeat, 'model': model, 'image': image,
+               'resolved': None}
+    with ExitStack() as stack:
+        network = 'dsh-bench-' + uuid.uuid4().hex
+        docker('network', 'create', '--driver', 'bridge', '--internal', network)
+        stack.callback(docker, 'network', 'rm', network)
+        gateway = json.loads(docker('network', 'inspect', network))[0]['IPAM']['Config'][0]['Gateway']
+        observer = CaseObserver(case / 'requests.json', REQUEST_LIMIT)
+        port = observer.start()
+        stack.callback(observer.close)
+        relay = LocalRelay(gateway, port)
+        stack.callback(relay.close)
+        configure_home(home, model, arm, plugin, f'http://{gateway}:{port}')
+        volumes = ['--volume', f'{NODE}:{NODE}:ro', '--volume', f'{home}:{home}:rw']
+        if arm == 'A':
+            volumes += ['--volume', f'{plugin}:{plugin}:ro']
+        container = docker('run', '--detach', '--network', network, '--runtime', 'runc',
+                           '--cpus', '4', '--memory', '8g', '--workdir', '/testbed',
+                           *volumes, image, 'sleep', 'infinity').decode().strip()
+        stack.callback(docker, 'rm', '--force', container)
+        stack.callback(docker, 'exec', container, 'chown', '-R', f'{os.getuid()}:{os.getgid()}', home)
+
+        def execute(*command):
+            return docker('exec', '--workdir', '/testbed', container, *command)
+
+        prepared = time.perf_counter()
+        execute('git', 'reset', '--hard', task['base_commit'])
+        execute('git', 'clean', '-fd')
+        execute('git', 'clone', '--no-local', '--no-tags', '--depth', '1', '--no-checkout',
+                'file:///testbed', '/tmp/base')
+        execute('python', '-c', "import shutil; shutil.rmtree('/testbed/.git'); "
+                "shutil.move('/tmp/base/.git','/testbed/.git'); shutil.rmtree('/tmp/base')")
+        execute('git', 'reset', '--mixed', task['base_commit'])
+        outcome['taskEnvironmentPreparationSeconds'] = round(time.perf_counter() - prepared, 4)
+        started = time.perf_counter()
+        command = ['docker', 'exec', '--workdir', '/testbed', container, 'env',
+                   f'DSH_HOME={home}', 'BENCH_RELAY_KEY=bench-observer',
+                   'DSH_PERMISSION_MODE=danger-full-access', 'DSH_TELEMETRY_DISABLED=1', 'CUDA_VISIBLE_DEVICES=',
+                   f'PATH={NODE}/bin:/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:/usr/local/sbin:'
+                   '/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+                   str(NODE / 'bin/node'), str(DSH), '--profile', 'headless', prompt_for(task, arm)]
+        with (home / 'agent-output.txt').open('w') as log:
+            try:
+                process = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=TASK_SECONDS)
+                outcome['agentExitCode'] = process.returncode
+                outcome['executionStatus'] = 'finished' if process.returncode == 0 else 'agent_error'
+            except subprocess.TimeoutExpired:
+                outcome.update(agentExitCode=None, executionStatus='timeout')
+            finally:
+                observer.stop_admitting()
+                execute('python', '-c', 'import os, signal, contextlib\n'
+                        'with contextlib.suppress(ProcessLookupError): os.kill(-1, signal.SIGKILL)')
+        outcome['executionSeconds'] = round(time.perf_counter() - started, 4)
+        execute('chown', '-R', f'{os.getuid()}:{os.getgid()}', home)
+        execute('git', 'add', '-N', '.')
+        patch = execute('git', 'diff', '--binary', task['base_commit'])
+        (case / 'patch.diff').write_bytes(patch)
+        outcome['patchBytes'] = len(patch)
+        outcome['solveAndExportSeconds'] = round(time.perf_counter() - started, 4)
+        lifecycle = events(home / 'native-events.jsonl') + events(home / 'auto-events.jsonl')
+        write_json(case / 'decisions-and-children.json', lifecycle)
+    calls = observer.calls
+    infrastructure = sorted({f"{c['kind']}:{c.get('httpStatus') or c.get('transportError')}" for c in calls
+                             if (c['kind'] == 'execution' and (c.get('transportError') or c.get('httpStatus') == 402
+                                                              or (c.get('httpStatus') or 0) >= 500))
+                             or (c['kind'] == 'jev' and c.get('httpStatus') == 403)})
+    if arm == 'A' and not any(item.get('kind') == 'policy_snapshot' for item in lifecycle):
+        infrastructure.append('plugin_inactive')
+    if infrastructure:
+        outcome.update(executionStatus='infra_error', infraErrors=infrastructure, upstreamCalls=len(calls))
+        write_json(case / 'infra-error.json', outcome)
+        print(json.dumps(outcome), flush=True)
+        return
+    (case / 'infra-error.json').unlink(missing_ok=True)
+    outcome.update(upstreamCalls=len(calls), executionCalls=sum(c['kind'] == 'execution' for c in calls),
+                   jevCalls=sum(c['kind'] == 'jev' for c in calls), **child_counts(lifecycle, calls))
+    write_json(case / 'result.json', outcome)
+    print(json.dumps(outcome), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', required=True, choices=MODEL_IDS)
+    parser.add_argument('--arms', default='A,B,C')
+    parser.add_argument('--tasks', type=Path, default=Path(__file__).with_name('tasks.json'))
+    parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--plugin', type=Path, required=True)
+    parser.add_argument('--parallel', type=int, default=3)
+    parser.add_argument('--repeat', type=int, default=1)
+    args = parser.parse_args()
+    arms = [arm.strip().upper() for arm in args.arms.split(',') if arm.strip()]
+    if not arms or len(set(arms)) != len(arms) or any(arm not in ARMS for arm in arms):
+        parser.error('--arms must be a comma-separated subset of A,B,C')
+    if args.parallel < 1 or args.repeat < 1:
+        parser.error('--parallel and --repeat must be positive')
+    root, plugin = args.out.resolve(), args.plugin.resolve()
+    task_file = args.tasks.resolve()
+    manifest = json.loads(task_file.read_text())
+    dataset = Path(os.environ.get('DSH_BENCH_ROOT', '.')).resolve() / 'evaluator/verified-subset.json'
+    statements = {row['instance_id']: row['problem_statement'] for row in json.loads(dataset.read_text())}
+    tasks = [{**task, 'problem_statement': statements[task['instance_id']]} for task in manifest['tasks']]
+    root.mkdir(parents=True, exist_ok=True)
+    config = {'model': args.model, 'arms': arms, 'tasks': str(task_file), 'plugin': str(plugin),
+              'parallel': args.parallel, 'repeat': args.repeat, 'taskTimeoutSeconds': TASK_SECONDS,
+              'requestLimitIncludingJev': REQUEST_LIMIT, 'maxOutputTokens': MAX_OUTPUT_TOKENS,
+              'pressureTokens': PRESSURE_TOKENS, 'retainTokens': RETAIN_TOKENS,
+              'compactionThresholdRatio': COMPACTION_THRESHOLD_RATIO,
+              'maxChildren': MAX_CHILDREN, 'maxConcurrentChildren': MAX_CONCURRENT}
+    config_file = root / 'run-config.json'
+    write_json(root / 'tasks.json', manifest)
+    write_json(config_file, config)
+    pending = [item for item in case_paths(root, tasks, arms, args.repeat) if not (item[3] / 'result.json').exists()]
+    if not pending:
+        return
+    if 'A' in arms and not os.environ.get('JEV_API_KEY'):
+        parser.error('Set JEV_API_KEY in the observer environment')
+    staged = root / 'plugin'
+    if 'A' in arms and not staged.exists():
+        stage_plugin(plugin, staged)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
+        futures = [pool.submit(run_case, *item, args.model, staged) for item in pending]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+
+
+if __name__ == '__main__':
+    main()
