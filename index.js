@@ -1011,8 +1011,9 @@ export function apply(ctx, options) {
   const region = (nodes, start, end, agent) =>
     nodes
       .slice(start, end + 1)
-      .map((seq) => ({
+      .map((seq, index) => ({
         seq,
+        position: start + index,
         message: agent.session.deriveEventMessage(agent.session.eventAt(seq)),
       }))
       .filter((x) => x.message !== null);
@@ -1060,12 +1061,12 @@ export function apply(ctx, options) {
     // The head (system + first user task) and the recent tail stay untouched, so
     // the cached prompt prefix survives the replacement.
     const fullEnd = end;
-    const compactRegion = async (reason) => {
+    const compactRegion = async (reason, regionEnd = fullEnd) => {
       signal.throwIfAborted();
       try {
         const result = await getCompactor().compactRegion(
           nodes[start],
-          nodes[fullEnd],
+          nodes[regionEnd],
           agent,
           signal,
         );
@@ -1073,7 +1074,7 @@ export function apply(ctx, options) {
           kind: "context_replaced",
           session: id,
           start: nodes[start],
-          end: nodes[fullEnd],
+          end: nodes[regionEnd],
           reason,
           sourceCount: result.shadowedSeqs.length,
         });
@@ -1083,7 +1084,7 @@ export function apply(ctx, options) {
           kind: "context_unshrinkable",
           session: id,
           start: nodes[start],
-          end: nodes[fullEnd],
+          end: nodes[regionEnd],
           pressure,
           ceiling,
           reason,
@@ -1103,7 +1104,7 @@ export function apply(ctx, options) {
         for (const block of message.content)
           if (block.type === "tool-call")
             calls.set(block.id, { tool: block.name, argument: salientArgument(block.arguments) });
-      return items.flatMap(({ seq, message }) => {
+      return items.flatMap(({ seq, position, message }) => {
         const required =
           message.role === "system" ||
           message.source.kind === "user" ||
@@ -1115,6 +1116,7 @@ export function apply(ctx, options) {
           return [
             {
               id: "event_" + seq,
+              position,
               kind: message.role,
               text: JSON.stringify(message),
               required: true,
@@ -1131,6 +1133,7 @@ export function apply(ctx, options) {
                 : undefined;
           return {
             id: "event_" + seq + "_block_" + i,
+            position,
             kind: message.role + "/" + block.type,
             text: JSON.stringify(block),
             required: false,
@@ -1157,6 +1160,24 @@ export function apply(ctx, options) {
         action: "native_compaction",
         reason: "selection does not fit one Jev batch",
       });
+      await compactRegion("selection_does_not_fit");
+      return;
+    }
+    // The judged span is the oldest contiguous run of complete candidates in the
+    // batch; the replacement shadows only that run and leaves the rest in place.
+    const covered = new Set(batch.history.map((unit) => unit.id));
+    const firstUnjudged = history.find((unit) => !unit.required && !covered.has(unit.id));
+    let judgedEnd = firstUnjudged ? firstUnjudged.position - 1 : end;
+    while (judgedEnd >= start && !toolPairingBalancedAfter(agent.session, nodes[judgedEnd]))
+      judgedEnd--;
+    if (judgedEnd < start) {
+      await compactRegion("selection_does_not_fit");
+      return;
+    }
+    const judged = history.filter((unit) => unit.position <= judgedEnd);
+    const judgedIds = new Set(judged.map((unit) => unit.id));
+    batch.history = batch.history.filter((unit) => judgedIds.has(unit.id));
+    if (!batch.history.length) {
       await compactRegion("selection_does_not_fit");
       return;
     }
@@ -1192,16 +1213,18 @@ export function apply(ctx, options) {
     signal.throwIfAborted();
     const unitText = (unit) => unit.kind + ":\n" + unit.text;
     const tokensOf = (unit) => ctx.tokenMeter.estimateMessage(note(unitText(unit)));
-    const regionTokens = measured.nodes.slice(start, end + 1).reduce((n, node) => n + node.tokens, 0);
+    const regionTokens = measured.nodes
+      .slice(start, judgedEnd + 1)
+      .reduce((sum, node) => sum + node.tokens, 0);
     const budgeted = budgetedSelection(
-      history,
+      judged,
       selection.judgments,
       config.keepRatio * regionTokens,
       tokensOf,
     );
     const kept = new Set(budgeted.keptIds);
-    const dropped = history.filter((unit) => !kept.has(unit.id));
-    const summary = history
+    const dropped = judged.filter((unit) => !kept.has(unit.id));
+    const summary = judged
       .filter((unit) => kept.has(unit.id))
       .map((unit) => ({ type: "text", text: unitText(unit) }));
     if (dropped.length)
@@ -1228,7 +1251,7 @@ export function apply(ctx, options) {
     }
     prepared.set(id, { summary, model: selection.model });
     try {
-      await compactRegion("replacement");
+      await compactRegion("replacement", judgedEnd);
     } finally {
       prepared.delete(id);
     }

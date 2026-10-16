@@ -5,6 +5,7 @@ import { apply, buildDefaultRoute } from "../index.js";
 import BasicCompactionEngine from "@deepseek-ai/dsh-compaction-basic";
 import {
   STATE_BYTES,
+  PREVIEW_CHARS,
   selectionBatch,
   scoreContext,
   budgetedSelection,
@@ -284,7 +285,7 @@ test("continued user requirements preserve complete tails and update the decisio
   assert.ok(!updated.includes("transient plugin"));
 });
 
-test("a batch requires all complete candidates to fit without truncating text or skipping reasoning", () => {
+test("a batch judges previews of the oldest complete candidates without carrying full text", () => {
   const history = [
     { id: "oldest", kind: "assistant/reasoning", text: "Evidence " + "x".repeat(1600) },
     ...Array.from({ length: 32 }, (_, i) => ({
@@ -293,17 +294,30 @@ test("a batch requires all complete candidates to fit without truncating text or
       text: "Evidence " + i,
     })),
   ];
-  assert.equal(selectionBatch("Task", history), null);
-  const batch = selectionBatch("Task", history.slice(0, 32));
-  assert.deepEqual(batch.history, history.slice(0, 32));
-  assert.ok(Buffer.byteLength(JSON.stringify(batch)) <= STATE_BYTES);
-  assert.equal(
-    selectionBatch("Task", [{ id: "large", text: "x".repeat(STATE_BYTES) + "ESSENTIAL_TAIL" }]),
-    null,
+  const batch = selectionBatch("Task", history);
+  assert.deepEqual(
+    batch.history.map((unit) => unit.id),
+    history.slice(0, 32).map((unit) => unit.id),
   );
+  assert.ok(Buffer.byteLength(JSON.stringify(batch)) <= STATE_BYTES);
+  const preview = batch.history[0].text;
+  assert.ok(preview.length <= PREVIEW_CHARS);
+  assert.match(preview, /chars omitted/);
+  assert.ok(preview.startsWith("assistant/reasoning\nEvidence "));
+  assert.equal(preview.includes("x".repeat(1600)), false);
+  const command = "x".repeat(STATE_BYTES) + "ESSENTIAL_TAIL";
+  const oversized = selectionBatch("Task", [
+    { id: "large", kind: "assistant/tool-call", tool: "bash", argument: command, text: command },
+  ]);
+  assert.equal(oversized.history.length, 1);
+  assert.deepEqual(Object.keys(oversized.history[0]), ["id", "text"]);
+  assert.ok(Buffer.byteLength(JSON.stringify(oversized)) <= STATE_BYTES);
+  assert.ok(oversized.history[0].text.length <= PREVIEW_CHARS);
+  assert.match(oversized.history[0].text, /^assistant\/tool-call bash \(/);
+  assert.match(oversized.history[0].text, /ESSENTIAL_TAIL$/);
 });
 
-test("a selection that cannot fit one batch returns no request", () => {
+test("a selection whose previews cannot fit one batch returns no request", () => {
   const huge = {
     task: "x".repeat(STATE_BYTES),
     trigger: "selection",
@@ -412,12 +426,18 @@ test("a failed primitive request is not retried or replaced with a synthetic kee
   assert.equal(calls, 1);
 });
 
-test("a complete single batch preserves evidence past 1500 characters and reasoning", () => {
+test("a complete single batch preserves the evidence tail and reasoning in previews", () => {
   const history = [
     { id: "evidence", text: "x".repeat(1600) + "TAIL_REQUIREMENT" },
     { id: "reasoning", kind: "assistant/reasoning", text: "Reasoning evidence" },
   ];
-  assert.deepEqual(selectionBatch("Task", history).history, history);
+  const batch = selectionBatch("Task", history);
+  assert.deepEqual(
+    batch.history.map((unit) => unit.id),
+    ["evidence", "reasoning"],
+  );
+  assert.match(batch.history[0].text, /TAIL_REQUIREMENT$/);
+  assert.equal(batch.history[1].text, "assistant/reasoning\nReasoning evidence");
 });
 
 function autoComposition(options = {}) {
@@ -890,28 +910,34 @@ function contextHistory(app, contents) {
   return events;
 }
 
-test("33 candidates use native compaction for the full region without Jev", async (t) => {
-  const native = nativeCompaction(t);
-  const fetch = t.mock.method(globalThis, "fetch", async () => {
-    throw new Error("Unexpected Jev call");
+test("33 candidates are judged by preview and only the 32 oldest events are replaced", async (t) => {
+  const native = nativeCompaction(t),
+    requests = [];
+  t.mock.method(globalThis, "fetch", async (url, { body }) => {
+    requests.push(JSON.parse(JSON.parse(body).state));
+    return jevReply(body);
   });
   const app = autoComposition({ pressure: true });
   const events = contextHistory(
     app,
     Array.from({ length: 33 }, (_, i) => [{ type: "text", text: "Source " + i }]),
   );
-  const remaining = JSON.stringify(events.slice(35));
+  const remaining = JSON.stringify(events.slice(34));
   await app.step();
-  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 34]);
-  assert.equal(native.summarize.mock.callCount(), 1);
-  assert.equal(fetch.mock.callCount(), 0);
-  assert.equal(JSON.stringify(events.slice(35)), remaining);
+  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 33]);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].history.length, 32);
+  assert.equal(requests[0].history[0].id, "event_2_block_0");
+  assert.equal(requests[0].history.at(-1).id, "event_33_block_0");
+  assert.equal(JSON.stringify(events.slice(34)), remaining);
 });
 
-test("a tool exchange that exceeds one batch is included in full native compaction", async (t) => {
-  const native = nativeCompaction(t);
-  const fetch = t.mock.method(globalThis, "fetch", async () => {
-    throw new Error("Unexpected Jev call");
+test("a partial tool result keeps the whole tool exchange outside the judged span", async (t) => {
+  const native = nativeCompaction(t),
+    requests = [];
+  t.mock.method(globalThis, "fetch", async (url, { body }) => {
+    requests.push(JSON.parse(JSON.parse(body).state));
+    return jevReply(body);
   });
   const app = autoComposition({ pressure: true });
   const events = contextHistory(app, [
@@ -924,54 +950,86 @@ test("a tool exchange that exceeds one batch is included in full native compacti
   ]);
   events[33].type = "tool/result";
   events[33].data.message.role = "tool";
-  const remaining = JSON.stringify(events.slice(34));
+  const remaining = JSON.stringify(events.slice(32));
   await app.step();
-  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 33]);
-  assert.equal(native.summarize.mock.callCount(), 1);
-  assert.equal(fetch.mock.callCount(), 0);
-  assert.equal(JSON.stringify(events.slice(34)), remaining);
+  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 31]);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].history.length, 30);
+  assert.equal(JSON.stringify(events.slice(32)), remaining);
 });
 
-test("an oversized candidate goes intact to the native summarizer", async (t) => {
-  const native = nativeCompaction(t);
-  const fetch = t.mock.method(globalThis, "fetch", async () => {
-    throw new Error("Unexpected Jev call");
-  });
-  const app = autoComposition({ pressure: true });
+test("a region whose full text exceeds the state budget is judged by previews and kept in full", async (t) => {
+  const native = nativeCompaction(t),
+    requests = [],
+    records = [];
+  t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
   const full = "x".repeat(STATE_BYTES) + "ESSENTIAL_TAIL";
-  app.agent.session.eventAt(2).data.message.content = [{ type: "text", text: full }];
-  let source;
-  native.summarize.mock.mockImplementation(async (input, agent) => {
-    source = agent.session.eventAt(2).data.message.content[0].text;
+  t.mock.method(globalThis, "fetch", async (url, { body }) => {
+    const state = JSON.parse(JSON.parse(body).state);
+    requests.push(state);
+    const answers = {};
+    for (const [i] of state.history.entries())
+      answers["importance_" + i] = { type: "score", score: i === 0 ? 2 : 0, confidence: 0.9 };
+    for (const [i] of state.history.entries())
+      answers["owner_" + i] = {
+        type: "choice",
+        choice: i === 0 ? "current" : "archive",
+        confidence: 0.9,
+      };
     return {
-      summary: [{ type: "text", text: "Native summary" }],
-      provider: "native",
-      model: "main",
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ model: "jev", answers }),
     };
   });
+  const app = autoComposition({ pressure: true, keepRatio: 0.35, recordFile: "context-decisions.jsonl" });
+  contextHistory(
+    app,
+    Array.from({ length: 4 }, () => [{ type: "text", text: full }]),
+  );
+  const sourceTokens = Math.ceil(full.length / 4);
+  const nodes = [100, 100, ...Array(4).fill(sourceTokens), 1024].map((tokens) => ({ tokens }));
+  app.ctx.tokenMeter.measure = () => ({
+    totalTokens: nodes.reduce((sum, node) => sum + node.tokens, 0),
+    nodes,
+  });
   await app.step();
-  assert.equal(source, full);
-  assert.equal(native.compact.mock.callCount(), 1);
-  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].history.length, 4);
+  for (const preview of requests[0].history) {
+    assert.ok(preview.text.length <= PREVIEW_CHARS);
+    assert.match(preview.text, /chars omitted/);
+  }
+  assert.equal(requests[0].history[0].text.includes("x".repeat(STATE_BYTES)), false);
+  assert.equal(records.find((record) => record.kind === "context_scores").estimatedBefore, 4 * sourceTokens);
+  assert.equal(native.summarize.mock.callCount(), 0);
+  const replaced = app.agent.session
+    .eventAt(2)
+    .data.message.content.map((block) => block.text)
+    .join("\n");
+  assert.ok(replaced.includes(full));
 });
 
-test("ceiling fallback compacts a tiny prefix and oversized event without Jev", async (t) => {
+test("the ceiling still compacts natively when Jev keeps too much context", async (t) => {
   const native = nativeCompaction(t);
-  const fetch = t.mock.method(globalThis, "fetch", async () => {
-    throw new Error("Unexpected Jev call");
-  });
-  const app = autoComposition({ pressure: true });
+  const records = [];
+  t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
+  t.mock.method(globalThis, "fetch", async (url, { body }) => jevReply(body));
+  const app = autoComposition({ pressure: true, keepRatio: 1, recordFile: "context-decisions.jsonl" });
   const full = "x".repeat(STATE_BYTES) + "ESSENTIAL_TAIL";
   contextHistory(app, [[{ type: "text", text: "Tiny" }], [{ type: "text", text: full }]]);
-  const nodes = [100, 100, 1, Math.ceil(full.length / 4), 1024].map((tokens) => ({ tokens }));
+  const nodes = [100, 100, 1, Math.ceil(full.length / 4) + 200, 1024].map((tokens) => ({ tokens }));
   const totalTokens = nodes.reduce((sum, node) => sum + node.tokens, 0);
   app.ctx.tokenMeter.measure = () => ({ totalTokens, nodes });
   assert.ok(totalTokens > app.config.pressureTokens * app.config.ceilingRatio);
   await app.step();
-  assert.equal(fetch.mock.callCount(), 0);
   assert.equal(native.compact.mock.callCount(), 1);
   assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 3]);
-  assert.equal(native.summarize.mock.callCount(), 1);
+  assert.ok(
+    records.some(
+      (record) => record.kind === "context_replaced" && record.reason === "ceiling_native",
+    ),
+  );
 });
 
 test("a native failure after Jev fails records the error and continues", async (t) => {
