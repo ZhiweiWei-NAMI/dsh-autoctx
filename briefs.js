@@ -8,7 +8,7 @@ const errorText = error => error instanceof Error ? error.message : String(error
 
 function git(cwd, args, timeoutMs) {
   return new Promise((accept, reject) => {
-    const child = execFile('git', ['-c', 'core.quotePath=false', ...args], {
+    const child = execFile('git', ['-c', 'core.quotePath=false', '-c', 'safe.directory=*', ...args], {
       cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, encoding: 'utf8',
     }, (error, stdout) => error ? reject(error) : accept(stdout));
     child.stdin?.end();
@@ -40,6 +40,8 @@ function boundedDiff(diff, maxChars) {
 }
 
 export async function workspaceDiff(cwd, { maxChars = 12000, timeoutMs = 5000 } = {}) {
+  // Without a workspace, git would diff whatever directory the host process runs in.
+  if (!cwd) return { diff: '', files: [], untracked: [], truncated: false, error: 'no workspace' };
   try {
     let base;
     try {
@@ -60,7 +62,8 @@ export async function workspaceDiff(cwd, { maxChars = 12000, timeoutMs = 5000 } 
       if (/^[RC]|^.[RC]/.test(entry)) i++;
     }
     let combined = diff, omitted = false;
-    for (const path of untracked) {
+    // Reading every new file of a large untracked tree would stall the turn; the first 20 are enough.
+    for (const path of untracked.slice(0, 20)) {
       if (!files.includes(path)) files.push(path);
       const absolute = resolve(cwd, path), info = await lstat(absolute);
       const header = `diff --git ${JSON.stringify('a/' + path)} ${JSON.stringify('b/' + path)}\n`;

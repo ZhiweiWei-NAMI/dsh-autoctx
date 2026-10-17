@@ -710,7 +710,7 @@ test("the schema default is Jev selection; contextSelection summary compacts wit
   assert.equal(fetch.mock.callCount(), 0);
 });
 
-test("a budgeted selection replaces the old region with the kept subset and a dropped index", async (t) => {
+test("a budgeted selection keeps one copy of a repeated output piece and replaces the region", async (t) => {
   const native = nativeCompaction(t),
     records = [];
   t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
@@ -726,14 +726,16 @@ test("a budgeted selection replaces the old region with the kept subset and a dr
   assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 2]);
   assert.equal(fetch.mock.callCount(), 1);
   const scored = records.find((record) => record.kind === "context_scores");
-  assert.equal(scored.dropped, 1);
-  assert.equal(scored.kept, 0);
+  // 10000 chars split into six identical 1500-char pieces and a shorter tail: one copy of each stays.
+  assert.equal(scored.segments, 7);
+  assert.equal(scored.kept, 2);
+  assert.equal(scored.dropped, 0);
   assert.ok(
     records.some((record) => record.kind === "context_replaced" && record.reason === "replacement"),
   );
   const after = app.agent.session.snapshotEvents().map((event) => JSON.stringify(event));
   assert.ok(after[2].length < original[2].length);
-  assert.match(after[2], /Archived units/);
+  assert.match(after[2], /chars of this output omitted/);
   assert.match(after[2], /assistant\/text/);
   assert.deepEqual([after[0], after[1], after[3]], [original[0], original[1], original[3]]);
 });
@@ -982,7 +984,7 @@ test("a complete tool exchange at the region end is replaced with the region", a
   assert.equal(JSON.stringify(events.slice(34)), remaining);
 });
 
-test("a region whose full text exceeds the state budget is judged by previews and kept in full", async (t) => {
+test("a region whose full text exceeds the state budget is judged by bounded piece previews", async (t) => {
   const native = nativeCompaction(t),
     requests = [],
     records = [];
@@ -1019,19 +1021,18 @@ test("a region whose full text exceeds the state budget is judged by previews an
   });
   await app.step();
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].history.length, 4);
-  for (const preview of requests[0].history) {
-    assert.ok(preview.text.length <= PREVIEW_CHARS);
-    assert.match(preview.text, /chars omitted/);
-  }
-  assert.equal(requests[0].history[0].text.includes("x".repeat(STATE_BYTES)), false);
+  assert.ok(requests[0].history.length > 4 && requests[0].history.length <= 32);
+  for (const preview of requests[0].history) assert.ok(preview.text.length <= PREVIEW_CHARS);
+  assert.ok(Buffer.byteLength(JSON.stringify(requests[0])) <= STATE_BYTES);
   assert.equal(records.find((record) => record.kind === "context_scores").estimatedBefore, 4 * sourceTokens);
   assert.equal(native.summarize.mock.callCount(), 0);
   const replaced = app.agent.session
     .eventAt(2)
     .data.message.content.map((block) => block.text)
     .join("\n");
-  assert.ok(replaced.includes(full));
+  // The small tail piece of each output is unjudged and kept once; the repeated filler is not.
+  assert.ok(replaced.includes("ESSENTIAL_TAIL"));
+  assert.equal(replaced.includes(full), false);
 });
 
 test("the ceiling still compacts natively when Jev keeps too much context", async (t) => {
@@ -1040,7 +1041,9 @@ test("the ceiling still compacts natively when Jev keeps too much context", asyn
   t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
   t.mock.method(globalThis, "fetch", async (url, { body }) => jevReply(body));
   const app = autoComposition({ pressure: true, keepRatio: 1, recordFile: "context-decisions.jsonl" });
-  const full = "x".repeat(STATE_BYTES) + "ESSENTIAL_TAIL";
+  // Non-repeating text, so no piece is a duplicate of another.
+  let seed = 7;
+  const full = Array.from({ length: STATE_BYTES }, () => "abcdefghijklmnopqrstuvwxyz"[(seed = (seed * 1103515245 + 12345) % 2147483648) % 26]).join("") + "ESSENTIAL_TAIL";
   contextHistory(app, [[{ type: "text", text: "Tiny" }], [{ type: "text", text: full }]]);
   const nodes = [100, 100, 1, Math.ceil(full.length / 4) + 200, 1024].map((tokens) => ({ tokens }));
   const totalTokens = nodes.reduce((sum, node) => sum + node.tokens, 0);
@@ -1232,7 +1235,8 @@ test("region selection requires guidance and restores its message after replacem
   app.agent.session.requestHeader = () => ({});
   const fetch = t.mock.method(globalThis, "fetch", async (url, { body }) => {
     const state = JSON.parse(JSON.parse(body).state);
-    assert.deepEqual(state.history.map((unit) => unit.id), ["event_3_block_0"]);
+    // Only the non-required output is a candidate, judged as evidence pieces.
+    assert.ok(state.history.length > 0 && state.history.every((unit) => unit.id.startsWith("event_3_block_0#")));
     return jevReply(body);
   });
   const compact = t.mock.method(

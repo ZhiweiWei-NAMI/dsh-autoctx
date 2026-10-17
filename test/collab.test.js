@@ -7,6 +7,8 @@ import { createGraph, observe, digest } from "../graph.js";
 import { costUSD } from "../models.js";
 import { STATE_BYTES } from "../decisions.js";
 import { newStats, applyStatsRecord } from "../stats.js";
+// Review and advisor briefs await the workspace diff before the child starts.
+const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 function childSession(id, parent = "root") {
   return {
@@ -467,6 +469,7 @@ test("advisor consults do not use up the review child slot", async (t) => {
   assert.equal(app.children.filter((child) => child.label === "Advisor").length, 2);
   app.edit(app.root, "src/a.js");
   const pending = app.stop();
+  await tick();
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(app.children.some((child) => child.label === "Independent review"));
   app.settle();
@@ -538,6 +541,7 @@ test("maxConcurrent still counts a running helper", async (t) => {
   await app.preStep(app.root, [userMessage("Fix the widget.")]);
   app.edit(app.root, "src/a.js");
   const pending = app.stop();
+  await tick();
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(app.children.some((child) => child.label === "Independent review"));
   const fail = () => app.handlers.get("tools/result")(
@@ -564,11 +568,12 @@ test("a configured cross-model reviewer uses spawn, agentOptions and the ledger"
   app.read(app.root, "src/a.js");
   app.edit(app.root, "src/a.js");
   const pending = app.stop();
+  await tick();
   await new Promise((resolve) => setImmediate(resolve));
   const review = app.children.find((child) => child.label === "Independent review");
   assert.equal(review.provider, "spawn");
   assert.deepEqual(review.agentOptions, { provider: "workbuddy", model: "glm-5.3-flash" });
-  assert.match(review.prompt, /Parent evidence ledger:\n/);
+  assert.match(review.prompt, /## Evidence ledger\n/);
   assert.match(review.prompt, /src\/a\.js/);
   app.settle();
   await pending;
@@ -581,13 +586,14 @@ test('the "same" reviewer forks; inside the first turn the fork has no seed, so 
   await app.preStep(app.root, [userMessage("Fix the widget.")]);
   app.edit(app.root, "src/a.js");
   const pending = app.stop();
+  await tick();
   await new Promise((resolve) => setImmediate(resolve));
   const review = app.children.find((child) => child.label === "Independent review");
   assert.equal(review.provider, "fork");
   assert.equal(review.agentOptions, undefined);
   // No tool filter: the fork keeps the parent's tool block and the guard enforces the reviewer's limits.
   assert.equal(review.toolFilter, undefined);
-  assert.match(review.prompt, /Parent evidence ledger:/);
+  assert.match(review.prompt, /## Evidence ledger/);
   app.settle();
   await pending;
 });
@@ -699,6 +705,7 @@ test("a forked reviewer keeps the tool block; the guard stops its edits and dele
   await app.preStep(app.root, [userMessage("Fix the widget.")]);
   app.edit(app.root, "src/a.js");
   const pending = app.stop();
+  await tick();
   await new Promise((resolve) => setImmediate(resolve));
   const reviewer = app.agents.get(app.children[0].id);
   const guard = app.handlers.get("tools/guard");
@@ -734,6 +741,7 @@ async function reviewedTurn(app) {
   await app.preStep(app.root, [userMessage("Fix the widget.")]);
   app.edit(app.root, "src/a.js");
   const pending = app.stop();
+  await tick();
   await new Promise((resolve) => setImmediate(resolve));
   app.settle();
   await pending;

@@ -4,6 +4,8 @@ import fs from "node:fs";
 import { apply } from "../index.js";
 import { createGraph, observe, editsAfter } from "../graph.js";
 import { newStats, applyStatsRecord } from "../stats.js";
+// Review and advisor briefs await the workspace diff before the child starts.
+const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 function childSession(id) {
   return {
@@ -180,10 +182,11 @@ test("a root turn that changed a file gets one review, and the report is steered
   }]);
   app.edit();
   const pending = app.stop(1);
+  await tick();
   assert.equal(app.started, 1);
   assert.equal(app.children.length, 1);
   assert.equal(app.children[0].mode, "one-shot");
-  assert.match(app.children[0].prompt, /Original issue:\nFix the missing widget\./);
+  assert.match(app.children[0].prompt, /## Original issue\nFix the missing widget\./);
   assert.equal(app.children[0].toolFilter, undefined);
   assert.deepEqual(records.filter((r) => r.kind === "review_start").length, 1);
   await app.stop(1);
@@ -245,6 +248,7 @@ test("a turn changed only by a bash write still gets one review", async (t) => {
     command: "cat > src/widget.js <<'EOF'\nexport const widget = 1;\nEOF",
   });
   const pending = app.stop(1);
+  await tick();
   assert.equal(app.started, 1);
   assert.deepEqual(records.filter((r) => r.kind === "review_start").length, 1);
   app.settle();
@@ -329,6 +333,7 @@ test("an empty review report is recorded as a failure without steering anything"
   await app.preStep(1);
   app.edit();
   const pending = app.stop(1);
+  await tick();
   app.settle();
   await pending;
   assert.equal(records.filter((r) => r.kind === "review_end").length, 0);
@@ -343,6 +348,7 @@ test("an aborted turn propagates the abort instead of recording a failure", asyn
   app.edit();
   const controller = new AbortController();
   const pending = app.stop(1, app.root, controller.signal);
+  await tick();
   await Promise.resolve();
   controller.abort(new Error("turn cancelled"));
   await assert.rejects(pending, /turn cancelled/);
@@ -355,6 +361,7 @@ test("the fork provider is preferred, with spawn as the fallback", async (t) => 
   await withFork.preStep(1);
   withFork.edit();
   const pending = withFork.stop(1);
+  await tick();
   assert.equal(withFork.children[0].provider, "fork");
   withFork.settle();
   await pending;
@@ -363,8 +370,9 @@ test("the fork provider is preferred, with spawn as the fallback", async (t) => 
   await noFork.preStep(1);
   noFork.edit(noFork.root, "str_replace_editor", { command: "str_replace" });
   const fallback = noFork.stop(1);
+  await tick();
   assert.equal(noFork.children[0].provider, "spawn");
-  assert.match(noFork.children[0].prompt, /Original issue:/);
+  assert.match(noFork.children[0].prompt, /## Original issue/);
   noFork.settle();
   await fallback;
 });
@@ -375,6 +383,7 @@ test("failed settlement with partial LGTM output does not continue the parent", 
   await app.preStep(1);
   app.edit();
   const pending = app.stop(1);
+  await tick();
   app.settle();
   await pending;
   assert.equal(app.children[0].disposed, true);

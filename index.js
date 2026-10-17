@@ -10,7 +10,8 @@ import { validateJsonSchemaValue, ToolArgsError } from "@deepseek-ai/dsh-tools";
 import { toolPairingBalancedBefore, toolPairingBalancedAfter } from "@deepseek-ai/dsh-compaction";
 import {
   scoreContext,
-  budgetedSelection,
+  planSelection,
+  renderSelection,
   droppedUnitLine,
   selectionBatch,
   extendTask,
@@ -25,6 +26,9 @@ import {
   DELEGATION_GUIDANCE,
 } from "./routing.js";
 import { newStats, applyStatsRecord } from "./stats.js";
+import { contributionFacts, learningQuestions, proposalsFrom } from "./learning.js";
+import { segmentUnits, focusTerms } from "./segments.js";
+import { workspaceDiff, hunkContext, failureExcerpt, adviceQuestion, advisorBrief, reviewBrief, attemptsFrom } from "./briefs.js";
 import {
   createGraph,
   observe,
@@ -56,7 +60,6 @@ import {
   revert,
   setUser,
   withdraw,
-  FIT_LEVELS,
   MODES,
 } from "./ledger.js";
 
@@ -286,13 +289,13 @@ const needOf = (weights) => {
 };
 const round = (value, digits = 6) => Math.round(value * 10 ** digits) / 10 ** digits;
 const REVIEW_PROMPT =
-  "Independently check the change the parent just made against the original issue. Inspect `git diff`, re-read the issue, run a minimal reproduction and the single most relevant existing test file. Never run the whole test suite; keep every command under 60 seconds; batch independent checks into one step. Do NOT edit files. Report only defects in the change itself: failures that also happen without the change, untested extras and style are not defects. Start the first line with exactly `LGTM` (then one line of evidence) or `DEFECTS` (then each concrete defect with evidence).";
+  "Independently check the change the parent just made against the original issue. The change and the code around it are below (run `git diff` only where the brief says it is truncated); re-read the issue, run a minimal reproduction and the single most relevant existing test file. Never run the whole test suite; keep every command under 60 seconds; batch independent checks into one step. Do NOT edit files. Report only defects in the change itself: failures that also happen without the change, untested extras and style are not defects. Start the first line with exactly `LGTM` (then one line of evidence) or `DEFECTS` (then each concrete defect with evidence).";
 const reviewMessage = (report) =>
   "An independent reviewer reports possible defects in your change:\n" +
   report +
   "\nCheck each against the behavior the issue asks for: fix the real ones and verify with the most relevant test; keep your change where a report contradicts the issue. Do not investigate unrelated or pre-existing failures, then finish.";
 const ADVISOR_PROMPT =
-  "You are a senior advisor to a coding agent. Do not call tools; answer from this brief only. Give the most likely root cause, the next 2–4 concrete steps, and what evidence would confirm them, in ≤ 1200 characters.";
+  "You are a senior advisor to a coding agent. Do not call tools; answer from this brief only. Answer its Question from the observed failure, the change and the code shown: name the specific line or condition at fault, the concrete fix, and what evidence would confirm it, in ≤ 1200 characters.";
 const advisorMessage = (model, trigger, reply) =>
   "Advisor (" + model + ", independent, no tool access) on " + trigger + ":\n" + reply +
   "\nTreat this as a hypothesis; verify it against evidence before acting.";
@@ -395,6 +398,8 @@ export function apply(ctx, options) {
   const currentTurn = new Map(),
     turnStartSteps = new Map(),
     changedTurn = new Map(),
+    // root session -> test key -> raw output of its latest failing run (the advisor has no tools).
+    failureOutput = new Map(),
     reviewedTurn = new Map(),
     reviewChildren = new Set(),
     reviewPending = new Set();
@@ -1008,7 +1013,15 @@ export function apply(ctx, options) {
           .flatMap((test) => test.runs)
           .filter((run) => run.via === undefined && run.event > since)
           .at(-1);
-        if (latest && (latest.outcome === "fail" || latest.outcome === "error")) wantEffort(exec.agent, "test_failure");
+        if (latest && (latest.outcome === "fail" || latest.outcome === "error")) {
+          wantEffort(exec.agent, "test_failure");
+          const key = Object.entries(graphFor(id).tests).find(([, test]) => test.runs.includes(latest))?.[0];
+          if (key) {
+            if (!failureOutput.has(id)) failureOutput.set(id, new Map());
+            const text = (result.content ?? []).filter((block) => block.type === "text").map((block) => block.text).join("\n");
+            failureOutput.get(id).set(key, text.slice(-40000));
+          }
+        }
       }
     }
     if (!delegation.has(exec.name) || !exec.agent) return;
@@ -1061,7 +1074,8 @@ export function apply(ctx, options) {
     if (childRoles.get(info.id) === "worker" && childModels.has(info.id)) {
       const use = roleUse(running.parent, "worker", childModels.get(info.id));
       if (info.stopReason === "completed") use.completed++;
-      use.reports.push({ outcome: info.stopReason, at: graphFor(running.parent).sequence });
+      const text = (info.lastAssistantMessage ?? []).filter((block) => block.type === "text").map((block) => block.text).join("\n").trim();
+      use.reports.push({ outcome: info.stopReason, at: graphFor(running.parent).sequence, text: text.slice(0, 300) });
     }
     record({
       kind: "child_end",
@@ -1355,10 +1369,17 @@ export function apply(ctx, options) {
       signal.throwIfAborted();
       // Even a seeded fork lacks the current turn (the host seeds completed turns only), so the brief
       // always carries the evidence ledger; it is appended after the inherited prefix.
-      const prompt =
-        REVIEW_PROMPT +
-        "\n\nOriginal issue:\n" + tasks.get(id) +
-        "\n\nParent evidence ledger:\n" + digest(rootGraph(agent), 3000);
+      // The reviewer starts from the actual change and its surrounding code instead of rediscovering them.
+      const cwd = workspaceOf(agent),
+        change = await workspaceDiff(cwd);
+      signal.throwIfAborted();
+      const prompt = reviewBrief({
+        prompt: REVIEW_PROMPT,
+        task: tasks.get(id),
+        diff: change.diff || "(no diff available" + (change.error ? ": " + change.error : "") + ")",
+        context: change.diff ? await hunkContext(cwd, change.diff) : "",
+        ledger: digest(rootGraph(agent), 3000),
+      });
       reviewPending.add(id);
       run = await ctx.subagents.start(provider, {
         label: "Independent review",
@@ -1835,11 +1856,28 @@ export function apply(ctx, options) {
     let run;
     try {
       signal.throwIfAborted();
-      const prompt =
-        ADVISOR_PROMPT +
-        "\n\nOriginal issue:\n" + tasks.get(id) +
-        "\n\nAgent evidence ledger:\n" + digest(rootGraph(agent), 3000) +
-        "\n\nTrigger: " + trigger;
+      // The advisor has no tools: the question, the raw failure, the change and the code around it are
+      // its evidence; the task and the ledger are background.
+      const graph = rootGraph(agent),
+        cwd = workspaceOf(agent),
+        test = trigger.startsWith("repeated failure: ") ? trigger.slice("repeated failure: ".length) : undefined,
+        runs = test ? (graph.tests[test]?.runs ?? []).filter((run) => run.via === undefined) : [],
+        change = await workspaceDiff(cwd);
+      signal.throwIfAborted();
+      const symbols = [...change.diff.matchAll(/^@@[^@]*@@\s*(?:async\s+)?(?:def|class|function)\s+([A-Za-z_$][\w$]*)/gm)].map((match) => match[1]);
+      const raw = test ? failureOutput.get(id)?.get(test) : undefined;
+      const prompt = advisorBrief({
+        prompt: ADVISOR_PROMPT,
+        question: adviceQuestion(trigger, { test, attempts: test ? Math.max(0, runs.length - 1) : undefined }),
+        failure: raw
+          ? failureExcerpt(raw, { focus: symbols })
+          : test ? (runs.at(-1)?.summary ?? "(no output captured)") : "(no failing run; trigger: " + trigger + ")",
+        diff: change.diff || "(no diff available" + (change.error ? ": " + change.error : "") + ")",
+        context: change.diff ? await hunkContext(cwd, change.diff) : "",
+        attempts: test ? attemptsFrom(graph, test) : "",
+        task: tasks.get(id),
+        ledger: digest(graph, 3000),
+      });
       advisorPending.add(id);
       run = await ctx.subagents.start("spawn", {
         label: "Advisor",
@@ -2168,19 +2206,6 @@ export function apply(ctx, options) {
     const latest = Object.values(graph.tests).map((test) => test.runs.at(-1)?.outcome);
     return { passing: latest.filter((x) => x === "pass").length, failing: latest.filter((x) => x === "fail" || x === "error").length };
   };
-  const editsAfterEvent = (graph, event) =>
-    Object.values(graph.files).flatMap((file) => file.edits).filter((edit) => edit.via === undefined && edit.event > event).length;
-  const basisOf = (fact, context) =>
-    [
-      fact.children + " " + fact.role + " run(s)",
-      ...fact.reports.slice(0, 2).map((report) =>
-        (report.verdict ?? report.outcome ?? "advice") + (report.executorEditsAfter ? ", executor edited after" : ", no edits after")),
-      "tests " + context.tests.passing + " pass/" + context.tests.failing + " fail",
-      "$" + fact.usd,
-      fact.seconds + "s",
-      ...(fact.cacheHit === null ? [] : ["cache " + Math.round(fact.cacheHit * 100) + "%"]),
-      ...(context.feedback ? ["user " + context.feedback.rating + (context.feedback.category ? " (" + context.feedback.category + ")" : "")] : []),
-    ].join("; ").slice(0, 160);
 
   async function settleTurn(session, turn) {
     const id = session.id,
@@ -2201,21 +2226,14 @@ export function apply(ctx, options) {
     const since = (key, entry, field) => entry[field] - (base[key]?.[field] ?? 0);
     const facts = Object.entries(use.roles)
       .filter(([key, entry]) => LEARNED_ROLES.has(entry.role) && since(key, entry, "children") > 0)
-      .map(([key, entry]) => {
-        const input = since(key, entry, "input");
-        return {
-          role: entry.role,
-          model: entry.model,
-          children: since(key, entry, "children"),
-          completed: since(key, entry, "completed"),
-          calls: since(key, entry, "calls"),
-          usd: round(since(key, entry, "usd")),
-          seconds: round(since(key, entry, "ms") / 1000, 1),
-          cacheHit: input ? round(since(key, entry, "cacheRead") / input, 3) : null,
-          reports: entry.reports.slice(base[key]?.reports ?? 0)
-            .map(({ at, ...report }) => ({ ...report, executorEditsAfter: editsAfterEvent(graph, at) })),
-        };
-      });
+      // Each report is split into its specific claims, each paired with the later facts it names.
+      .map(([key, entry]) => contributionFacts({
+        role: entry.role,
+        model: entry.model,
+        ...Object.fromEntries(["children", "completed", "calls", "usd", "ms", "input", "cacheRead"]
+          .map((field) => [field, since(key, entry, field)])),
+        reports: entry.reports.slice(base[key]?.reports ?? 0).map((report) => ({ ...report, text: report.text ?? "" })),
+      }, graph));
     const executor = Object.values(use.roles).find((entry) => entry.role === "executor");
     const summary = {
       turn,
@@ -2271,12 +2289,9 @@ export function apply(ctx, options) {
       return;
     }
     const tagged = context.tag !== undefined;
-    const questions = Object.fromEntries(facts.map((fact, i) => ["fit_" + i, {
-      type: "score",
-      instructions:
-        "How well does " + fact.model + " fit the " + fact.role + " role for " + (tagged ? context.tag : "this kind of") + " tasks in this workspace, given facts[" + i + "] from this task and its current weight? Use observed facts only: a defects report the executor acted on before tests passed was useful; one contradicted by passing tests without edits, or by user feedback, was wrong advice; cost and time count under the user's need (" + context.need + "). One task is weak evidence.",
-      criteria: FIT_LEVELS,
-    }]));
+    // Use records saved before claims were extracted carry no claims: nothing in them is judgeable.
+    facts = facts.map((fact) => ({ ...fact, reports: (fact.reports ?? []).map((report) => ({ claims: [], unmatched: 0, ...report })) }));
+    const questions = learningQuestions(facts, { tag: context.tag, need: context.need });
     // Without a tag yet, the current weights of every tag are shown and the tag is asked in the same call.
     const current = (fact) =>
       tagged
@@ -2292,14 +2307,12 @@ export function apply(ctx, options) {
     const answers = (await decide(agent, request, AbortSignal.timeout(20000), { unbudgeted: true })).answers;
     const tag = tagged ? context.tag : answers.task_tag.choice;
     context = { ...context, tag };
-    const proposals = facts.map((fact, i) => ({
-      key: weightKey(tag, fact.model, fact.role),
-      evidence: [evidenceId + ":" + fact.role + "|" + fact.model],
-      target: answers["fit_" + i].score / (FIT_LEVELS.length - 1),
-      basis: basisOf(fact, context),
-      // Jev's confidence is not calibrated; it is shown as is, labeled so.
-      uncertainty: round(1 - answers["fit_" + i].confidence, 2),
-    }));
+    // A contribution Jev cannot tie to observed facts is no observation: its weight and count stay.
+    const { proposals, unassessable } = proposalsFrom(answers, facts, { tag, evidenceId, weightKey });
+    if (!proposals.length) {
+      record({ kind: "learning", session: id, tag, mode: ledger.mode, proposed: false, reason: "unassessable", unassessable });
+      return;
+    }
     const result = await updateLedger(cwd, (latest) => propose(latest, proposals, Date.now()));
     record({
       kind: "learning",
@@ -2311,6 +2324,7 @@ export function apply(ctx, options) {
       applied: result.applied.map((item) => ({ key: item.key, from: item.current, to: item.proposed })),
       pending: result.pending ? result.ledger.pending.version : null,
       skipped: result.skipped,
+      unassessable,
     });
   }
 
@@ -2486,11 +2500,31 @@ export function apply(ctx, options) {
     // One decision covers the whole region: Jev judges the largest units, where the savings are, and
     // the rest stay verbatim. Judging only the oldest batch freed 2-4K tokens per replacement, so
     // pressure returned within a few steps and every return cost another decision from the budget.
+    // Candidates are evidence pieces (a test section, a diff hunk, a definition), not whole outputs, so a
+    // decisive line in the middle of a long output reaches Jev. The open problem and what stays anyway are
+    // in the state, because Jev judges each candidate on its own; duplicates and complements are local.
+    const own = graphFor(id),
+      failing = Object.entries(own.tests)
+        .filter(([, test]) => ["fail", "error"].includes(test.runs.at(-1)?.outcome))
+        .map(([key, test]) => ({ key, run: test.runs.at(-1) }));
+    const rawFailures = failing.map(({ key }) => failureOutput.get(rootOf(agent))?.get(key) ?? "").join("\n");
+    const focus = focusTerms({
+      failingTests: failing.flatMap(({ key }) => key.match(/\btest_\w+|[\w./-]+\.py\b/g) ?? []),
+      errors: [...new Set(rawFailures.match(/\b[A-Z]\w*(?:Error|Exception)\b/g) ?? [])].slice(0, 8),
+    });
+    const openQuestion = failing.length
+      ? "Still failing: " + failing.slice(0, 3).map(({ key, run }) => key + (run.summary ? " (" + String(run.summary).slice(0, 160) + ")" : "")).join("; ")
+      : undefined;
+    const retained = {
+      note: "Kept regardless of this selection: the instructions below, the context before this region, and observation.currentEvidence.",
+      instructions: history.filter((unit) => unit.required).map((unit) => unit.text.slice(0, 400)).slice(-4),
+    };
+    const segments = segmentUnits(history, { focus });
     const unitText = (unit) => unit.kind + ":\n" + unit.text;
-    const tokensOf = (unit) => ctx.tokenMeter.estimateMessage(note(unitText(unit)));
-    const sizes = new Map(history.map((unit) => [unit.id, tokensOf(unit)]));
-    const largestFirst = [...history].sort((a, b) => sizes.get(b.id) - sizes.get(a.id));
-    const batch = selectionBatch(tasks.get(id), largestFirst, observation);
+    const tokensOf = (piece) => ctx.tokenMeter.estimateMessage(note(piece.unitId === undefined ? unitText(piece) : piece.text));
+    const sizes = new Map(segments.map((piece) => [piece.id, tokensOf(piece)]));
+    const largestFirst = [...segments].sort((a, b) => sizes.get(b.id) - sizes.get(a.id));
+    const batch = selectionBatch(tasks.get(id), largestFirst, observation, { openQuestion, retained, focus });
     if (!batch) {
       record({
         kind: "decision_budget_boundary",
@@ -2502,7 +2536,6 @@ export function apply(ctx, options) {
       return;
     }
     const judgedIds = new Set(batch.history.map((unit) => unit.id));
-    const judged = history.filter((unit) => judgedIds.has(unit.id));
     if (state.decisions >= config.maxDecisions) {
       record({
         kind: "decision_budget_boundary",
@@ -2592,35 +2625,25 @@ export function apply(ctx, options) {
         effort: selection.answers.thinking.choice === "always" ? config.adaptiveEffort : undefined,
       };
     const regionTokens = regionTokensEstimate;
-    // Unjudged units are kept first (required ones always); when they alone exceed the keep budget,
-    // the oldest non-required ones are archived to one line each.
-    const keepBudget = config.keepRatio * regionTokens;
-    const unjudged = history.filter((unit) => !judgedIds.has(unit.id));
-    const kept = new Set(unjudged.map((unit) => unit.id));
-    let unjudgedTokens = unjudged.reduce((sum, unit) => sum + sizes.get(unit.id), 0);
-    for (const unit of unjudged) {
-      if (unjudgedTokens <= keepBudget) break;
-      if (unit.required) continue;
-      kept.delete(unit.id);
-      unjudgedTokens -= sizes.get(unit.id);
-    }
-    const budgeted = budgetedSelection(
-      judged,
-      selection.judgments,
-      Math.max(0, keepBudget - unjudgedTokens),
-      tokensOf,
-    );
-    for (const keptId of budgeted.keptIds) kept.add(keptId);
-    const dropped = history.filter((unit) => !kept.has(unit.id));
-    const summary = history
-      .filter((unit) => kept.has(unit.id))
-      .map((unit) => ({ type: "text", text: unitText(unit) }));
+    // Required pieces always stay; then Jev's necessary pieces, unjudged ones newest first, and the rest
+    // by importance, each with the definition or report it needs, one copy of each duplicate.
+    const plan = planSelection({
+      segments,
+      judgedIds: [...judgedIds],
+      judgments: selection.judgments,
+      keepBudget: config.keepRatio * regionTokens,
+      tokensOf: (piece) => sizes.get(piece.id),
+    });
+    const rendered = renderSelection(history, segments, plan.keptIds, droppedUnitLine);
+    const kept = new Set(plan.keptIds),
+      dropped = rendered.dropped;
+    const summary = rendered.blocks.map((text) => ({ type: "text", text }));
     if (dropped.length)
       summary.push({
         type: "text",
         text:
           "Archived units (already examined; listed for avoidance, content removed):\n" +
-          dropped.map(droppedUnitLine).join("\n"),
+          dropped.join("\n"),
       });
     const replacementTokens =
       ctx.tokenMeter.estimateMessage(note(summary.map((x) => x.text).join("\n"))) + 200;
@@ -2628,8 +2651,10 @@ export function apply(ctx, options) {
       kind: "context_scores",
       session: id,
       judgments: selection.judgments,
+      segments: segments.length,
       kept: kept.size,
       dropped: dropped.length,
+      ...(openQuestion ? { openQuestion } : {}),
       estimatedBefore: regionTokens,
       estimatedAfter: replacementTokens,
     });

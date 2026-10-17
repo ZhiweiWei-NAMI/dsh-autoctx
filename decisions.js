@@ -38,8 +38,8 @@ export function selectionBatch(task, history, observation={}, extra={}) {
   const terms = focusTerms({symbols:extra.focus ?? []}).map(term => term.toLowerCase());
   const matches = unit => terms.some(term => [unit.text, unit.tool, unit.argument]
     .some(value => typeof value === 'string' && value.toLowerCase().includes(term)));
-  const candidates = history.filter(unit => !unit.required).sort((a,b) =>
-    Number(matches(b))-Number(matches(a)) || b.text.length-a.text.length);
+  // The caller's order (largest first) is kept; candidates matching the open problem go first.
+  const candidates = history.filter(unit => !unit.required).sort((a,b) => Number(matches(b))-Number(matches(a)));
   const selected = [];
   for (const unit of candidates) {
     if (selected.length>=32) break;
@@ -187,9 +187,12 @@ export function planSelection({segments, judgedIds, judgments, keepBudget, token
     }
   };
   for (const segment of segments.filter(segment => segment.required)) complete(segment);
+  // Evidence Jev called necessary goes before unjudged pieces (segmentation leaves many); lower bands
+  // only take what is left.
+  for (const segment of ranked) if (scores.get(segment.id) > 1.5 && take(segment)) complete(segment);
   for (const segment of unjudged) if (take(segment)) complete(segment);
-  // Scores are processed in descending bands before cheaper, lower-value evidence.
-  for (const segment of ranked) if (take(segment)) complete(segment);
+  // A piece Jev judged to add little is archived unless another kept piece needs it (complete above).
+  for (const segment of ranked) if (scores.get(segment.id) <= 1.5 && scores.get(segment.id) >= 0.5 && take(segment)) complete(segment);
   return {keptIds:segments.filter(segment => kept.has(segment.id)).map(segment => segment.id),
     droppedIds:segments.filter(segment => !kept.has(segment.id)).map(segment => segment.id), usedTokens};
 }
