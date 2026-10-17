@@ -193,11 +193,8 @@ test("a root turn that changed a file gets one review, and the report is steered
   assert.equal(app.children[0].disposed, true);
   assert.equal(records.filter((r) => r.kind === "review_end").length, 1);
   assert.equal(records.find((r) => r.kind === "review_end").lgtm, true);
-  assert.equal(app.steered.length, 1);
-  assert.deepEqual(app.steered[0].source, { kind: "dsh-autoctx" });
-  assert.match(app.steered[0].content[0].text, /Independent review of your change/);
-  assert.match(app.steered[0].content[0].text, /LGTM: tests pass/);
-  assert.match(app.steered[0].content[0].text, /fix it and verify; otherwise finish\./);
+  // LGTM ends the turn without steering the report back.
+  assert.equal(app.steered.length, 0);
   await app.stop(1);
   await app.preStep(2);
   await app.stop(2);

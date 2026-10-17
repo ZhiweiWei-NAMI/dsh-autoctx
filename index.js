@@ -208,11 +208,11 @@ const HELPER_LABELS = new Set(["Independent review", "Advisor"]);
 // Tools whose successful result means the turn changed files on disk.
 const fileChanging = new Set(["edit", "write", "apply_patch", "multi_edit"]);
 const REVIEW_PROMPT =
-  "Independently check the change the parent just made against the original issue. Inspect `git diff`, re-read the issue, run a minimal reproduction and the single most relevant existing test file. Never run the whole test suite; keep every command under 60 seconds; batch independent checks into one step. Do NOT edit files. Start the first line with exactly `LGTM` (then the evidence) or `DEFECTS` (then each concrete defect with evidence).";
+  "Independently check the change the parent just made against the original issue. Inspect `git diff`, re-read the issue, run a minimal reproduction and the single most relevant existing test file. Never run the whole test suite; keep every command under 60 seconds; batch independent checks into one step. Do NOT edit files. Report only defects in the change itself: failures that also happen without the change, untested extras and style are not defects. Start the first line with exactly `LGTM` (then one line of evidence) or `DEFECTS` (then each concrete defect with evidence).";
 const reviewMessage = (report) =>
-  "Independent review of your change:\n" +
+  "Independent review found defects in your change:\n" +
   report +
-  "\nIf it reports a defect, fix it and verify; otherwise finish.";
+  "\nFix only these defects, verify them with the most relevant test, then finish. Do not investigate unrelated or pre-existing failures.";
 const ADVISOR_PROMPT =
   "You are a senior advisor to a coding agent. Do not call tools; answer from this brief only. Give the most likely root cause, the next 2–4 concrete steps, and what evidence would confirm them, in ≤ 1200 characters.";
 const advisorMessage = (model, trigger, reply) =>
@@ -828,6 +828,7 @@ export function apply(ctx, options) {
     const id = agent.session.id;
     if (effortInstalled.has(id) || !agent.ctx || !config.adaptiveEffort || config.adaptiveEffort === "off") return;
     effortInstalled.add(id);
+    // Prepended so it runs outermost: dsh's model selection drops any effort an inner listener sets.
     agent.ctx.on("agent/request", async (payload, next) => {
       const resolved = await next();
       if (effortSupported.get(id) !== true || agent.options?.reasoningEffort !== undefined) return resolved;
@@ -840,7 +841,7 @@ export function apply(ctx, options) {
       if (resolved.reasoningEffort === undefined) return resolved;
       const { reasoningEffort: _raised, ...withoutEffort } = resolved;
       return withoutEffort;
-    });
+    }, { prepend: true });
   }
 
   // Helpers share the task's concurrency and request budgets.
@@ -993,8 +994,12 @@ export function apply(ctx, options) {
         stopReason: outcome.stopReason,
         lgtm: /^[\W_]*LGTM\b/i.test(report),
       });
-      agent.steer(note(reviewMessage(report)));
-      wantEffort(agent, "review_report");
+      // LGTM ends the turn as is: steering the report back reopened it, and flash executors chased
+      // the reviewer's caveats until the request cap.
+      if (!/^[\W_]*LGTM\b/i.test(report)) {
+        agent.steer(note(reviewMessage(report)));
+        wantEffort(agent, "review_report");
+      }
     } catch (error) {
       signal.throwIfAborted();
       record({ kind: "review_failed", session: id, turn, childId: run?.id, error: String(error) });

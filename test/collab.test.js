@@ -465,7 +465,7 @@ test("advisor consults do not use up the review child slot", async (t) => {
   assert.ok(app.children.some((child) => child.label === "Independent review"));
   app.settle();
   await pending;
-  assert.equal(app.steered.length, 1);
+  assert.equal(app.steered.length, 0); // the review completed with LGTM, which ends the turn
 });
 
 test("helpers from a resumed listing do not consume delegation slots", async (t) => {
@@ -566,7 +566,7 @@ test("a configured cross-model reviewer uses spawn, agentOptions and the ledger"
   assert.match(review.prompt, /src\/a\.js/);
   app.settle();
   await pending;
-  assert.equal(app.steered.length, 1);
+  assert.equal(app.steered.length, 0); // the review completed with LGTM, which ends the turn
 });
 
 test('the "same" reviewer keeps the fork review without a model brief', async (t) => {
