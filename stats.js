@@ -48,8 +48,10 @@ export function applyStatsRecord(stats,record,decisions=stats.decisions) {
     case 'jev': if (Number.isFinite(record.usd)) next.cost={...stats.cost,jev:stats.cost.jev+record.usd};
       else next.unpriced=stats.unpriced+1; break;
     case 'review_start': if (record.provider==='fork') { next.forks=stats.forks+1; if (record.historySeeded) next.historySeeded=stats.historySeeded+1; } break;
-    case 'turn_plan': next.plan={tag:record.tag,effort:record.effort,via:record.via,highReasoning:record.highReasoning??null}; break;
-    case 'effort_checkpoint': next.plan={...(stats.plan??{}),effort:record.to,via:'checkpoint',highReasoning:record.highReasoning}; break;
+    case 'turn_plan': next.plan={tag:record.tag,thinking:record.thinking??null,effort:record.effort,via:record.via,
+      probabilities:record.probabilities??null,raised:0}; break;
+    case 'effort_checkpoint': next.plan={...(stats.plan??{}),thinking:record.to,via:'checkpoint'}; break;
+    case 'effort_raised': if (stats.plan) next.plan={...stats.plan,raised:(stats.plan.raised??0)+1}; break;
     case 'context_deferred': next.deferrals=stats.deferrals+1; break;
     case 'learning': next.learning={mode:record.mode,version:record.version??null,proposed:record.proposed,
       applied:record.applied??[],pending:record.pending??null,reason:record.reason??null}; break;

@@ -259,6 +259,16 @@ const TAG_QUESTION = {
   criteria: TASK_TAGS,
 };
 const LEARNED_ROLES = new Set(["reviewer", "advisor", "worker"]);
+// Thinking policies Jev chooses from per turn (and again at a context checkpoint).
+const THINKING_POLICIES = {
+  off: "No thinking this turn: every request stays in one provider cache space. Fits mechanical, well-specified work.",
+  decision_points:
+    "Think only on the request right after a decision point: the start of the turn, a failing test, a reviewer's defect report, an advisor reply, or several steps without new evidence. Other requests stay off; each switch re-reads the context uncached once.",
+  always: "Think on every request this turn: one cache space, but more output tokens and time on every request.",
+};
+// Measured in dsh-bench (12 SWE-bench Verified pytest tasks, 600 s, 64 calls incl. Jev; resolved tasks).
+const THINKING_MEASURED =
+  "dsh-bench, 12 SWE-bench Verified tasks per run: deepseek-v4.1-flash resolved 18/24 with decision_points and 15/24 with thinking off for the whole turn; glm-5.3-flash 18/24 with decision_points and 7/12 with off; always was not measured. Small samples.";
 // Measured on deepseek-v4.1-flash through WorkBuddy (same affinity id): thinking on and off are separate
 // provider cache spaces. Other routes were not measured.
 const thinkingCacheFact = (model) =>
@@ -405,6 +415,8 @@ export function apply(ctx, options) {
     effortSupported = new Map(),
     effortInstalled = new Set(),
     effortSet = new Map(),
+    effortDue = new Map(),
+    effortStall = new Map(),
     userEffort = new Set(),
     childEffort = new Map(),
     // Per-root accounting of the current turn: role use, cost and cache by category.
@@ -528,6 +540,7 @@ export function apply(ctx, options) {
         "execution_call",
         "turn_plan",
         "effort_checkpoint",
+        "effort_raised",
         "context_deferred",
         "learning",
       ].includes(value.kind)
@@ -989,6 +1002,14 @@ export function apply(ctx, options) {
         },
       );
       noteEdits(root, id, id === root ? "parent" : childLabels.get(id) ?? id, since);
+      if (id === root) {
+        // A failing test run is where a flash executor most often misdiagnoses: a decision point.
+        const latest = Object.values(graphFor(id).tests)
+          .flatMap((test) => test.runs)
+          .filter((run) => run.via === undefined && run.event > since)
+          .at(-1);
+        if (latest && (latest.outcome === "fail" || latest.outcome === "error")) wantEffort(exec.agent, "test_failure");
+      }
     }
     if (!delegation.has(exec.name) || !exec.agent) return;
     budget(rootOf(exec.agent)).pending.delete(exec.callId);
@@ -1071,9 +1092,23 @@ export function apply(ctx, options) {
     });
   }
 
-  // One Jev turn plan per root turn: the task tag keys the workspace ledger, and the thinking setting
-  // stays for the whole turn. Toggling it per event split the cache (thinking on and off are separate
-  // cache spaces on the measured route), so it changes only here and at a context checkpoint.
+  // One Jev turn plan per root turn: the task tag keys the workspace ledger, and Jev picks the turn's
+  // thinking policy with the measured outcomes and the cache cost of a switch in view. The policy holds
+  // for the turn and is revisited only at a context checkpoint, where the prefix is rebuilt anyway.
+  const thinkingQuestion = (instructions) => ({ type: "choice", instructions, criteria: THINKING_POLICIES });
+  const thinkingState = (agent, contextTokens) => {
+    const price = modelInfo(currentModel(agent))?.price;
+    return {
+      model: currentModel(agent),
+      route: agent.options?.provider,
+      contextTokens,
+      cache: thinkingCacheFact(currentModel(agent)),
+      ...(price
+        ? { switchCostUSDNow: round((contextTokens * (price.input - (price.cacheRead ?? price.input))) / 1e6, 5) }
+        : {}),
+      measured: THINKING_MEASURED,
+    };
+  };
   async function planTurn(agent, signal) {
     const id = agent.session.id,
       turn = currentTurn.get(id),
@@ -1082,56 +1117,52 @@ export function apply(ctx, options) {
     // Without an effort to decide, nothing is asked here: the task tag rides on the first later decision
     // that needs it (role choice or learning).
     if (!effortOn) {
-      turnPlans.set(id, { turn, via: "none" });
+      turnPlans.set(id, { turn, thinking: "off", via: "none" });
       return turnPlans.get(id);
     }
-    const plan = { turn, effort: previous?.effort, via: "kept" };
-    const questions = {
-      task_tag: TAG_QUESTION,
-      ...(effortOn
-        ? {
-            high_reasoning: {
-              type: "noul",
-              instructions:
-                "Should the executor keep extended reasoning (thinking) on for the rest of this turn? It adds output tokens and time to every request; it pays off when the cause is unclear or several hypotheses must be weighed, less when the next steps are mechanical. A change from the current setting has the cache effect in `executor.thinkingCache`. Answer the probability that thinking on gives the better outcome under the user's preference.",
-            },
-          }
-        : {}),
-    };
+    // Without a Jev answer the measured default holds: thinking at decision points.
+    const plan = { turn, thinking: previous?.thinking ?? "decision_points", via: "default" };
     const anchor = pressureAnchors.get(id);
     const request = {
       task: tasks.get(id),
       trigger: "turn_plan",
       preference: roots.get(id)?.policy?.weights,
       executor: {
-        model: agent.options?.model,
-        route: agent.options?.provider,
-        thinkingNow: previous?.effort ? "on (" + previous.effort + ")" : "off",
-        thinkingCache: thinkingCacheFact(agent.options?.model),
-        contextTokens: anchor?.input ?? ctx.tokenMeter.measure(agent.session).totalTokens,
-        ...(lastCached.has(id) ? { lastCachedTokens: lastCached.get(id) } : {}),
+        ...thinkingState(agent, anchor?.input ?? ctx.tokenMeter.measure(agent.session).totalTokens),
+        thinkingNow: previous?.thinking ?? "decision_points",
       },
-      questions,
+      questions: {
+        task_tag: TAG_QUESTION,
+        thinking: thinkingQuestion(
+          "Which thinking policy should the executor follow for this turn? Quality of the result comes first; weigh the measured outcomes in `executor.measured`, the extra output tokens and time of thinking, and the cache cost of each switch (`executor.switchCostUSDNow`) under the user's preference.",
+        ),
+      },
     };
     try {
       const answers = (await decide(agent, request, signal)).answers;
       plan.tag = answers.task_tag.choice;
       plan.tagConfidence = answers.task_tag.confidence;
-      if (effortOn) {
-        plan.highReasoning = answers.high_reasoning.noul;
-        plan.effort = answers.high_reasoning.noul >= 0.5 ? config.adaptiveEffort : undefined;
-      }
+      plan.thinking = answers.thinking.choice;
+      plan.thinkingProbabilities = answers.thinking.probabilities;
       plan.via = "jev";
     } catch (error) {
       if (signal.aborted) throw error;
-      // Without Jev the current setting stays: a switch would only cost a cache rebuild.
       plan.error = String(error).slice(0, 200);
     }
+    plan.effort = plan.thinking === "always" ? config.adaptiveEffort : undefined;
     turnPlans.set(id, plan);
-    record({ kind: "turn_plan", session: id, turn, tag: plan.tag ?? null, effort: plan.effort ?? null, via: plan.via,
-      ...(plan.highReasoning === undefined ? {} : { highReasoning: plan.highReasoning }),
+    record({ kind: "turn_plan", session: id, turn, tag: plan.tag ?? null, thinking: plan.thinking, effort: plan.effort ?? null,
+      via: plan.via, ...(plan.thinkingProbabilities ? { probabilities: plan.thinkingProbabilities } : {}),
       ...(plan.error ? { error: plan.error } : {}) });
+    if (plan.thinking === "decision_points") wantEffort(agent, "turn_start");
     return plan;
+  }
+
+  // Under the decision-points policy, the root's next request thinks after one of these events.
+  function wantEffort(agent, reason) {
+    if (agent.session.header.parentSession !== undefined) return;
+    if (turnPlans.get(agent.session.id)?.thinking !== "decision_points") return;
+    if (!effortDue.has(agent.session.id)) effortDue.set(agent.session.id, reason);
   }
 
   // The root's sticky effort through dsh's request-config waterfall on the agent's own scoped context, as
@@ -1154,10 +1185,17 @@ export function apply(ctx, options) {
       }
       const root = rootOf(agent);
       let effort;
-      if (id === root) effort = effortSupported.get(root) === true ? turnPlans.get(root)?.effort : undefined;
-      else {
-        // A same-model child keeps the effort its branch started with: a later parent checkpoint does
-        // not rewrite the cache identity of a running child.
+      if (id === root) {
+        const plan = effortSupported.get(root) === true ? turnPlans.get(root) : undefined;
+        if (plan?.thinking === "always") effort = plan.effort;
+        else if (plan?.thinking === "decision_points" && effortDue.has(id)) {
+          effort = config.adaptiveEffort;
+          record({ kind: "effort_raised", session: id, effort, reason: effortDue.get(id), step: payload.step });
+          effortDue.delete(id);
+        }
+      } else {
+        // A same-model child keeps the effort its branch started with (only an always-thinking parent
+        // passes one on): a later parent checkpoint does not rewrite a running child's cache identity.
         if (!childEffort.has(id))
           childEffort.set(id, effortSupported.get(root) === true && resolved.model === currentModel(ctx.agents.get(root))
             ? turnPlans.get(root)?.effort : undefined);
@@ -1375,6 +1413,7 @@ export function apply(ctx, options) {
       // the reviewer's caveats until the request cap.
       if (!lgtm) {
         agent.steer(note(reviewMessage(report)));
+        wantEffort(agent, "review_report");
         return true;
       }
     } catch (error) {
@@ -1862,7 +1901,10 @@ export function apply(ctx, options) {
     }
     const reminder = takeSync(agent);
     if (reminder) extra.push(note(reminder));
-    if (advisor) extra.push(note(advisor));
+    if (advisor) {
+      extra.push(note(advisor));
+      wantEffort(agent, "advisor_report");
+    }
     if (extra.length) admitted = { ...admitted, messages: [...(admitted.messages ?? []), ...extra] };
     if (agent.session.header.parentSession !== undefined) return admitted;
     const guidance = agent.session
@@ -1901,6 +1943,16 @@ export function apply(ctx, options) {
       record({ kind: "turn_reopened", session: id, turn: payload.turn });
     }
     installEffort(agent);
+    if (!isChild) {
+      // Several steps without new evidence are a decision point too.
+      const key = progressKey(graphFor(id)),
+        stall = effortStall.get(id);
+      if (!stall || stall.key !== key) effortStall.set(id, { key, step: graphStep(id), done: false });
+      else if (!stall.done && graphStep(id) - stall.step >= 4) {
+        stall.done = true;
+        wantEffort(agent, "stall");
+      }
+    }
     if (messages.some((m) => ["user", "agent-message", "subagent-settled"].includes(m.source.kind)))
       declinedDelegation.delete(id);
     if (isChild && turnIds.get(id) !== payload.turn) {
@@ -2349,9 +2401,8 @@ export function apply(ctx, options) {
         });
         if (checkpointEffort) {
           const plan = turnPlans.get(id) ?? { via: "checkpoint" };
-          if (checkpointEffort.effort !== plan.effort)
-            record({ kind: "effort_checkpoint", session: id, from: plan.effort ?? null, to: checkpointEffort.effort ?? null,
-              highReasoning: checkpointEffort.highReasoning });
+          if (checkpointEffort.thinking !== plan.thinking)
+            record({ kind: "effort_checkpoint", session: id, from: plan.thinking ?? null, to: checkpointEffort.thinking });
           turnPlans.set(id, { ...plan, ...checkpointEffort, via: "checkpoint" });
         }
       } catch (error) {
@@ -2501,11 +2552,9 @@ export function apply(ctx, options) {
         : {}),
       ...(effortOn
         ? {
-            high_reasoning: {
-              type: "noul",
-              instructions:
-                "After this checkpoint, should the executor keep extended reasoning (thinking) on for the rest of the turn? The replacement re-reads the context anyway, so switching now costs no extra cache rebuild. Answer the probability that thinking on gives the better outcome under the user's preference.",
-            },
+            thinking: thinkingQuestion(
+              "Which thinking policy should the executor follow after this checkpoint? The replacement re-reads the context anyway, so changing the policy now adds no cache rebuild. Quality of the result comes first; weigh `executorThinking.measured` and the extra output tokens and time under the user's preference.",
+            ),
           }
         : {}),
     };
@@ -2519,7 +2568,8 @@ export function apply(ctx, options) {
       );
       selection = await scoreContext(
         (request) => decide(agent, request, signal),
-        { ...batch, economics, preference: roots.get(rootOf(agent))?.policy?.weights, executorThinking: turnPlans.get(id)?.effort ?? "off" },
+        { ...batch, economics, preference: roots.get(rootOf(agent))?.policy?.weights,
+          ...(effortOn ? { executorThinking: { now: turnPlans.get(id)?.thinking ?? "off", measured: THINKING_MEASURED } } : {}) },
         owners,
         extra,
       );
@@ -2536,10 +2586,10 @@ export function apply(ctx, options) {
         recheckAt: deferredSelection.get(id), economics });
       return;
     }
-    if (selection.answers.high_reasoning)
+    if (selection.answers.thinking)
       checkpointEffort = {
-        effort: selection.answers.high_reasoning.noul >= 0.5 ? config.adaptiveEffort : undefined,
-        highReasoning: selection.answers.high_reasoning.noul,
+        thinking: selection.answers.thinking.choice,
+        effort: selection.answers.thinking.choice === "always" ? config.adaptiveEffort : undefined,
       };
     const regionTokens = regionTokensEstimate;
     // Unjudged units are kept first (required ones always); when they alone exceed the keep budget,

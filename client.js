@@ -100,7 +100,10 @@ window.__ModuleLoader__.load({
 			planNoTag: "untagged",
 			thinkingOn: "thinking {effort}",
 			thinkingOff: "thinking off",
-			planProb: "Jev high-reasoning p {p}",
+			planProb: "Jev p {p}",
+			thinking_off: "thinking off",
+			thinking_decision_points: "thinking at decision points",
+			thinking_always: "thinking always",
 			planVia: "via {via}",
 			viaJev: "Jev",
 			viaKept: "kept",
@@ -240,7 +243,10 @@ window.__ModuleLoader__.load({
 			planNoTag: "无标签",
 			thinkingOn: "思考 {effort}",
 			thinkingOff: "思考关闭",
-			planProb: "Jev 高推理概率 {p}",
+			planProb: "Jev 概率 {p}",
+			thinking_off: "不思考",
+			thinking_decision_points: "关键节点思考",
+			thinking_always: "全程思考",
 			planVia: "来源 {via}",
 			viaJev: "Jev",
 			viaKept: "沿用",
@@ -766,8 +772,9 @@ window.__ModuleLoader__.load({
 							]) : null,
 							plan ? row(t("statsPlan"), [[
 								plan.tag ?? t("planNoTag"),
-								plan.effort ? t("thinkingOn", { effort: String(plan.effort) }) : t("thinkingOff"),
-								plan.highReasoning != null ? t("planProb", { p: pct(plan.highReasoning) }) : null,
+								plan.thinking ? t("thinking_" + plan.thinking) + (plan.thinking === "decision_points" && plan.raised ? " ×" + plan.raised : "")
+									: plan.effort ? t("thinkingOn", { effort: String(plan.effort) }) : t("thinkingOff"),
+								plan.probabilities && plan.thinking ? t("planProb", { p: pct(plan.probabilities[plan.thinking]) }) : null,
 								t("planVia", { via: viaLabel(t, plan.via) })
 							].filter(Boolean).join(" · ")]) : null,
 							stats.jevUnavailable != null ? jsxs(react.Fragment, { children: [
