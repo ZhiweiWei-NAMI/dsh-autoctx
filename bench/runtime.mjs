@@ -33,7 +33,7 @@ export function apply(ctx, config) {
     active.delete(info.id);
     record({ kind: 'child_end', id: info.id, runId: info.runId, stopReason: info.stopReason });
   });
-  if (config.arm === 'C') {
+  if (config.arm === 'C' || config.arm === 'H') {
     const start = ctx.subagents.start;
     let starting = 0;
     ctx.subagents.start = async function (provider, request) {

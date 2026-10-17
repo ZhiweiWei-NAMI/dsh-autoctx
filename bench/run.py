@@ -31,7 +31,19 @@ RETAIN_TOKENS = 8000
 MAX_CHILDREN = 2
 MAX_CONCURRENT = 2
 COMPACTION_THRESHOLD_RATIO = 0.1875
-ARMS = ('A', 'B', 'C')
+ARMS = ('A', 'B', 'C', 'H')
+# dsh effort level -> wire value; WorkBuddy honors reasoning_effort (no field = no thinking).
+EFFORTS = {'low': 'low', 'high': 'high', 'xhigh': 'max'}
+# Wire compatibility copied from pi-ai's opencode-go catalog for the same models.
+COMPAT = {'deepseek': {'thinkingFormat': 'deepseek', 'requiresReasoningContentOnAssistantMessages': True,
+                       'supportsDeveloperRole': False, 'supportsStore': False},
+          'glm': {'supportsDeveloperRole': False, 'supportsStore': False}}
+
+
+def workbuddy_model(model):
+    entry = {'id': model, 'contextWindow': 128000, 'maxTokens': MAX_OUTPUT_TOKENS, 'reasoningEfforts': dict(EFFORTS)}
+    compat = COMPAT.get(model.split('-')[0])
+    return {**entry, 'compat': compat} if compat else entry
 
 
 def docker(*args):
@@ -55,10 +67,9 @@ def configure_home(home, model, arm, plugin, relay, extra_models, routes, review
     patch = [{'id': item, 'disabled': True} for item in
              ('session-title-llm', 'tool-workflow', 'tool-ralph', 'tool-web', 'web-search-deepseek',
               'repeat-tool-reminder', 'llm-retry')]
-    workbuddy = [{'id': model, 'contextWindow': 128000, 'maxTokens': MAX_OUTPUT_TOKENS,
-                  'reasoningEfforts': False}]
-    workbuddy += [{'id': extra, 'contextWindow': 128000, 'maxTokens': MAX_OUTPUT_TOKENS,
-                   'reasoningEfforts': False} for extra in extra_models if routes.get(extra) == 'workbuddy']
+    workbuddy = [workbuddy_model(model)]
+    workbuddy += [workbuddy_model(extra) for extra in extra_models if routes.get(extra) == 'workbuddy']
+    pool = [model] + [extra for extra in extra_models if extra != model]
     providers = {'workbuddy': {
         'api': 'openai-completions', 'baseURL': relay + '/v1', 'apiKeyEnv': 'BENCH_RELAY_KEY',
         'compat': {'maxTokensField': 'max_tokens', 'supportsUsageInStreaming': True},
@@ -84,6 +95,11 @@ def configure_home(home, model, arm, plugin, relay, extra_models, routes, review
         patch += [
             {'id': 'compaction-basic', 'disabled': True},
             {'insert': [{'id': 'dsh-autoctx', 'name': str(plugin / 'index.js'), 'config': {
+                # The same heterogeneous pool native arm H offers, as Jev-ranked delegation routes.
+                'routes': [{'id': m, 'label': m, 'model': m, 'provider': routes[m],
+                            'description': (next((c for c in catalog() if c.get('id') == m), {}).get('strengths')
+                                            or m),
+                            'efforts': list(EFFORTS) if routes[m] == 'workbuddy' else []} for m in pool],
                 'mode': 'auto', 'apiKey': 'bench-observer', 'jevEndpoint': relay + '/jev',
                 'maxChildren': MAX_CHILDREN, 'maxConcurrent': MAX_CONCURRENT, 'maxDecisions': 12,
                 'maxChildRequests': REQUEST_LIMIT, 'maxChildTurnRequests': REQUEST_LIMIT,
@@ -99,11 +115,20 @@ def configure_home(home, model, arm, plugin, relay, extra_models, routes, review
         patch.append({'id': 'compaction-basic', 'disabled': False, 'config': {
             'thresholdRatio': COMPACTION_THRESHOLD_RATIO, 'retainTokens': RETAIN_TOKENS,
             'maxTokens': MAX_OUTPUT_TOKENS, 'compactionRetries': 0, 'maxOverflowRetries': 0}})
+    # Arms H and A expose dsh's native per-call model selection over the same pool.
+    heterogeneous = arm in ('A', 'H')
+    if heterogeneous:
+        patch.append({'insert': [{'id': 'subagent-model-selection-settings',
+                                  'name': '@deepseek-ai/dsh-tool-subagent/model-selection-settings',
+                                  'config': {'enabled': True, 'allowedModels': [
+                                      {'provider': routes[m], 'model': m} for m in pool]}}]})
     for pid, provider, tool in [('tool-subagent', 'spawn', 'subagent'),
                                 ('tool-subagent-fork', 'fork', 'subagent_fork')]:
-        patch.append({'id': pid, 'disabled': arm == 'B', 'config': {
-            'provider': provider, 'toolName': tool, 'backgroundMode': 'one-shot', 'maxDepth': 1,
-            'agentOptions': {'provider': 'workbuddy', 'model': model, 'maxTokens': MAX_OUTPUT_TOKENS}}})
+        config = {'provider': provider, 'toolName': tool, 'backgroundMode': 'one-shot', 'maxDepth': 1,
+                  'agentOptions': {'provider': 'workbuddy', 'model': model, 'maxTokens': MAX_OUTPUT_TOKENS}}
+        if heterogeneous and provider == 'spawn':
+            config['modelSelectionSettings'] = True
+        patch.append({'id': pid, 'disabled': arm == 'B', 'config': config})
     (home / 'cordis.patch.yml').write_text(yaml.safe_dump(patch, sort_keys=False))
 
 
@@ -130,7 +155,7 @@ def prompt_for(task, arm):
     prompt = 'Resolve this issue in the repository. Use real tools to inspect and edit code, and run appropriate tests. '
     if arm == 'B':
         prompt += 'This run permits only the main agent; do not delegate. '
-    elif arm == 'C':
+    elif arm in ('C', 'H'):
         prompt += 'Native subagents are optional; decide whether they help and collect their results. '
     else:
         prompt += 'Auto selects collaboration; use the supplied child results. '
@@ -247,7 +272,7 @@ def main():
     args = parser.parse_args()
     arms = [arm.strip().upper() for arm in args.arms.split(',') if arm.strip()]
     if not arms or len(set(arms)) != len(arms) or any(arm not in ARMS for arm in arms):
-        parser.error('--arms must be a comma-separated subset of A,B,C')
+        parser.error('--arms must be a comma-separated subset of A,B,C,H')
     if args.parallel < 1 or args.repeat < 1:
         parser.error('--parallel and --repeat must be positive')
     if not math.isfinite(args.max_usd) or args.max_usd <= 0:

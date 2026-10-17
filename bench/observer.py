@@ -107,6 +107,11 @@ class CaseObserver:
         session = client.headers.get('x-wb-session-id') or client.headers.get('x-deepseek-harness-session-id')
         record = {'kind': 'jev' if jev else 'execution', 'role': role, 'upstream': upstream,
                   'model': body.get('model'), 'session': session, 'startedUnix': time.time()}
+        effort = body.get('reasoning_effort') or (body.get('reasoning') or {}).get('effort') \
+            if isinstance(body.get('reasoning'), dict) or body.get('reasoning_effort') else None
+        thinking = body.get('thinking')
+        if effort or thinking:
+            record['effort'] = effort or json.dumps(thinking)[:80]
         if opencode and path.split('?', 1)[0].endswith('/messages'):
             record['usageProtocol'] = 'anthropic-messages'
         with self.lock:

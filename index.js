@@ -1483,7 +1483,8 @@ export function apply(ctx, options) {
     }
     if (!isChild && modeOf(agent) === "auto") installRouting(agent);
     if (isChild) {
-      installChildReporting(agent);
+      // The advisor has no tools at all, so it cannot (and need not) report through send_message.
+      if (!advisorChildren.has(id)) installChildReporting(agent);
       const state = budget(rootOf(agent)),
         used = turnRequests.get(id) ?? 0,
         turnCap = reviewChildren.has(id) ? config.reviewMaxRequests :
