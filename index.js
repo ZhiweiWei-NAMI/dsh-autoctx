@@ -62,9 +62,11 @@ export const Config = z.object({
   apiKey: z.string().role("secret").volatile().description("Jev API key; unset runs native mode"),
   jevModel: z
     .string()
-    .default("jev-1.13-free")
+    .default("jev-1.13")
     .volatile()
-    .description("Jev model answering the decisions"),
+    .description(
+      "Jev model answering the decisions: jev-1.13 (billed to the key's workspace) or jev-1.13-free (free tier, rate limited)",
+    ),
   jevEndpoint: z.string().default("https://opencode.ai/inference/v1/systemone"),
   routes: z
     .array(
@@ -194,8 +196,7 @@ export const Config = z.object({
     .description("Append one execution-economy note before the root task's first model request"),
   contextSelection: z
     .union(["jev", "summary"])
-    // Measured on dsh-bench r1: summary 10/12 vs jev 8/12 (deepseek-v4.1-flash), 9 vs 9 (glm-5.3-flash).
-    .default("summary")
+    .default("jev")
     .volatile()
     .description(
       "Under pressure, Jev keeps the most relevant units verbatim (jev) or the executor summarizes the region (summary)",
@@ -308,7 +309,8 @@ export function apply(ctx, options) {
     waiters = new Map(),
     prepared = new Map();
   const pressureAnchors = new Map(),
-    memos = new Map();
+    memos = new Map(),
+    jevDown = new Map();
   const declinedDelegation = new Set();
   const turnRequests = new Map(),
     turnIds = new Map(),
@@ -427,6 +429,7 @@ export function apply(ctx, options) {
       ![
         "policy_snapshot",
         "jev",
+        "jev_unavailable",
         "delegation_decision",
         "child_start",
         "child_end",
@@ -500,9 +503,20 @@ export function apply(ctx, options) {
     if (!memos.has(root)) memos.set(root, createDecisionMemo());
     return memos.get(root);
   };
+  // Circuit breaker: an unusable Jev (rate limit, auth, billing, server or network failure) is recorded once
+  // and the task stops calling it, so the local fallbacks take over without spending the request budget.
+  const JEV_UNAVAILABLE = new Set([401, 402, 403, 429]);
+  function tripJev(root, session, status, detail) {
+    if (jevDown.has(root)) return;
+    jevDown.set(root, { status, detail });
+    record({ kind: "jev_unavailable", session, model: config.jevModel, httpStatus: status, error: detail });
+  }
   async function decide(agent, request, signal) {
     const root = rootOf(agent),
       state = budget(root);
+    const down = jevDown.get(root);
+    if (down)
+      throw new Error(`Jev unavailable for this task (${down.status ?? "network"}); using local fallbacks.`);
     const { questions, ...decisionState } = request;
     const body = JSON.stringify({
       model: config.jevModel,
@@ -516,15 +530,25 @@ export function apply(ctx, options) {
       state.decisions++;
       updateStats(root);
       const started = performance.now();
-      const response = await fetch(config.jevEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer " + config.apiKey },
-        body,
-        signal,
-      });
+      let response;
+      try {
+        response = await fetch(config.jevEndpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer " + config.apiKey },
+          body,
+          signal,
+        });
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        tripJev(root, agent.session.id, undefined, redact(String(error), config.apiKey).slice(0, 300));
+        throw error;
+      }
       const bodyText = redact(await response.text(), config.apiKey);
-      if (!response.ok)
+      if (!response.ok) {
+        if (JEV_UNAVAILABLE.has(response.status) || response.status >= 500)
+          tripJev(root, agent.session.id, response.status, bodyText.slice(0, 300));
         throw new Error(`Jev decision failed (HTTP ${response.status}): ${bodyText}`);
+      }
       let result;
       try {
         result = JSON.parse(bodyText);

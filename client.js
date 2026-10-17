@@ -12,7 +12,7 @@ window.__ModuleLoader__.load({
 			apiKey: "Jev API key",
 			apiKeyHint: "Leave blank to keep the configured key.",
 			jevModel: "Jev model",
-			jevModelHint: "The model that answers the decisions.",
+			jevModelHint: "Type the model name: jev-1.13 (billed to the key's workspace) or jev-1.13-free (free tier, rate limited).",
 			maxDecisions: "Decision budget",
 			maxDecisionsHint: "Jev decision calls per root task.",
 			maxChildren: "Children per task",
@@ -64,6 +64,8 @@ window.__ModuleLoader__.load({
 			statsCompactions: "Compactions",
 			statsSaved: "saved {n} tokens",
 			statsReviews: "Reviews",
+			statsJevUnavailable: "Jev unavailable",
+			statsJevUnavailableHint: "HTTP {status}; this task uses local fallbacks",
 			statsReviewsLgtm: "LGTM",
 			statsLastRoute: "Last route"
 		};
@@ -75,7 +77,7 @@ window.__ModuleLoader__.load({
 			apiKey: "Jev API Key",
 			apiKeyHint: "留空表示保持当前密钥。",
 			jevModel: "Jev 模型",
-			jevModelHint: "回答决策的模型。",
+			jevModelHint: "填写模型名称：jev-1.13（按 key 所在 workspace 计费）或 jev-1.13-free（免费额度，有限流）。",
 			maxDecisions: "决策预算",
 			maxDecisionsHint: "每个根任务可用的 Jev 决策调用次数。",
 			maxChildren: "每任务子代理数",
@@ -127,6 +129,8 @@ window.__ModuleLoader__.load({
 			statsCompactions: "压缩次数",
 			statsSaved: "已节省 {n} tokens",
 			statsReviews: "复核",
+			statsJevUnavailable: "Jev 不可用",
+			statsJevUnavailableHint: "HTTP {status}；本任务改用本地回退",
 			statsReviewsLgtm: "通过",
 			statsLastRoute: "最近路由"
 		};
@@ -369,6 +373,10 @@ window.__ModuleLoader__.load({
 								stats.compactions,
 								stats.tokensSaved > 0 ? " · " + t("statsSaved", { n: "~" + compact(stats.tokensSaved) }) : null
 							] }),
+							stats.jevUnavailable != null ? jsxs(react.Fragment, { children: [
+								jsx("span", { className: "dac-key", children: t("statsJevUnavailable") }),
+								jsx("span", { children: t("statsJevUnavailableHint", { status: String(stats.jevUnavailable) }) })
+							] }) : null,
 							stats.reviews > 0 ? jsxs(react.Fragment, { children: [
 								jsx("span", { className: "dac-key", children: t("statsReviews") }),
 								jsx("span", { children: stats.reviews + " · " + stats.reviewsLgtm + " " + t("statsReviewsLgtm") })

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { apply, buildDefaultRoute } from "../index.js";
+import { apply, buildDefaultRoute, Config } from "../index.js";
 import BasicCompactionEngine from "@deepseek-ai/dsh-compaction-basic";
 import {
   STATE_BYTES,
@@ -462,6 +462,7 @@ function autoComposition(options = {}) {
     ceilingRatio: 1.5,
     retainTokens: 1024,
     economyGuidance: true,
+    contextSelection: "jev",
     keepRatio: 0.35,
     ...options,
   };
@@ -682,6 +683,32 @@ function nativeCompaction(t) {
   );
   return { summarize, compact };
 }
+
+test("the schema default is Jev selection; contextSelection summary compacts without calling Jev", async (t) => {
+  const defaults = Config({});
+  assert.equal(defaults.contextSelection.get(), "jev");
+  assert.equal(defaults.jevModel.get(), "jev-1.13");
+  const native = nativeCompaction(t),
+    records = [];
+  t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
+  const fetch = t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("Unexpected Jev context selection request");
+  });
+  const app = autoComposition({
+    pressure: true,
+    pressureTokens: 3000,
+    contextSelection: "summary",
+    recordFile: "context-decisions.jsonl",
+  });
+  await app.step();
+  assert.equal(native.compact.mock.callCount(), 1);
+  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 2]);
+  assert.equal(native.summarize.mock.callCount(), 1);
+  assert.ok(
+    records.some((record) => record.kind === "context_replaced" && record.reason === "summary"),
+  );
+  assert.equal(fetch.mock.callCount(), 0);
+});
 
 test("a budgeted selection replaces the old region with the kept subset and a dropped index", async (t) => {
   const native = nativeCompaction(t),

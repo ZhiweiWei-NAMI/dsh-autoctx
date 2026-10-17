@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import time
+import urllib.request
 import uuid
 from contextlib import ExitStack
 from pathlib import Path
@@ -15,7 +16,7 @@ import yaml
 
 from common import case_paths, catalog, child_counts, events, write_json
 from local_relay import LocalRelay
-from observer import CaseObserver
+from observer import JEV_UPSTREAM, CaseObserver
 
 NODE = Path(os.environ.get('DSH_BENCH_NODE', '/opt/node'))
 DSH = NODE / 'lib/node_modules/@deepseek-ai/dsh/lib/bin.js'
@@ -32,6 +33,10 @@ MAX_CHILDREN = 2
 MAX_CONCURRENT = 2
 COMPACTION_THRESHOLD_RATIO = 0.1875
 ARMS = ('A', 'B', 'C', 'H')
+# Jev model for arm A, set from --jev-model; jev-1.13 is billed to the key's workspace, jev-1.13-free is rate limited.
+JEV_MODEL = 'jev-1.13'
+# Arm A stops scheduling cases once this many Jev calls failed: its results would measure Auto without Jev.
+JEV_FAILURE_LIMIT = 2
 # dsh effort level -> wire value; WorkBuddy honors reasoning_effort (no field = no thinking).
 EFFORTS = {'low': 'low', 'high': 'high', 'xhigh': 'max'}
 # Wire compatibility copied from pi-ai's opencode-go catalog for the same models.
@@ -100,7 +105,7 @@ def configure_home(home, model, arm, plugin, relay, extra_models, routes, review
                             'description': (next((c for c in catalog() if c.get('id') == m), {}).get('strengths')
                                             or m),
                             'efforts': list(EFFORTS) if routes[m] == 'workbuddy' else []} for m in pool],
-                'mode': 'auto', 'apiKey': 'bench-observer', 'jevEndpoint': relay + '/jev',
+                'mode': 'auto', 'apiKey': 'bench-observer', 'jevEndpoint': relay + '/jev', 'jevModel': JEV_MODEL,
                 'maxChildren': MAX_CHILDREN, 'maxConcurrent': MAX_CONCURRENT, 'maxDecisions': 12,
                 'maxChildRequests': REQUEST_LIMIT, 'maxChildTurnRequests': REQUEST_LIMIT,
                 'pressureTokens': PRESSURE_TOKENS, 'retainTokens': RETAIN_TOKENS,
@@ -109,7 +114,7 @@ def configure_home(home, model, arm, plugin, relay, extra_models, routes, review
                 'reviewerModel': reviewer,
                 'advisorModel': advisor,
                 # Auto's context policy under pressure (jev or summary); recorded in run-config.json.
-                'contextSelection': os.environ.get('BENCH_CONTEXT_SELECTION', 'summary'),
+                'contextSelection': os.environ.get('BENCH_CONTEXT_SELECTION', 'jev'),
                 'allowPaidModels': any(route.startswith('opencode') for route in routes.values()),
                 'recordFile': str(home / 'auto-events.jsonl')}}]},
         ]
@@ -263,7 +268,31 @@ def run_case(task, arm, repeat, case, model, plugin, extra_models, routes, revie
     print(json.dumps(outcome), flush=True)
 
 
+def jev_preflight(model):
+    """One minimal decision against the real Jev endpoint; arm A must not start without a working Jev."""
+    body = json.dumps({'model': model, 'state': json.dumps({'task': 'bench preflight'}),
+                       'questions': {'ok': {'type': 'noul', 'instructions': 'Is this a preflight check?'}}}).encode()
+    request = urllib.request.Request(JEV_UPSTREAM, data=body, method='POST', headers={
+        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + os.environ['JEV_API_KEY']})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            answers = json.loads(response.read()).get('answers') or {}
+    except Exception as error:  # the key never appears in urllib errors
+        raise SystemExit(f'Jev preflight failed for {model}: {error}')
+    if 'ok' not in answers:
+        raise SystemExit(f'Jev preflight for {model} returned no answer')
+
+
+def jev_failures(case):
+    try:
+        calls = json.loads((case / 'requests.json').read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return 0
+    return sum(1 for call in calls if call.get('kind') == 'jev' and call.get('httpStatus') != 200)
+
+
 def main():
+    global JEV_MODEL
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', required=True, choices=MODEL_IDS)
     parser.add_argument('--arms', default='A,B,C')
@@ -271,12 +300,15 @@ def main():
     parser.add_argument('--reviewer', default='same')
     parser.add_argument('--advisor', default='off')
     parser.add_argument('--max-usd', type=float, default=0.50)
+    parser.add_argument('--jev-model', default=JEV_MODEL,
+                        help='Jev model for arm A: jev-1.13 (billed) or jev-1.13-free (free tier, rate limited)')
     parser.add_argument('--tasks', type=Path, default=Path(__file__).with_name('tasks.json'))
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--plugin', type=Path, required=True)
     parser.add_argument('--parallel', type=int, default=3)
     parser.add_argument('--repeat', type=int, default=1)
     args = parser.parse_args()
+    JEV_MODEL = args.jev_model
     arms = [arm.strip().upper() for arm in args.arms.split(',') if arm.strip()]
     if not arms or len(set(arms)) != len(arms) or any(arm not in ARMS for arm in arms):
         parser.error('--arms must be a comma-separated subset of A,B,C,H')
@@ -305,7 +337,8 @@ def main():
               'maxChildren': MAX_CHILDREN, 'maxConcurrentChildren': MAX_CONCURRENT,
               'extraModels': extra_models, 'modelRoutes': routes,
               'reviewer': args.reviewer, 'advisor': args.advisor, 'maxUsd': args.max_usd,
-              'contextSelection': os.environ.get('BENCH_CONTEXT_SELECTION', 'summary')}
+              'contextSelection': os.environ.get('BENCH_CONTEXT_SELECTION', 'jev'),
+              'jevModel': JEV_MODEL}
     config_file = root / 'run-config.json'
     write_json(root / 'tasks.json', manifest)
     write_json(config_file, config)
@@ -319,11 +352,20 @@ def main():
     staged = root / 'plugin'
     if 'A' in arms and not staged.exists():
         stage_plugin(plugin, staged)
+    if any(item[1] == 'A' for item in pending):
+        jev_preflight(JEV_MODEL)
+    failed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
-        futures = [pool.submit(run_case, *item, args.model, staged, extra_models, routes,
-                               args.reviewer, args.advisor, args.max_usd) for item in pending]
+        futures = {pool.submit(run_case, *item, args.model, staged, extra_models, routes,
+                               args.reviewer, args.advisor, args.max_usd): item for item in pending}
         for future in concurrent.futures.as_completed(futures):
             future.result()
+            item = futures[future]
+            if item[1] == 'A':
+                failed += jev_failures(item[3])
+            if failed >= JEV_FAILURE_LIMIT:
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise SystemExit(f'Jev failed {failed} times in arm A; stopped. Check {root} before rerunning.')
 
 
 if __name__ == '__main__':
