@@ -29,6 +29,16 @@ window.__ModuleLoader__.load({
 			reviewBeforeFinishHint: "Start one independent review child before a root turn that changed files finishes. Requires an API key and a non-single mode.",
 			reviewMaxRequests: "Review request cap",
 			reviewMaxRequestsHint: "Model requests allowed for one review child.",
+			reviewerModel: "Reviewer model",
+			reviewerModelHint: "same keeps the fork review; auto asks Jev; or a catalog id such as glm-5.3-flash.",
+			advisorModel: "Advisor model",
+			advisorModelHint: "off disables advice; auto asks Jev; or a catalog id. One short consultation per trigger.",
+			allowPaidModels: "Allow paid models",
+			allowPaidModelsHint: "Let roles use models whose dsh provider is a paid route.",
+			advisorMaxConsults: "Advisor consultations",
+			advisorMaxConsultsHint: "Consultations allowed per root task.",
+			advisorStallSteps: "Advisor stall steps",
+			advisorStallStepsHint: "Root requests without new evidence before the advisor is consulted (min 3).",
 			keepRatio: "Keep ratio",
 			keepRatioHint: "Share of a compacted region's tokens kept by budgeted selection (0.1–0.8).",
 			yamlNote: "Routes, strategy and weights stay in the profile's cordis.patch.yml.",
@@ -82,6 +92,16 @@ window.__ModuleLoader__.load({
 			reviewBeforeFinishHint: "根任务修改文件后、结束本轮前，启动一个独立复核子代理。需配置 API key，且不处于单代理模式。",
 			reviewMaxRequests: "复核请求上限",
 			reviewMaxRequestsHint: "单个复核子代理可用的模型请求次数。",
+			reviewerModel: "复核模型",
+			reviewerModelHint: "same 使用 fork 复核；auto 询问 Jev；也可填模型目录里的 id（如 glm-5.3-flash）。",
+			advisorModel: "顾问模型",
+			advisorModelHint: "off 关闭顾问；auto 询问 Jev；也可填模型目录里的 id。每次触发只咨询一次。",
+			allowPaidModels: "允许付费模型",
+			allowPaidModelsHint: "允许角色使用 dsh provider 属于付费线路的模型。",
+			advisorMaxConsults: "顾问咨询次数",
+			advisorMaxConsultsHint: "每个根任务允许的顾问咨询次数。",
+			advisorStallSteps: "顾问停滞步数",
+			advisorStallStepsHint: "根任务连续多少请求没有新证据后咨询顾问（最少 3）。",
 			keepRatio: "保留比例",
 			keepRatioHint: "预算选择保留被压缩区域 tokens 的比例（0.1–0.8）。",
 			yamlNote: "路由、策略与权重仍在 profile 的 cordis.patch.yml 里维护。",
@@ -113,8 +133,8 @@ window.__ModuleLoader__.load({
 		const NS = "plugins.dshAutoctx";
 		const CONFIG_KEY = "dsh-autoctx#dsh-autoctx";
 		const inject = ["slots", "locale"];
-		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "retainTokens", "keepRatio", "reviewMaxRequests"];
-		const BOOLEAN_FIELDS = ["economyGuidance", "reviewBeforeFinish"];
+		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "retainTokens", "keepRatio", "reviewMaxRequests", "advisorMaxConsults", "advisorStallSteps"];
+		const BOOLEAN_FIELDS = ["economyGuidance", "reviewBeforeFinish", "allowPaidModels"];
 		const booleanField = (field) => ({
 			field,
 			format: (value) => value === true ? "true" : value === false ? "false" : "",
@@ -128,6 +148,7 @@ window.__ModuleLoader__.load({
 		});
 		const specs = Object.fromEntries([
 			ui.settingsTextField("mode"), ui.settingsTextField("jevModel"),
+			ui.settingsTextField("reviewerModel"), ui.settingsTextField("advisorModel"),
 			...NUMERIC_FIELDS.map((name) => ui.settingsNumberField(name)),
 			...BOOLEAN_FIELDS.map(booleanField)
 		].map((spec) => [spec.field, spec]));
@@ -230,6 +251,8 @@ window.__ModuleLoader__.load({
 					field("jevModel"), field("maxDecisions"),
 					section("sectionSubagents"), field("maxChildren"), field("maxConcurrent"),
 					field("reviewBeforeFinish"), field("reviewMaxRequests"),
+					field("reviewerModel"), field("advisorModel"), field("allowPaidModels"),
+					field("advisorMaxConsults"), field("advisorStallSteps"),
 					section("sectionContext"), field("pressureTokens"), field("retainTokens"),
 					field("keepRatio"), field("economyGuidance"),
 					jsx("div", { className: "dac-hint", children: t("yamlNote") })

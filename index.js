@@ -25,6 +25,21 @@ import {
   DELEGATION_GUIDANCE,
 } from "./routing.js";
 import { newStats, applyStatsRecord } from "./stats.js";
+import {
+  createGraph,
+  observe,
+  digest,
+  progressKey,
+  hasRead,
+  merge,
+  fromJSON,
+} from "./graph.js";
+import {
+  modelInfo,
+  availableModels,
+  pickModel,
+  knowledge,
+} from "./models.js";
 
 export const name = "dsh-autoctx";
 export const inject = [
@@ -57,11 +72,45 @@ export const Config = z.object({
         id: z.string(),
         label: z.string(),
         model: z.string(),
+        provider: z.string(),
         description: z.string(),
         efforts: z.array(z.string()).default([]),
       }),
     )
     .default([]),
+  modelRoutes: z
+    .dict(z.string())
+    .default({})
+    .description("Model id to dsh provider name for the models available to roles"),
+  allowPaidModels: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description("Allow roles to use models on paid provider routes"),
+  reviewerModel: z
+    .string()
+    .default("same")
+    .volatile()
+    .description('Reviewer model: "same" keeps the fork review, "auto" asks Jev, or a catalog id'),
+  advisorModel: z
+    .string()
+    .default("off")
+    .volatile()
+    .description('Advisor model: "off", "auto", or a catalog id'),
+  advisorMaxConsults: z
+    .number()
+    .step(1)
+    .min(0)
+    .default(2)
+    .volatile()
+    .description("Advisor consultations per root task"),
+  advisorStallSteps: z
+    .number()
+    .step(1)
+    .min(3)
+    .default(6)
+    .volatile()
+    .description("Root requests without new evidence before the advisor is consulted"),
   strategy: z.object({
     mode: z.union(["automatic", "single", "native"]).default("automatic"),
     weights: z
@@ -155,6 +204,18 @@ const reviewMessage = (report) =>
   "Independent review of your change:\n" +
   report +
   "\nIf it reports a defect, fix it and verify; otherwise finish.";
+const ADVISOR_PROMPT =
+  "You are a senior advisor to a coding agent. Do not call tools; answer from this brief only. Give the most likely root cause, the next 2–4 concrete steps, and what evidence would confirm them, in ≤ 1200 characters.";
+const advisorMessage = (model, trigger, reply) =>
+  "Advisor (" + model + ", independent, no tool access) on " + trigger + ":\n" + reply +
+  "\nTreat this as a hypothesis; verify it against evidence before acting.";
+const syncMessage = (edits) =>
+  "Collaborator changes since your last step:\n" +
+  edits.map((edit) => "- " + edit.path + " edited by " + edit.label).join("\n") +
+  "\nRe-read these before relying on earlier content.";
+const ledgerNote = (graph) =>
+  "Evidence ledger of this session (files, tests and searches you already examined; re-read only what you need):\n" +
+  digest(graph, 2000);
 const text = (m) =>
   m.content
     .filter((b) => b.type === "text")
@@ -242,6 +303,62 @@ export function apply(ctx, options) {
     changedTurn = new Map(),
     reviewedTurn = new Map(),
     reviewChildren = new Set();
+  // One evidence graph per live session, restored from storage on the first request.
+  const graphs = new Map(),
+    graphSteps = new Map(),
+    loadedGraphs = new Set(),
+    pendingLedgers = new Set(),
+    syncCursors = new Map(),
+    editLogs = new Map(),
+    advisorState = new Map(),
+    advisorChildren = new Set(),
+    advisorPending = new Set(),
+    modelKnowledge = new Map(),
+    availableByRoot = new Map(),
+    providersByRoot = new Map();
+  const childLabels = new Map();
+  const graphFor = (id) => {
+    if (!graphs.has(id)) graphs.set(id, createGraph());
+    return graphs.get(id);
+  };
+  const graphStep = (id) => graphSteps.get(id) ?? 0;
+  const rootGraph = (agent) => graphFor(rootOf(agent));
+  const editLog = (root) => {
+    if (!editLogs.has(root)) editLogs.set(root, []);
+    return editLogs.get(root);
+  };
+  const noteEdits = (root, id, label, since) => {
+    const log = editLog(root);
+    for (const [path, file] of Object.entries(graphFor(id).files))
+      for (const edit of file.edits)
+        if (edit.via === undefined && edit.event > since)
+          log.push({ session: id, label, path, step: edit.step, seq: log.length + 1 });
+  };
+  const persistGraph = async (id) => {
+    if (!graphs.has(id)) return;
+    try {
+      await (await storage()).table("graphs").put(id, { ...graphs.get(id), requests: graphStep(id) });
+    } catch (error) {
+      record({ kind: "graph_save_failed", session: id, error: String(error) });
+    }
+  };
+  const restoreGraph = async (id) => {
+    if (loadedGraphs.has(id)) return;
+    loadedGraphs.add(id);
+    try {
+      const saved = (await storage()).table("graphs").get(id);
+      const empty = !graphs.has(id) || graphs.get(id).sequence === 0;
+      if (saved !== undefined && empty) {
+        const graph = fromJSON(saved);
+        graphs.set(id, graph);
+        if (Number.isInteger(saved?.requests) && saved.requests >= 0)
+          graphSteps.set(id, saved.requests);
+      }
+    } catch (error) {
+      loadedGraphs.delete(id);
+      record({ kind: "graph_restore_failed", session: id, error: String(error) });
+    }
+  };
   const rootOf = (agent) => agent.session.header.parentSession ?? agent.session.id;
   const budget = (id) => {
     if (!budgets.has(id))
@@ -289,6 +406,10 @@ export function apply(ctx, options) {
         "review_start",
         "review_end",
         "review_failed",
+        "advisor_end",
+        "sync_note",
+        "ledger_note",
+        "model_choice",
       ].includes(value.kind)
     )
       return;
@@ -333,7 +454,11 @@ export function apply(ctx, options) {
         name: "dsh_auto",
         version: 1,
         layout: "per-record",
-        tables: { policies: domainTable(schema.json()), assignments: domainTable(schema.json()) },
+        tables: {
+          policies: domainTable(schema.json()),
+          assignments: domainTable(schema.json()),
+          graphs: domainTable(schema.json()),
+        },
       }),
     ));
   ctx.on("dispose", async () => {
@@ -394,9 +519,43 @@ export function apply(ctx, options) {
     });
   }
 
+  const providerOf = (agent, id) =>
+    providersByRoot.get(rootOf(agent))?.[id];
+
+  // Native preparation proves a configured model route exists before a role can use it.
+  async function ensureAvailable(agent, signal) {
+    const root = rootOf(agent);
+    if (availableByRoot.has(root)) return availableByRoot.get(root);
+    const executor = agent.options?.model;
+    const routes = {
+      ...(config.modelRoutes ?? {}),
+      ...(executor ? { [executor]: agent.options.provider } : {}),
+    };
+    const available = [];
+    for (const entry of availableModels(routes, { allowPaid: config.allowPaidModels === true })) {
+      try {
+        await ctx.llm.prepareCall({ provider: routes[entry.id], model: entry.id }, signal);
+        available.push(entry);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        record({
+          kind: "profile_unavailable",
+          session: root,
+          profile: entry.id,
+          error: String(error),
+        });
+      }
+    }
+    availableByRoot.set(root, available);
+    providersByRoot.set(root, routes);
+    if (available.length) modelKnowledge.set(root, knowledge(available));
+    return available;
+  }
+
   async function initialize(agent, signal) {
     const id = agent.session.id;
     const configuredMode = config.apiKey ? config.mode : "native";
+    await ensureAvailable(agent, signal);
     if (!config.apiKey || config.mode !== "auto") {
       const state = { configuredMode, mode: configuredMode, profiles: [] };
       roots.set(id, state);
@@ -447,20 +606,23 @@ export function apply(ctx, options) {
       // Native preparation validates actual client-side routes and supported effort names.
       // An omitted/empty effort list explicitly requests the native default.
       const efforts = route.efforts ?? [];
+      const provider = route.provider ?? agent.options.provider;
       for (const effort of efforts.length ? efforts : [undefined]) {
         const options = {
-          provider: agent.options.provider,
+          provider,
           model: route.model,
           ...(effort === undefined ? {} : { reasoningEffort: effort }),
         };
         try {
           await ctx.llm.prepareCall(options, signal);
+          const info = modelInfo(route.model);
           state.profiles.push({
             id: route.id + "/" + (effort ?? "default"),
             routeId: route.id,
             label: route.label,
             capability: route.description,
             options,
+            ...(info ? { knowledge: knowledge([info]) } : {}),
           });
         } catch (error) {
           if (signal.aborted) throw error;
@@ -520,6 +682,25 @@ export function apply(ctx, options) {
       const session = exec.agent.session.id;
       changedTurn.set(session, currentTurn.get(session));
     }
+    if (exec.agent) {
+      const id = exec.agent.session.id,
+        root = rootOf(exec.agent);
+      const step = graphStep(id),
+        since = graphFor(id).sequence;
+      observe(
+        graphFor(id),
+        step,
+        { name: exec.name, arguments: exec.arguments },
+        {
+          isError: result.isError,
+          text: (result.content ?? [])
+            .filter((block) => block.type === "text")
+            .map((block) => block.text)
+            .join("\n"),
+        },
+      );
+      noteEdits(root, id, id === root ? "parent" : childLabels.get(id) ?? id, since);
+    }
     if (!delegation.has(exec.name) || !exec.agent) return;
     budget(rootOf(exec.agent)).pending.delete(exec.callId);
     record({
@@ -539,6 +720,7 @@ export function apply(ctx, options) {
       state = budget(parent);
     state.children.add(info.id);
     active.set(info.id, { parent, runId: info.runId });
+    if (advisorPending.has(parent)) advisorChildren.add(info.id);
     const assignment = assignments.get(info.id);
     if (assignment?.callId) state.pending.delete(assignment.callId);
     record({
@@ -548,10 +730,11 @@ export function apply(ctx, options) {
       active: [...active.values()].filter((x) => x.parent === parent).length,
     });
   });
-  ctx.on("subagent/end", (info) => {
+  ctx.on("subagent/end", async (info) => {
     const running = active.get(info.id);
     if (!running) throw new Error("Native child ended without a start.");
     active.delete(info.id);
+    advisorChildren.delete(info.id);
     settled.set(info.id, info);
     record({
       kind: "child_end",
@@ -561,6 +744,7 @@ export function apply(ctx, options) {
     });
     for (const done of waiters.get(info.id) ?? []) done(info);
     waiters.delete(info.id);
+    await persistGraph(info.id);
   });
   function awaitSettlement(id, previous, signal) {
     const current = settled.get(id);
@@ -592,26 +776,107 @@ export function apply(ctx, options) {
     );
   }
 
+  // Explicit ids are honored only when native preparation accepted them; "auto"
+  // spends one Jev question, then falls back to local price/role ranking.
+  async function chooseModel(role, agent, reason, signal) {
+    const root = rootOf(agent),
+      setting = role === "reviewer" ? config.reviewerModel : config.advisorModel;
+    const available = await ensureAvailable(agent, signal);
+    const found = (id) => available.find((entry) => entry.id === id);
+    const finish = (model, via) => {
+      record({
+        kind: "model_choice",
+        session: root,
+        role,
+        ...(model ? { model: model.id } : {}),
+        via,
+      });
+      return model;
+    };
+    if (setting && setting !== "same" && setting !== "auto" && setting !== "off") {
+      const entry = found(setting) ?? found(modelInfo(setting)?.id);
+      if (!entry) {
+        record({ kind: "model_unavailable", session: root, role, model: setting });
+        return undefined;
+      }
+      return finish(entry, "config");
+    }
+    if (setting === "auto" && budget(root).decisions < config.maxDecisions) {
+      const candidates = available
+        .filter((entry) => entry.roles.includes(role))
+        .slice(0, 4);
+      if (candidates.length) {
+        const criteria = Object.fromEntries(candidates.map((entry) => [entry.id, knowledge([entry])]));
+        const models = modelKnowledge.get(root);
+        const request = {
+          ...(models ? { models } : {}),
+          task: tasks.get(root),
+          ledger: digest(rootGraph(agent), 1500),
+          trigger: role + ": " + reason,
+          questions: {
+            model: {
+              type: "choice",
+              instructions:
+                "Which model should act as " + role + " now? Weigh measured strengths, family independence from the executor, and price.",
+              criteria,
+            },
+          },
+        };
+        try {
+          if (Buffer.byteLength(JSON.stringify(request)) <= STATE_BYTES) {
+            const decision = await decide(agent, request, signal);
+            const answer = decision.answers?.model;
+            const chosen = criteria[answer?.choice] ? found(answer.choice) : undefined;
+            if (chosen && answer.confidence >= 0.4) return finish(chosen, "jev");
+          }
+        } catch (error) {
+          if (signal.aborted) throw error;
+        }
+      }
+    }
+    return finish(pickModel(role, { executor: agent.options?.model, available }), "fallback");
+  }
+
   async function independentReview(agent, turn, signal) {
     const id = agent.session.id;
     if (reviewedTurn.get(id) === turn || changedTurn.get(id) !== turn) return;
     if (!rootHasChildSlot(id)) return;
     // Marked before starting, so a failed review never repeats within the turn.
     reviewedTurn.set(id, turn);
+    const custom = config.reviewerModel !== undefined && config.reviewerModel !== "same";
+    const reviewer = custom ? await chooseModel("reviewer", agent, "independent review", signal) : undefined;
     let run;
-    record({ kind: "review_start", session: id, turn });
+    record({
+      kind: "review_start",
+      session: id,
+      turn,
+      model: reviewer?.id ?? "same",
+    });
     try {
       signal.throwIfAborted();
-      const provider = ctx.subagents.getProvider("fork") !== undefined ? "fork" : "spawn";
+      const cross = !!reviewer;
+      const provider = cross
+        ? "spawn"
+        : ctx.subagents.getProvider("fork") !== undefined
+          ? "fork"
+          : "spawn";
+      // A spawn child does not share the parent's cache, so the brief carries the ledger.
+      const prompt = cross
+        ? REVIEW_PROMPT +
+          "\n\nOriginal issue:\n" + tasks.get(id) +
+          "\n\nParent evidence ledger:\n" + digest(rootGraph(agent), 3000)
+        : REVIEW_PROMPT + "\n\nOriginal issue:\n" + tasks.get(id);
       run = await ctx.subagents.start(provider, {
         label: "Independent review",
         parent: agent,
-        prompt: [{ type: "text", text: REVIEW_PROMPT + "\n\nOriginal issue:\n" + tasks.get(id) }],
+        prompt: [{ type: "text", text: prompt }],
+        ...(cross ? { agentOptions: { provider: providerOf(agent, reviewer.id), model: reviewer.id } } : {}),
         toolFilter: { deny: ["subagent", "subagent_fork"] },
         maxDepth: 1,
         signal,
       });
       reviewChildren.add(run.id);
+      childLabels.set(run.id, "Independent review");
       let outcome;
       try {
         outcome = await run.result;
@@ -635,6 +900,7 @@ export function apply(ctx, options) {
         session: id,
         turn,
         childId: run.id,
+        model: reviewer?.id ?? "same",
         stopReason: outcome.stopReason,
         lgtm: /^[\W_]*LGTM\b/i.test(report),
       });
@@ -648,11 +914,16 @@ export function apply(ctx, options) {
   }
 
   ctx.on("agent/turn-stopping", async ({ agent, turn, signal }) => {
-    // Auto and native share the reviewer; single mode and keyless runs stay native-only.
-    if (!config.reviewBeforeFinish || !config.apiKey) return;
-    if (agent.session.header.parentSession !== undefined) return;
-    if (modeOf(agent) === "single") return;
-    await independentReview(agent, turn, signal);
+    const saved = persistGraph(agent.session.id);
+    try {
+      // Auto and native share the reviewer; single mode and keyless runs stay native-only.
+      if (!config.reviewBeforeFinish || !config.apiKey) return;
+      if (agent.session.header.parentSession !== undefined) return;
+      if (modeOf(agent) === "single") return;
+      await independentReview(agent, turn, signal);
+    } finally {
+      await saved;
+    }
   });
 
   async function routeDelegation(args, exec, provider) {
@@ -719,7 +990,10 @@ export function apply(ctx, options) {
           : [];
       })
       .slice(-3);
+    // Model knowledge leads every Jev state and stays identical for the whole root task.
+    const models = modelKnowledge.get(rootOf(parent)) ?? "";
     const request = {
+      ...(models ? { models } : {}),
       instructions: DELEGATION_GUIDANCE,
       routes: state.profiles,
       task: tasks.get(parent.session.id),
@@ -797,6 +1071,7 @@ export function apply(ctx, options) {
           provider === "spawn" && ctx.subagents.getProvider("fork") !== undefined
             ? "fork"
             : provider;
+        childLabels.set(id, args.description);
         await ctx.subagents.startContinuable({
           childId: id,
           provider: chosen,
@@ -963,11 +1238,156 @@ export function apply(ctx, options) {
     return compactor;
   };
 
+  const advisorFor = (root) => {
+    if (!advisorState.has(root))
+      advisorState.set(root, { key: undefined, consults: 0, stallDone: false, failures: new Set() });
+    return advisorState.get(root);
+  };
+  const repeatedFailure = (graph, handled) => {
+    for (const [key, test] of Object.entries(graph.tests)) {
+      if (handled.has(key)) continue;
+      const runs = test.runs.filter((run) => run.via === undefined);
+      const latest = runs.at(-1);
+      if (!latest || (latest.outcome !== "fail" && latest.outcome !== "error")) continue;
+      const failing = runs.slice(0, -1).filter(
+        (run) => run.outcome === "fail" || run.outcome === "error",
+      );
+      if (!failing.length) continue;
+      if (
+        Object.values(graph.files).some((file) =>
+          file.edits.some((edit) => edit.via === undefined && edit.event < latest.event &&
+            failing.some((run) => run.event < edit.event)),
+        )
+      )
+        return key;
+    }
+    return undefined;
+  };
+  const takeSync = (agent) => {
+    const id = agent.session.id,
+      graph = graphFor(id),
+      log = editLog(rootOf(agent));
+    let cursor = syncCursors.get(id) ?? 0;
+    const paths = new Map();
+    for (const edit of log) {
+      if (edit.seq <= cursor) continue;
+      if (edit.session !== id && hasRead(graph, edit.path)) {
+        if (!paths.has(edit.path) && paths.size === 6) break;
+        paths.set(edit.path, edit);
+      }
+      cursor = edit.seq;
+    }
+    syncCursors.set(id, cursor);
+    const changes = [...paths.values()];
+    if (!changes.length) return undefined;
+    record({ kind: "sync_note", session: id, paths: changes.map((edit) => edit.path) });
+    return syncMessage(changes);
+  };
+  async function consultAdvisor(agent, trigger, signal) {
+    const id = agent.session.id;
+    if (config.advisorModel === "off" || modeOf(agent) !== "auto") return undefined;
+    if (agent.session.header.parentSession !== undefined) return undefined;
+    const state = advisorFor(id);
+    if (state.consults >= (config.advisorMaxConsults ?? 2) || !rootHasChildSlot(id))
+      return undefined;
+    const model = await chooseModel("advisor", agent, trigger, signal);
+    if (!model || !rootHasChildSlot(id)) return undefined;
+    state.consults++;
+    state.since = graphStep(id);
+    if (trigger === "stall") state.stallDone = true;
+    else state.failures.add(trigger.slice("repeated failure: ".length));
+    record({ kind: "advisor_start", session: id, trigger, model: model.id });
+    let run;
+    try {
+      signal.throwIfAborted();
+      const prompt =
+        ADVISOR_PROMPT +
+        "\n\nOriginal issue:\n" + tasks.get(id) +
+        "\n\nAgent evidence ledger:\n" + digest(rootGraph(agent), 3000) +
+        "\n\nTrigger: " + trigger;
+      advisorPending.add(id);
+      run = await ctx.subagents.start("spawn", {
+        label: "Advisor",
+        parent: agent,
+        prompt: [{ type: "text", text: prompt }],
+        agentOptions: { provider: providerOf(agent, model.id), model: model.id },
+        toolFilter: { deny: ["subagent", "subagent_fork"] },
+        maxDepth: 1,
+        signal,
+      });
+      advisorChildren.add(run.id);
+      childLabels.set(run.id, "Advisor");
+      let outcome;
+      try {
+        outcome = await run.result;
+      } finally {
+        await run.dispose();
+      }
+      signal.throwIfAborted();
+      if (outcome.stopReason !== "completed")
+        throw new Error("Advisor ended with " + outcome.stopReason + ".");
+      const reply = outcome.output
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("\n")
+        .trim();
+      if (!reply) throw new Error("Advisor returned no text.");
+      record({ kind: "advisor_end", session: id, model: model.id, chars: reply.length });
+      return advisorMessage(model.id, trigger, reply);
+    } catch (error) {
+      signal.throwIfAborted();
+      record({ kind: "advisor_failed", session: id, trigger, model: model.id, error: String(error) });
+      return undefined;
+    } finally {
+      advisorPending.delete(id);
+      if (run) advisorChildren.delete(run.id);
+    }
+  }
+
+  // Every injection is appended after next(), so the cached prompt prefix is untouched.
+  function appendNotes(agent, admitted, { advisor, finalRequest }) {
+    const id = agent.session.id;
+    const extra = [];
+    if (finalRequest)
+      extra.push(
+        note(
+          "This is your final model request under the child budget. Return the concrete result, test evidence, and any unfinished work now.",
+        ),
+      );
+    if (pendingLedgers.has(id)) {
+      pendingLedgers.delete(id);
+      extra.push(note(ledgerNote(graphFor(id))));
+      record({ kind: "ledger_note", session: id });
+    }
+    const reminder = takeSync(agent);
+    if (reminder) extra.push(note(reminder));
+    if (advisor) extra.push(note(advisor));
+    if (extra.length) admitted = { ...admitted, messages: [...(admitted.messages ?? []), ...extra] };
+    if (agent.session.header.parentSession !== undefined) return admitted;
+    const guidance = agent.session
+      .snapshotEvents()
+      .filter(
+        (event) =>
+          event.type === "user/message" &&
+          isEconomyGuidance(agent.session.deriveEventMessage(event)),
+      );
+    if (
+      (!config.economyGuidance && guidance.length === 0) ||
+      guidance.some((event) => agent.session.surface.nodes.includes(event.seq))
+    )
+      return admitted;
+    record({ kind: "economy_guidance", session: id });
+    return { ...admitted, messages: [...(admitted.messages ?? []), note(ECONOMY_GUIDANCE)] };
+  }
+
   ctx.on("agent/pre-step", async (payload, next) => {
     const { agent, messages, signal } = payload,
       id = agent.session.id,
       isChild = agent.session.header.parentSession !== undefined;
+    let finalRequest = false;
     currentTurn.set(id, payload.turn);
+    await restoreGraph(id);
+    graphFor(id);
     if (messages.some((m) => ["user", "agent-message", "subagent-settled"].includes(m.source.kind)))
       declinedDelegation.delete(id);
     if (isChild && turnIds.get(id) !== payload.turn) {
@@ -975,12 +1395,13 @@ export function apply(ctx, options) {
       turnRequests.set(id, 0);
     }
     for (const message of messages)
-      if (message.source.kind === "subagent-settled")
-        recordCollection(
-          id,
-          message.source.senderSessionId,
-          settled.get(message.source.senderSessionId),
-        );
+      if (message.source.kind === "subagent-settled") {
+        const child = message.source.senderSessionId;
+        recordCollection(id, child, settled.get(child));
+        // The child's evidence stays attributed to its label in the parent graph.
+        await restoreGraph(child);
+        merge(graphFor(id), graphFor(child), childLabels.get(child) ?? child);
+      }
     if (!tasks.has(id)) {
       const assignment =
         assignments.get(id) ??
@@ -1014,7 +1435,11 @@ export function apply(ctx, options) {
       if (config.mode !== "single") {
         const children = await ctx.subagents.listChildren(id, signal),
           resources = budget(id);
-        for (const child of children) if (child.kind === "child") resources.children.add(child.id);
+        for (const child of children)
+          if (child.kind === "child") {
+            resources.children.add(child.id);
+            if (typeof child.label === "string" && child.label) childLabels.set(child.id, child.label);
+          }
       }
       const state = await initialize(agent, signal);
       if (state.mode === "auto") installRouting(agent);
@@ -1024,7 +1449,8 @@ export function apply(ctx, options) {
       installChildReporting(agent);
       const state = budget(rootOf(agent)),
         used = turnRequests.get(id) ?? 0,
-        turnCap = reviewChildren.has(id) ? config.reviewMaxRequests : config.maxChildTurnRequests;
+        turnCap = reviewChildren.has(id) ? config.reviewMaxRequests :
+          advisorChildren.has(id) ? 1 : config.maxChildTurnRequests;
       if (state.childRequests >= config.maxChildRequests || used >= turnCap) {
         record({
           kind: "child_budget_exhausted",
@@ -1034,21 +1460,38 @@ export function apply(ctx, options) {
         });
         throw new Error("Child request budget exhausted; parent budget remains available.");
       }
-      if (used === turnCap - 1 || state.childRequests === config.maxChildRequests - 1) {
-        const admitted = await next();
-        if (admitted.kind === "reject") return admitted;
-        return {
-          ...admitted,
-          messages: [
-            ...admitted.messages,
-            note(
-              "This is your final model request under the child budget. Return the concrete result, test evidence, and any unfinished work now.",
-            ),
-          ],
-        };
+      if (used === turnCap - 1 || state.childRequests === config.maxChildRequests - 1)
+        finalRequest = true;
+    }
+    // Advisor triggers are checked before admission, on the root's own evidence.
+    let advisor;
+    if (!isChild && config.advisorModel && config.advisorModel !== "off" && modeOf(agent) === "auto") {
+      const state = advisorFor(id),
+        graph = rootGraph(agent),
+        key = progressKey(graph),
+        now = graphStep(id),
+        stallSteps = Math.max(
+          3,
+          Number.isFinite(config.advisorStallSteps) ? config.advisorStallSteps : 6,
+        );
+      if (state.key !== key) {
+        state.key = key;
+        state.since = now;
+        state.stallDone = false;
+        state.failures.clear();
+      }
+      if (state.since === undefined) state.since = now;
+      const failing = repeatedFailure(graph, state.failures);
+      if (state.consults < (config.advisorMaxConsults ?? 2)) {
+        if (now - state.since >= stallSteps && !state.stallDone) {
+          advisor = await consultAdvisor(agent, "stall", signal);
+        } else if (failing) {
+          advisor = await consultAdvisor(agent, "repeated failure: " + failing, signal);
+        }
       }
     }
-    if (agent.session.requestHeader() !== undefined) {
+    if (!finalRequest && agent.session.requestHeader() !== undefined) {
+      // A native compaction in this step rewrites the prefix, so its ledger can follow immediately.
       if (modeOf(agent) !== "auto") {
         try {
           await getCompactor().compactIfNeeded(agent, "pressure", signal);
@@ -1059,21 +1502,9 @@ export function apply(ctx, options) {
       } else await selectUnderPressure(agent, signal);
     }
     const admitted = await next();
-    if (admitted.kind === "reject" || isChild) return admitted;
-    const guidance = agent.session
-      .snapshotEvents()
-      .filter(
-        (event) =>
-          event.type === "user/message" &&
-          isEconomyGuidance(agent.session.deriveEventMessage(event)),
-      );
-    if (
-      (!config.economyGuidance && guidance.length === 0) ||
-      guidance.some((event) => agent.session.surface.nodes.includes(event.seq))
-    )
-      return admitted;
-    record({ kind: "economy_guidance", session: id });
-    return { ...admitted, messages: [...(admitted.messages ?? []), note(ECONOMY_GUIDANCE)] };
+    if (admitted.kind === "reject") return admitted;
+    graphSteps.set(id, graphStep(id) + 1);
+    return appendNotes(agent, admitted, { advisor, finalRequest });
   });
   ctx.on("llm/stream", async function* (options, next) {
     const agent = options.sessionId ? ctx.agents.get(options.sessionId) : undefined;
@@ -1081,7 +1512,8 @@ export function apply(ctx, options) {
       const id = agent.session.id,
         state = budget(rootOf(agent)),
         used = turnRequests.get(id) ?? 0,
-        cap = reviewChildren.has(id) ? config.reviewMaxRequests : config.maxChildTurnRequests;
+        cap = reviewChildren.has(id) ? config.reviewMaxRequests :
+          advisorChildren.has(id) ? 1 : config.maxChildTurnRequests;
       if (state.childRequests >= config.maxChildRequests || used >= cap)
         throw new Error("Child model-call budget exhausted, including compaction calls.");
       turnRequests.set(id, used + 1);
@@ -1117,7 +1549,10 @@ export function apply(ctx, options) {
     }
   });
   ctx.on("session/event", (session, event) => {
-    if (event.type === "compaction/summary") pressureAnchors.delete(session.id);
+    if (event.type === "compaction/summary") {
+      pressureAnchors.delete(session.id);
+      pendingLedgers.add(session.id);
+    }
   });
 
   const region = (nodes, start, end, agent) =>
@@ -1264,7 +1699,14 @@ export function apply(ctx, options) {
       ...boundedEvidence(recent),
     };
     const state = budget(rootOf(agent));
-    const batch = selectionBatch(tasks.get(id), history, observation);
+    let batch = selectionBatch(tasks.get(id), history, observation);
+    const models = modelKnowledge.get(rootOf(agent));
+    if (batch && models) {
+      batch = { models, ...batch };
+      while (batch.history.length && Buffer.byteLength(JSON.stringify(batch)) > STATE_BYTES)
+        batch.history.pop();
+      if (!batch.history.length) batch = null;
+    }
     if (!batch) {
       record({
         kind: "decision_budget_boundary",

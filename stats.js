@@ -2,7 +2,8 @@
 export function newStats(mode,maxDecisions,pressureTokens) {
   return {mode,decisions:0,maxDecisions,delegations:0,activeChildren:0,childrenDone:0,
     compactions:0,tokensSaved:0,contextTokens:null,pressureTokens,lastDecision:null,
-    reviews:0,reviewsLgtm:0,updatedAt:0,pendingSaved:{}};
+    reviews:0,reviewsLgtm:0,advisors:0,syncNotes:0,ledgerNotes:0,modelChoices:0,
+    updatedAt:0,pendingSaved:{}};
 }
 export function applyStatsRecord(stats,record,decisions=stats.decisions) {
   const next={...stats,decisions,contextTokens:record.nativeEstimate??stats.contextTokens};
@@ -18,6 +19,10 @@ export function applyStatsRecord(stats,record,decisions=stats.decisions) {
       next.activeChildren=record.active??Math.max(0,stats.activeChildren-1); break;
     case 'review_end': next.reviews=stats.reviews+1;
       if (record.lgtm) next.reviewsLgtm=stats.reviewsLgtm+1; break;
+    case 'advisor_end': next.advisors=stats.advisors+1; break;
+    case 'sync_note': next.syncNotes=stats.syncNotes+1; break;
+    case 'ledger_note': next.ledgerNotes=stats.ledgerNotes+1; break;
+    case 'model_choice': next.modelChoices=stats.modelChoices+1; break;
     case 'context_scores':
       next.pendingSaved={...stats.pendingSaved,[record.session]:Math.max(0,record.estimatedBefore-record.estimatedAfter)}; break;
     case 'context_kept':
