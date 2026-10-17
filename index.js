@@ -108,7 +108,7 @@ export const Config = z.object({
     .number()
     .step(1)
     .min(0)
-    .default(2)
+    .default(1)
     .volatile()
     .description("Advisor consultations per root task"),
   advisorStallSteps: z
@@ -218,17 +218,6 @@ const ADVISOR_PROMPT =
 const advisorMessage = (model, trigger, reply) =>
   "Advisor (" + model + ", independent, no tool access) on " + trigger + ":\n" + reply +
   "\nTreat this as a hypothesis; verify it against evidence before acting.";
-// Before the first repository edit, any new read, search or test result is progress. After it, only
-// new repository edits and passing tests are: a rabbit hole of novel debug commands kept changing the
-// full progress key, so the stall trigger never fired (7236: 35 steps of /tmp probes after the edit).
-function momentumKey(graph) {
-  const edited = Object.entries(graph.files)
-    .filter(([path, file]) => file.edits.length && !/^\/(tmp|dev)\//.test(path));
-  if (!edited.length) return { working: false, key: progressKey(graph) };
-  const edits = edited.reduce((sum, [, file]) => sum + file.edits.length, 0),
-    passing = Object.values(graph.tests).filter((test) => test.runs.at(-1)?.outcome === "pass").length;
-  return { working: true, key: "edits " + edits + ", passing " + passing };
-}
 const syncMessage = (edits) =>
   "Collaborator changes since your last step:\n" +
   edits.map((edit) => "- " + edit.path + " edited by " + edit.label).join("\n") +
@@ -1603,12 +1592,12 @@ export function apply(ctx, options) {
     if (!isChild && config.advisorModel && config.advisorModel !== "off" && modeOf(agent) === "auto") {
       const state = advisorFor(id),
         graph = rootGraph(agent),
-        momentum = momentumKey(graph),
-        key = momentum.key,
+        key = progressKey(graph),
         now = graphStep(id),
-        base = Math.max(3, Number.isFinite(config.advisorStallSteps) ? config.advisorStallSteps : 6),
-        // Fix-and-verify steps change no file for a while legitimately, so the working phase waits longer.
-        stallSteps = momentum.working ? 2 * base : base;
+        stallSteps = Math.max(
+          3,
+          Number.isFinite(config.advisorStallSteps) ? config.advisorStallSteps : 6,
+        );
       if (state.key !== key) {
         state.key = key;
         state.since = now;
@@ -1619,9 +1608,7 @@ export function apply(ctx, options) {
       const failing = repeatedFailure(graph, state.failures);
       if (state.consults < (config.advisorMaxConsults ?? 2)) {
         if (now - state.since >= stallSteps && !state.stallDone) {
-          advisor = await consultAdvisor(agent, momentum.working
-            ? "stall: " + stallSteps + " steps without a repository edit or newly passing test"
-            : "stall", signal);
+          advisor = await consultAdvisor(agent, "stall", signal);
         } else if (failing) {
           advisor = await consultAdvisor(agent, "repeated failure: " + failing, signal);
         }

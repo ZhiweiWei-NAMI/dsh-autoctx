@@ -1,6 +1,6 @@
 {
   "name": "dsh-autoctx",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "type": "module",
   "main": "index.js",
   "exports": {
