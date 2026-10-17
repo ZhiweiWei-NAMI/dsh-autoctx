@@ -109,7 +109,7 @@ def configure_home(home, model, arm, plugin, relay, extra_models, routes, review
                 'reviewerModel': reviewer,
                 'advisorModel': advisor,
                 # Auto's context policy under pressure (jev or summary); recorded in run-config.json.
-                'contextSelection': os.environ.get('BENCH_CONTEXT_SELECTION', 'jev'),
+                'contextSelection': os.environ.get('BENCH_CONTEXT_SELECTION', 'summary'),
                 'allowPaidModels': any(route.startswith('opencode') for route in routes.values()),
                 'recordFile': str(home / 'auto-events.jsonl')}}]},
         ]
@@ -305,7 +305,7 @@ def main():
               'maxChildren': MAX_CHILDREN, 'maxConcurrentChildren': MAX_CONCURRENT,
               'extraModels': extra_models, 'modelRoutes': routes,
               'reviewer': args.reviewer, 'advisor': args.advisor, 'maxUsd': args.max_usd,
-              'contextSelection': os.environ.get('BENCH_CONTEXT_SELECTION', 'jev')}
+              'contextSelection': os.environ.get('BENCH_CONTEXT_SELECTION', 'summary')}
     config_file = root / 'run-config.json'
     write_json(root / 'tasks.json', manifest)
     write_json(config_file, config)

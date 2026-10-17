@@ -194,7 +194,8 @@ export const Config = z.object({
     .description("Append one execution-economy note before the root task's first model request"),
   contextSelection: z
     .union(["jev", "summary"])
-    .default("jev")
+    // Measured on dsh-bench r1: summary 10/12 vs jev 8/12 (deepseek-v4.1-flash), 9 vs 9 (glm-5.3-flash).
+    .default("summary")
     .volatile()
     .description(
       "Under pressure, Jev keeps the most relevant units verbatim (jev) or the executor summarizes the region (summary)",
