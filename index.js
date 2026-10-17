@@ -108,7 +108,7 @@ export const Config = z.object({
     .number()
     .step(1)
     .min(0)
-    .default(1)
+    .default(2)
     .volatile()
     .description("Advisor consultations per root task"),
   advisorStallSteps: z
@@ -210,14 +210,25 @@ const fileChanging = new Set(["edit", "write", "apply_patch", "multi_edit"]);
 const REVIEW_PROMPT =
   "Independently check the change the parent just made against the original issue. Inspect `git diff`, re-read the issue, run a minimal reproduction and the single most relevant existing test file. Never run the whole test suite; keep every command under 60 seconds; batch independent checks into one step. Do NOT edit files. Report only defects in the change itself: failures that also happen without the change, untested extras and style are not defects. Start the first line with exactly `LGTM` (then one line of evidence) or `DEFECTS` (then each concrete defect with evidence).";
 const reviewMessage = (report) =>
-  "Independent review found defects in your change:\n" +
+  "An independent reviewer reports possible defects in your change:\n" +
   report +
-  "\nFix only these defects, verify them with the most relevant test, then finish. Do not investigate unrelated or pre-existing failures.";
+  "\nCheck each against the behavior the issue asks for: fix the real ones and verify with the most relevant test; keep your change where a report contradicts the issue. Do not investigate unrelated or pre-existing failures, then finish.";
 const ADVISOR_PROMPT =
   "You are a senior advisor to a coding agent. Do not call tools; answer from this brief only. Give the most likely root cause, the next 2–4 concrete steps, and what evidence would confirm them, in ≤ 1200 characters.";
 const advisorMessage = (model, trigger, reply) =>
   "Advisor (" + model + ", independent, no tool access) on " + trigger + ":\n" + reply +
   "\nTreat this as a hypothesis; verify it against evidence before acting.";
+// Before the first repository edit, any new read, search or test result is progress. After it, only
+// new repository edits and passing tests are: a rabbit hole of novel debug commands kept changing the
+// full progress key, so the stall trigger never fired (7236: 35 steps of /tmp probes after the edit).
+function momentumKey(graph) {
+  const edited = Object.entries(graph.files)
+    .filter(([path, file]) => file.edits.length && !/^\/(tmp|dev)\//.test(path));
+  if (!edited.length) return { working: false, key: progressKey(graph) };
+  const edits = edited.reduce((sum, [, file]) => sum + file.edits.length, 0),
+    passing = Object.values(graph.tests).filter((test) => test.runs.at(-1)?.outcome === "pass").length;
+  return { working: true, key: "edits " + edits + ", passing " + passing };
+}
 const syncMessage = (edits) =>
   "Collaborator changes since your last step:\n" +
   edits.map((edit) => "- " + edit.path + " edited by " + edit.label).join("\n") +
@@ -1592,12 +1603,12 @@ export function apply(ctx, options) {
     if (!isChild && config.advisorModel && config.advisorModel !== "off" && modeOf(agent) === "auto") {
       const state = advisorFor(id),
         graph = rootGraph(agent),
-        key = progressKey(graph),
+        momentum = momentumKey(graph),
+        key = momentum.key,
         now = graphStep(id),
-        stallSteps = Math.max(
-          3,
-          Number.isFinite(config.advisorStallSteps) ? config.advisorStallSteps : 6,
-        );
+        base = Math.max(3, Number.isFinite(config.advisorStallSteps) ? config.advisorStallSteps : 6),
+        // Fix-and-verify steps change no file for a while legitimately, so the working phase waits longer.
+        stallSteps = momentum.working ? 2 * base : base;
       if (state.key !== key) {
         state.key = key;
         state.since = now;
@@ -1608,7 +1619,9 @@ export function apply(ctx, options) {
       const failing = repeatedFailure(graph, state.failures);
       if (state.consults < (config.advisorMaxConsults ?? 2)) {
         if (now - state.since >= stallSteps && !state.stallDone) {
-          advisor = await consultAdvisor(agent, "stall", signal);
+          advisor = await consultAdvisor(agent, momentum.working
+            ? "stall: " + stallSteps + " steps without a repository edit or newly passing test"
+            : "stall", signal);
         } else if (failing) {
           advisor = await consultAdvisor(agent, "repeated failure: " + failing, signal);
         }
@@ -1710,9 +1723,18 @@ export function apply(ctx, options) {
     });
     const nodes = [...agent.session.surface.nodes];
     let start = 2,
-      end = nodes.length - 1,
-      retainTokens = config.retainTokens;
+      end = nodes.length - 1;
     while (start <= end && !toolPairingBalancedBefore(agent.session, nodes[start])) start++;
+    // Retain only as much tail as lets one replacement land near 60% of the pressure budget. With the
+    // full retainTokens, head + tail + kept units sat just under pressure and two large tool results
+    // forced the next replacement (6197: nine decisions in one task).
+    const headTokens = measured.nodes.slice(0, start).reduce((sum, node) => sum + node.tokens, 0);
+    const fit = Math.floor(
+      (0.6 * config.pressureTokens - headTokens - config.keepRatio * (pressure - headTokens)) /
+        (1 - config.keepRatio),
+    );
+    const baseRetain = Math.min(config.retainTokens, Math.max(2000, fit));
+    let retainTokens = baseRetain;
     do {
       end = nodes.length - 1;
       let tail = 0;
@@ -1763,7 +1785,7 @@ export function apply(ctx, options) {
         });
       }
     };
-    if (retainTokens < config.retainTokens) {
+    if (retainTokens < baseRetain) {
       await compactRegion("ceiling_reduced_retention");
       return;
     }
@@ -1823,14 +1845,14 @@ export function apply(ctx, options) {
       ...boundedEvidence(recent),
     };
     const state = budget(rootOf(agent));
-    let batch = selectionBatch(tasks.get(id), history, observation);
-    const models = modelKnowledge.get(rootOf(agent));
-    if (batch && models) {
-      batch = { models, ...batch };
-      while (batch.history.length && Buffer.byteLength(JSON.stringify(batch)) > STATE_BYTES)
-        batch.history.pop();
-      if (!batch.history.length) batch = null;
-    }
+    // One decision covers the whole region: Jev judges the largest units, where the savings are, and
+    // the rest stay verbatim. Judging only the oldest batch freed 2-4K tokens per replacement, so
+    // pressure returned within a few steps and every return cost another decision from the budget.
+    const unitText = (unit) => unit.kind + ":\n" + unit.text;
+    const tokensOf = (unit) => ctx.tokenMeter.estimateMessage(note(unitText(unit)));
+    const sizes = new Map(history.map((unit) => [unit.id, tokensOf(unit)]));
+    const largestFirst = [...history].sort((a, b) => sizes.get(b.id) - sizes.get(a.id));
+    const batch = selectionBatch(tasks.get(id), largestFirst, observation);
     if (!batch) {
       record({
         kind: "decision_budget_boundary",
@@ -1841,24 +1863,8 @@ export function apply(ctx, options) {
       await compactRegion("selection_does_not_fit");
       return;
     }
-    // The judged span is the oldest contiguous run of complete candidates in the
-    // batch; the replacement shadows only that run and leaves the rest in place.
-    const covered = new Set(batch.history.map((unit) => unit.id));
-    const firstUnjudged = history.find((unit) => !unit.required && !covered.has(unit.id));
-    let judgedEnd = firstUnjudged ? firstUnjudged.position - 1 : end;
-    while (judgedEnd >= start && !toolPairingBalancedAfter(agent.session, nodes[judgedEnd]))
-      judgedEnd--;
-    if (judgedEnd < start) {
-      await compactRegion("selection_does_not_fit");
-      return;
-    }
-    const judged = history.filter((unit) => unit.position <= judgedEnd);
-    const judgedIds = new Set(judged.map((unit) => unit.id));
-    batch.history = batch.history.filter((unit) => judgedIds.has(unit.id));
-    if (!batch.history.length) {
-      await compactRegion("selection_does_not_fit");
-      return;
-    }
+    const judgedIds = new Set(batch.history.map((unit) => unit.id));
+    const judged = history.filter((unit) => judgedIds.has(unit.id));
     if (state.decisions >= config.maxDecisions) {
       record({
         kind: "decision_budget_boundary",
@@ -1889,20 +1895,30 @@ export function apply(ctx, options) {
       return;
     }
     signal.throwIfAborted();
-    const unitText = (unit) => unit.kind + ":\n" + unit.text;
-    const tokensOf = (unit) => ctx.tokenMeter.estimateMessage(note(unitText(unit)));
     const regionTokens = measured.nodes
-      .slice(start, judgedEnd + 1)
+      .slice(start, end + 1)
       .reduce((sum, node) => sum + node.tokens, 0);
+    // Unjudged units are kept first (required ones always); when they alone exceed the keep budget,
+    // the oldest non-required ones are archived to one line each.
+    const keepBudget = config.keepRatio * regionTokens;
+    const unjudged = history.filter((unit) => !judgedIds.has(unit.id));
+    const kept = new Set(unjudged.map((unit) => unit.id));
+    let unjudgedTokens = unjudged.reduce((sum, unit) => sum + sizes.get(unit.id), 0);
+    for (const unit of unjudged) {
+      if (unjudgedTokens <= keepBudget) break;
+      if (unit.required) continue;
+      kept.delete(unit.id);
+      unjudgedTokens -= sizes.get(unit.id);
+    }
     const budgeted = budgetedSelection(
       judged,
       selection.judgments,
-      config.keepRatio * regionTokens,
+      Math.max(0, keepBudget - unjudgedTokens),
       tokensOf,
     );
-    const kept = new Set(budgeted.keptIds);
-    const dropped = judged.filter((unit) => !kept.has(unit.id));
-    const summary = judged
+    for (const keptId of budgeted.keptIds) kept.add(keptId);
+    const dropped = history.filter((unit) => !kept.has(unit.id));
+    const summary = history
       .filter((unit) => kept.has(unit.id))
       .map((unit) => ({ type: "text", text: unitText(unit) }));
     if (dropped.length)
@@ -1929,7 +1945,7 @@ export function apply(ctx, options) {
     }
     prepared.set(id, { summary, model: selection.model });
     try {
-      await compactRegion("replacement", judgedEnd);
+      await compactRegion("replacement");
     } finally {
       prepared.delete(id);
     }

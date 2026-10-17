@@ -910,7 +910,7 @@ function contextHistory(app, contents) {
   return events;
 }
 
-test("33 candidates are judged by preview and only the 32 oldest events are replaced", async (t) => {
+test("33 candidates: 32 are judged by preview and one decision replaces the whole region", async (t) => {
   const native = nativeCompaction(t),
     requests = [];
   t.mock.method(globalThis, "fetch", async (url, { body }) => {
@@ -922,17 +922,15 @@ test("33 candidates are judged by preview and only the 32 oldest events are repl
     app,
     Array.from({ length: 33 }, (_, i) => [{ type: "text", text: "Source " + i }]),
   );
-  const remaining = JSON.stringify(events.slice(34));
+  const remaining = JSON.stringify(events.slice(35));
   await app.step();
-  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 33]);
+  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 34]);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].history.length, 32);
-  assert.equal(requests[0].history[0].id, "event_2_block_0");
-  assert.equal(requests[0].history.at(-1).id, "event_33_block_0");
-  assert.equal(JSON.stringify(events.slice(34)), remaining);
+  assert.equal(JSON.stringify(events.slice(35)), remaining);
 });
 
-test("a partial tool result keeps the whole tool exchange outside the judged span", async (t) => {
+test("a complete tool exchange at the region end is replaced with the region", async (t) => {
   const native = nativeCompaction(t),
     requests = [];
   t.mock.method(globalThis, "fetch", async (url, { body }) => {
@@ -950,12 +948,11 @@ test("a partial tool result keeps the whole tool exchange outside the judged spa
   ]);
   events[33].type = "tool/result";
   events[33].data.message.role = "tool";
-  const remaining = JSON.stringify(events.slice(32));
+  const remaining = JSON.stringify(events.slice(34));
   await app.step();
-  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 31]);
+  assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 33]);
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].history.length, 30);
-  assert.equal(JSON.stringify(events.slice(32)), remaining);
+  assert.equal(JSON.stringify(events.slice(34)), remaining);
 });
 
 test("a region whose full text exceeds the state budget is judged by previews and kept in full", async (t) => {

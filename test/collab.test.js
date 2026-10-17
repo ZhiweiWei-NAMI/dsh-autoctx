@@ -584,7 +584,7 @@ test('the "same" reviewer keeps the fork review without a model brief', async (t
   await pending;
 });
 
-test("the Jev state starts with identical models knowledge across calls in one root task", async (t) => {
+test("delegation Jev states start with identical models knowledge; selection states carry none", async (t) => {
   recordAll(t);
   const states = [];
   t.mock.method(globalThis, "fetch", async (url, { body }) => {
@@ -651,10 +651,10 @@ test("the Jev state starts with identical models knowledge across calls in one r
   await app.preStep(app.root, [userMessage("Constraints: " + "x".repeat(9000))]);
   assert.equal(states.length, 3);
   assert.equal(states[2].trigger, "selection");
-  assert.ok(states[2].history.length < 32);
-  for (const state of states) assert.equal(Object.keys(state)[0], "models");
+  // Context selection spends the whole state on history; model knowledge serves the delegation calls.
+  assert.equal(states[2].models, undefined);
+  for (const state of states.slice(0, 2)) assert.equal(Object.keys(state)[0], "models");
   assert.equal(states[0].models, states[1].models);
-  assert.equal(states[0].models, states[2].models);
   assert.match(states[0].models, /glm-5\.3-flash/);
 });
 
