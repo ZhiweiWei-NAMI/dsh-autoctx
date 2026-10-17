@@ -273,7 +273,9 @@ def jev_preflight(model):
     body = json.dumps({'model': model, 'state': json.dumps({'task': 'bench preflight'}),
                        'questions': {'ok': {'type': 'noul', 'instructions': 'Is this a preflight check?'}}}).encode()
     request = urllib.request.Request(JEV_UPSTREAM, data=body, method='POST', headers={
-        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + os.environ['JEV_API_KEY']})
+        # The relay forwards the plugin's Node user agent; urllib's default one is refused with HTTP 403.
+        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + os.environ['JEV_API_KEY'],
+        'User-Agent': 'node'})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             answers = json.loads(response.read()).get('answers') or {}
