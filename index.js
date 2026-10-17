@@ -1380,6 +1380,8 @@ export function apply(ctx, options) {
         context: change.diff ? await hunkContext(cwd, change.diff) : "",
         ledger: digest(rootGraph(agent), 3000),
       });
+      record({ kind: "brief", session: id, role: "reviewer", chars: prompt.length, diffChars: change.diff.length,
+        files: change.files.length, ...(change.error ? { error: change.error } : {}) });
       reviewPending.add(id);
       run = await ctx.subagents.start(provider, {
         label: "Independent review",
@@ -1878,6 +1880,8 @@ export function apply(ctx, options) {
         task: tasks.get(id),
         ledger: digest(graph, 3000),
       });
+      record({ kind: "brief", session: id, role: "advisor", chars: prompt.length, diffChars: change.diff.length,
+        files: change.files.length, failureChars: raw?.length ?? 0, ...(change.error ? { error: change.error } : {}) });
       advisorPending.add(id);
       run = await ctx.subagents.start("spawn", {
         label: "Advisor",
