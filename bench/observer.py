@@ -1,5 +1,6 @@
 """Forward and measure execution, Jev and native OpenCode traffic within one shared call budget."""
 import gzip
+import hashlib
 import json
 import os
 import threading
@@ -36,6 +37,21 @@ def content_body(raw, encoding, encode=False):
         else:
             raise ValueError('Unsupported content encoding')
     return raw
+
+
+def prefix_identity(body):
+    """Request-prefix identity, independent of provider cache reports: hashes of the cache-relevant
+    configuration and tools, and a cumulative hash after every message, so a child's first request can be
+    checked against its parent's history byte for byte."""
+    digest = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:12]
+    system = body.get('system')
+    messages = ([{'role': 'system', 'content': system}] if system is not None else []) + list(body.get('messages') or [])
+    running, cumulative = hashlib.sha256(), []
+    for message in messages:
+        running.update(json.dumps(message, sort_keys=True).encode())
+        cumulative.append(running.copy().hexdigest()[:12])
+    config = {key: body.get(key) for key in ('model', 'thinking', 'reasoning_effort', 'reasoning') if key in body}
+    return {'toolsHash': digest(body.get('tools') or []), 'configHash': digest(config), 'messageHashes': cumulative}
 
 
 class CaseObserver:
@@ -114,6 +130,8 @@ class CaseObserver:
             record['effort'] = effort or json.dumps(thinking)[:80]
         if opencode and path.split('?', 1)[0].endswith('/messages'):
             record['usageProtocol'] = 'anthropic-messages'
+        if not jev:
+            record.update(prefix_identity(body))
         with self.lock:
             if self.stopped or len(self.calls) >= self.limit:
                 client.send_error(429, 'Task model-request limit reached or solver stopped')

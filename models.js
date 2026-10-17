@@ -1,4 +1,4 @@
-// Model knowledge from models.json: prices, routes, roles and dsh-bench
+// Model knowledge from models.json: prices, routes, short priors and dsh-bench
 // measurements. The catalog is static data; callers only read and rank it.
 import fs from 'node:fs';
 
@@ -8,10 +8,9 @@ const entries = () => (Array.isArray(CATALOG?.models) ? CATALOG.models : []);
 const known = id => typeof id === 'string' && id.length > 0;
 const withId = (a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 
-// A usable entry needs a price to rank and roles to match a route.
+// A usable entry needs a price to rank.
 const valid = entry => !!entry && known(entry.id)
-  && !!entry.price && typeof entry.price.input === 'number' && typeof entry.price.output === 'number'
-  && Array.isArray(entry.roles);
+  && !!entry.price && typeof entry.price.input === 'number' && typeof entry.price.output === 'number';
 
 export function modelInfo(id) {
   if (!known(id)) return undefined;
@@ -23,18 +22,34 @@ export function modelInfo(id) {
   return models.find(entry => typeof entry?.id === 'string' && entry.id.toLowerCase() === suffix);
 }
 
+// Host usage is disjoint (dsh-llm TokenUsage): input is uncached input only; cache reads and writes are
+// separate. The bench relay's {input, output, cacheRead, cacheWrite} spelling is accepted too.
 export function costUSD(id, usage) {
   const entry = modelInfo(id);
   if (!entry || !entry.price) return undefined;
-  const price = entry.price;
   const used = usage ?? {};
-  if (!Number.isFinite(used.input) || !Number.isFinite(used.output)) return undefined;
+  const input = used.inputTokens ?? used.input, output = used.outputTokens ?? used.output;
+  if (!Number.isFinite(input) || !Number.isFinite(output)) return undefined;
+  const cacheRead = used.cacheReadTokens ?? used.cacheRead ?? 0, cacheWrite = used.cacheWriteTokens ?? used.cacheWrite ?? 0;
+  const price = entry.price, above = price.above;
+  // A long-prompt tier scales every input-side price by its input ratio (assumption where the tier lists only input/output).
+  const long = above && input + cacheRead + cacheWrite > above.tokens;
+  const scale = long ? above.input / price.input : 1;
   return (
-    used.input * price.input
-    + used.output * price.output
-    + (used.cacheRead ?? 0) * price.cacheRead
-    + (used.cacheWrite ?? 0) * (price.cacheWrite ?? 0)
+    input * price.input * scale
+    + output * (long ? above.output : price.output)
+    + cacheRead * (price.cacheRead ?? price.input) * scale
+    + cacheWrite * (price.cacheWrite ?? price.input) * scale
   ) / 1e6;
+}
+
+// Jev's own price (models.json `jev`); usage uses the Jev response's input_tokens/output_tokens.
+export function jevCostUSD(model, usage) {
+  const price = CATALOG?.jev?.[model];
+  if (!price || !usage) return undefined;
+  const input = usage.input_tokens ?? usage.inputTokens, output = usage.output_tokens ?? usage.outputTokens;
+  if (!Number.isFinite(input) || !Number.isFinite(output)) return undefined;
+  return (input * price.input + output * price.output) / 1e6;
 }
 
 export function availableModels(modelRoutes, { allowPaid = false } = {}) {
@@ -47,23 +62,14 @@ export function availableModels(modelRoutes, { allowPaid = false } = {}) {
   });
 }
 
-export function pickModel(role, { executor, available, exclude = [] } = {}) {
+// Fallback without a Jev answer: the highest effective ledger weight for this role, then the cheapest brief.
+// Family is information for Jev, not a ranking rule.
+export function pickModel(role, { available, exclude = [], weightOf } = {}) {
   const blocked = new Set(Array.isArray(exclude) ? exclude : []);
-  const candidates = (Array.isArray(available) ? available : [])
-    .filter(entry => valid(entry) && entry.roles.includes(role) && !blocked.has(entry.id));
+  const candidates = (Array.isArray(available) ? available : []).filter(entry => valid(entry) && !blocked.has(entry.id));
   if (candidates.length === 0) return undefined;
-  const own = typeof executor === 'string' ? modelInfo(executor) : executor;
-  const ownId = own?.id ?? (typeof executor === 'string' ? executor : undefined);
-  const family = own?.family;
-  const different = entry => (family && entry.family === family ? 1 : 0);
-  const reuse = entry => (entry.id === ownId ? 0 : 1);
-  const pro = entry => (entry.tier === 'pro' ? 0 : 1);
-  return candidates.sort((a, b) => {
-    if (role === 'advisor' && pro(a) !== pro(b)) return pro(a) - pro(b);
-    if ((role === 'reviewer' || role === 'advisor') && different(a) !== different(b)) return different(a) - different(b);
-    if (role === 'worker' && reuse(a) !== reuse(b)) return reuse(a) - reuse(b);
-    return briefCost(a) - briefCost(b) || withId(a, b);
-  })[0];
+  const weight = entry => (typeof weightOf === 'function' ? weightOf(entry.id, role) : 0.5);
+  return candidates.sort((a, b) => weight(b) - weight(a) || briefCost(a) - briefCost(b) || withId(a, b))[0];
 }
 
 export function briefCost(entry) {
@@ -83,12 +89,9 @@ const line = (entry, cap) => {
   const family = [entry.family, entry.tier].filter(value => typeof value === 'string').join('/');
   if (family) parts.push(family);
   parts.push(`$${price.input}/${price.output}${Number.isFinite(price.cacheRead) ? '/' + price.cacheRead : ''} per 1M`);
-  const roles = entry.roles.filter(role => typeof role === 'string');
-  if (roles.length) parts.push('roles: ' + roles.join(','));
-  const strengths = clip(entry.strengths, cap);
-  if (strengths) parts.push('+ ' + strengths);
-  const weaknesses = clip(entry.weaknesses, cap);
-  if (weaknesses) parts.push('- ' + weaknesses);
+  if (Number.isFinite(entry.context)) parts.push('context ' + entry.context);
+  const prior = clip(entry.prior, cap);
+  if (prior) parts.push('prior: ' + prior);
   const measured = entry.measured ?? {};
   const measurements = [];
   if (Number.isFinite(measured.resolved) && Number.isFinite(measured.cases)) {
@@ -99,7 +102,7 @@ const line = (entry, cap) => {
   }
   if (Number.isFinite(measured.callsPerCase)) measurements.push(`${measured.callsPerCase} calls/task`);
   if (Number.isFinite(measured.callCapped)) measurements.push(`${measured.callCapped} hit call cap`);
-  if (measurements.length) parts.push('measured ' + measurements.join(', '));
+  if (measurements.length) parts.push('measured as ' + (measured.role ?? 'executor') + ': ' + measurements.join(', '));
   return parts.join(' | ');
 };
 
@@ -118,7 +121,7 @@ export function knowledge(list) {
     return ids.join('\n');
   }
   let lo = 0;
-  let hi = Math.max(0, ...sorted.flatMap(entry => [entry.strengths, entry.weaknesses].map(text => (typeof text === 'string' ? text.length : 0))));
+  let hi = Math.max(0, ...sorted.map(entry => (typeof entry.prior === 'string' ? entry.prior.length : 0)));
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2);
     if (bytes(sorted.map(entry => line(entry, mid))) <= 4000) lo = mid;

@@ -54,14 +54,15 @@ export function createDecisionMemo() {
   };
 }
 
-export async function scoreContext(decide, request, owners) {
+// `extra` questions (cost and effort at this checkpoint) ride on the same call; their answers are returned as is.
+export async function scoreContext(decide, request, owners, extra={}) {
   const judgments=[];
-  const result=await decide({...request,questions:contextQuestions(request.history,owners)});
+  const result=await decide({...request,questions:{...contextQuestions(request.history,owners),...extra}});
   for (const [i,unit] of request.history.entries()) {
     const importance=result.answers['importance_'+i],owner=result.answers['owner_'+i];
     judgments.push({source:unit.id,part:unit.id,importance,owner});
   }
-  return {model:result.model,judgments};
+  return {model:result.model,judgments,answers:Object.fromEntries(Object.keys(extra).map(id=>[id,result.answers[id]]))};
 }
 
 // Required units count toward the budget; ranked complete units fill the rest.

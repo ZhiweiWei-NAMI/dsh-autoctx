@@ -135,6 +135,12 @@ function collab(options = {}) {
             get: (key) => records.get(key),
             delete: async (key) => records.delete(key),
             put: async (key, value) => records.set(key, value),
+            update: async (key, fn) => {
+              if (!records.has(key)) throw new Error("missing-key");
+              const next = fn(records.get(key));
+              records.set(key, next);
+              return next;
+            },
           };
         },
         close: async () => {},
@@ -569,7 +575,7 @@ test("a configured cross-model reviewer uses spawn, agentOptions and the ledger"
   assert.equal(app.steered.length, 0); // the review completed with LGTM, which ends the turn
 });
 
-test('the "same" reviewer keeps the fork review without a model brief', async (t) => {
+test('the "same" reviewer forks; inside the first turn the fork has no seed, so the brief carries the ledger', async (t) => {
   recordAll(t);
   const app = collab({ reviewBeforeFinish: true });
   await app.preStep(app.root, [userMessage("Fix the widget.")]);
@@ -579,7 +585,9 @@ test('the "same" reviewer keeps the fork review without a model brief', async (t
   const review = app.children.find((child) => child.label === "Independent review");
   assert.equal(review.provider, "fork");
   assert.equal(review.agentOptions, undefined);
-  assert.doesNotMatch(review.prompt, /Parent evidence ledger:/);
+  // No tool filter: the fork keeps the parent's tool block and the guard enforces the reviewer's limits.
+  assert.equal(review.toolFilter, undefined);
+  assert.match(review.prompt, /Parent evidence ledger:/);
   app.settle();
   await pending;
 });
@@ -683,4 +691,99 @@ test("one failed fix attempt does not consult the advisor", async (t) => {
   fail();
   await app.preStep(app.root, []);
   assert.equal(records.filter((record) => record.kind === "advisor_start").length, 0);
+});
+
+test("a forked reviewer keeps the tool block; the guard stops its edits and delegation", async (t) => {
+  recordAll(t);
+  const app = collab({ reviewBeforeFinish: true });
+  await app.preStep(app.root, [userMessage("Fix the widget.")]);
+  app.edit(app.root, "src/a.js");
+  const pending = app.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  const reviewer = app.agents.get(app.children[0].id);
+  const guard = app.handlers.get("tools/guard");
+  assert.match(guard({ name: "edit", agent: reviewer, arguments: { file_path: "src/a.js" } }), /does not edit/);
+  assert.match(guard({ name: "str_replace_editor", agent: reviewer, arguments: { command: "str_replace" } }), /does not edit/);
+  assert.equal(guard({ name: "str_replace_editor", agent: reviewer, arguments: { command: "view" } }), undefined);
+  assert.equal(guard({ name: "bash", agent: reviewer, arguments: { command: "git diff" } }), undefined);
+  assert.match(guard({ name: "subagent", agent: reviewer, arguments: {}, callId: "x" }), /Nested delegation/);
+  app.settle();
+  await pending;
+});
+
+// Jev mock for the learning flow: role choice, then one batched fit score per used role at turn end.
+function learningJev(t, { score = 4, choice = "glm-5.3-flash" } = {}) {
+  const states = [];
+  t.mock.method(globalThis, "fetch", async (url, { body }) => {
+    const request = JSON.parse(body);
+    const state = JSON.parse(request.state);
+    states.push({ state, questions: request.questions });
+    const answers = {};
+    for (const [id, question] of Object.entries(request.questions))
+      answers[id] = question.type === "choice"
+        ? { type: "choice", choice: id === "task_tag" ? "debugging" : choice, confidence: 0.8,
+            probabilities: { [choice]: 0.7 } }
+        : question.type === "score"
+          ? { type: "score", score, confidence: 0.6 }
+          : { type: "noul", noul: 0.9 };
+    return { ok: true, status: 200, text: async () => JSON.stringify({ model: "jev", answers, usage: { input_tokens: 1000, output_tokens: 10 } }) };
+  });
+  return states;
+}
+async function reviewedTurn(app) {
+  await app.preStep(app.root, [userMessage("Fix the widget.")]);
+  app.edit(app.root, "src/a.js");
+  const pending = app.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  app.settle();
+  await pending;
+  app.handlers.get("session/event")(app.root.session, { type: "turn/end", data: { turn: "turn", reason: { kind: "completed" } } });
+  for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
+test("auto learning: the turn's reviewer gets one bounded weight step; candidates are not role-filtered", async (t) => {
+  const records = recordAll(t);
+  const states = learningJev(t);
+  const app = collab({ reviewBeforeFinish: true, reviewerModel: "auto", learning: "auto", jevModel: "jev-1.13" });
+  await reviewedTurn(app);
+  const choice = states.find((x) => x.questions.model);
+  // The executor's own model is a candidate and the tag is asked with the same call.
+  assert.deepEqual(Object.keys(choice.questions.model.criteria).sort(), ["deepseek-v4.1-flash", "glm-5.3-flash"]);
+  assert.ok(choice.questions.task_tag);
+  assert.doesNotMatch(choice.questions.model.instructions, /independence/);
+  const learning = states.find((x) => x.state.trigger === "learning");
+  assert.ok(learning.questions.fit_0);
+  const ledger = [...app.tables.get("ledger").values()][0];
+  assert.equal(ledger.mode, "auto");
+  assert.equal(ledger.version, 1);
+  assert.deepEqual(ledger.weights["debugging|glm-5.3-flash|reviewer"].learned, 0.75);
+  assert.equal(ledger.weights["debugging|glm-5.3-flash|reviewer"].n, 1);
+  // The unused candidate is untouched: not being chosen never lowers a weight.
+  assert.equal(ledger.weights["debugging|deepseek-v4.1-flash|reviewer"], undefined);
+  const use = records.find((r) => r.kind === "turn_use");
+  assert.equal(use.roles[0].model, "glm-5.3-flash");
+  assert.ok(use.cost.jev > 0);
+  // The same turn ending again is not counted twice.
+  app.handlers.get("session/event")(app.root.session, { type: "turn/end", data: { turn: "turn", reason: { kind: "completed" } } });
+  for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal([...app.tables.get("ledger").values()][0].version, 1);
+});
+
+test("manual learning queues one pending card; frozen only records", async (t) => {
+  recordAll(t);
+  learningJev(t, { score: 0 });
+  const manual = collab({ reviewBeforeFinish: true, reviewerModel: "auto", learning: "manual" });
+  await reviewedTurn(manual);
+  const ledger = [...manual.tables.get("ledger").values()][0];
+  assert.equal(ledger.version, 0);
+  assert.equal(ledger.pending.version, 1);
+  assert.deepEqual(ledger.pending.items["debugging|glm-5.3-flash|reviewer"].current, 0.5);
+  assert.deepEqual(ledger.pending.items["debugging|glm-5.3-flash|reviewer"].proposed, 0.25);
+  const frozen = collab({ reviewBeforeFinish: true, reviewerModel: "auto", learning: "frozen" });
+  await reviewedTurn(frozen);
+  assert.equal(frozen.tables.get("ledger")?.size ?? 0, 0);
+  // Storage keys must be path-safe like the real per-record backend requires.
+  for (const app of [manual, frozen])
+    for (const name of ["ledger", "uses"])
+      for (const key of app.tables.get(name)?.keys() ?? []) assert.match(key, /^[a-zA-Z0-9_-]+$/);
 });

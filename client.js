@@ -67,7 +67,69 @@ window.__ModuleLoader__.load({
 			statsJevUnavailable: "Jev unavailable",
 			statsJevUnavailableHint: "HTTP {status}; this task uses local fallbacks",
 			statsReviewsLgtm: "LGTM",
-			statsLastRoute: "Last route"
+			statsLastRoute: "Last route",
+			pendingDot: "Weight changes are waiting for approval",
+			statsCost: "Cost",
+			costExecutor: "executor",
+			costChildren: "children",
+			costJev: "Jev",
+			costCompaction: "compaction",
+			costUnpriced: "+{n} unpriced",
+			statsCache: "Cache",
+			cacheReported: "Provider-reported cache hit",
+			cacheExecutor: "executor",
+			cacheCalls: "{n} calls",
+			statsPrefix: "Prefix reuse",
+			prefixValue: "{seeded}/{forks} forks seeded with parent history",
+			prefixHint: "Session prefix reuse, not a cache hit: a reused prefix may still miss in the provider cache.",
+			statsDeferrals: "{n} deferred for cost",
+			statsPlan: "Turn plan",
+			planNoTag: "untagged",
+			thinkingOn: "thinking {effort}",
+			thinkingOff: "thinking off",
+			planProb: "Jev high-reasoning p {p}",
+			planVia: "via {via}",
+			viaJev: "Jev",
+			viaKept: "kept",
+			viaNone: "none",
+			viaCheckpoint: "checkpoint",
+			viaChoice: "model choice",
+			viaFallback: "fallback",
+			viaConfig: "config",
+			schedTitle: "Scheduling & learning",
+			learnMode: "Learning mode",
+			learnAuto: "auto",
+			learnManual: "manual",
+			learnFrozen: "frozen",
+			learnAutoHint: "Apply Jev's weight suggestions automatically and record every change.",
+			learnManualHint: "Collect suggestions into one card for you to confirm.",
+			learnFrozenHint: "Record evidence only; weights are not adjusted.",
+			choiceConfidence: "Jev confidence (uncalibrated)",
+			colModel: "Model",
+			colProbability: "Jev choice probability",
+			colWeight: "Workspace weight",
+			colTag: "Tag",
+			colRole: "Role",
+			srcUser: "user",
+			srcLearned: "learned",
+			srcNone: "no evidence",
+			filtered: "Filtered",
+			weightsTitle: "Workspace weights",
+			noWeights: "No weights recorded yet.",
+			lastAuto: "Auto-adjusted {n} items",
+			pauseAuto: "Pause auto",
+			revertLast: "Restore previous version",
+			reverted: "Restored",
+			pendingTitle: "Weight changes to confirm (v{v})",
+			pendingUpdated: "Updated",
+			basis: "basis",
+			target: "target",
+			uncertainty: "uncertainty {x} (Jev, uncalibrated)",
+			evidence: "{n} evidence",
+			approve: "Approve this version",
+			keepCurrent: "Keep current",
+			feedbackNote: "Native thumbs up/down on answers (optional categories: result, instructions, cost, …) are used as learning evidence.",
+			actionFailed: "The server did not accept this action."
 		};
 		const zh = {
 			summary: "自动路由、子代理与上下文压缩均由 Jev 决策。",
@@ -132,7 +194,69 @@ window.__ModuleLoader__.load({
 			statsJevUnavailable: "Jev 不可用",
 			statsJevUnavailableHint: "HTTP {status}；本任务改用本地回退",
 			statsReviewsLgtm: "通过",
-			statsLastRoute: "最近路由"
+			statsLastRoute: "最近路由",
+			pendingDot: "有待确认的权重调整",
+			statsCost: "成本",
+			costExecutor: "执行",
+			costChildren: "子代理",
+			costJev: "Jev",
+			costCompaction: "压缩",
+			costUnpriced: "+{n} 未计价",
+			statsCache: "缓存",
+			cacheReported: "接口报告缓存命中",
+			cacheExecutor: "执行器",
+			cacheCalls: "{n} 次调用",
+			statsPrefix: "会话前缀复用",
+			prefixValue: "{seeded}/{forks} 个 fork 带父会话历史启动",
+			prefixHint: "这是会话前缀复用，不是缓存命中：复用的前缀在接口缓存中仍可能未命中。",
+			statsDeferrals: "因成本推迟 {n} 次",
+			statsPlan: "本轮计划",
+			planNoTag: "无标签",
+			thinkingOn: "思考 {effort}",
+			thinkingOff: "思考关闭",
+			planProb: "Jev 高推理概率 {p}",
+			planVia: "来源 {via}",
+			viaJev: "Jev",
+			viaKept: "沿用",
+			viaNone: "无",
+			viaCheckpoint: "检查点",
+			viaChoice: "模型选择",
+			viaFallback: "回退",
+			viaConfig: "配置",
+			schedTitle: "调度与学习",
+			learnMode: "学习模式",
+			learnAuto: "自动",
+			learnManual: "手动",
+			learnFrozen: "冻结",
+			learnAutoHint: "自动应用 Jev 的权重建议并记录变更。",
+			learnManualHint: "建议汇总成一张待确认卡片。",
+			learnFrozenHint: "只记录证据，不调整。",
+			choiceConfidence: "Jev 置信度（未校准）",
+			colModel: "模型",
+			colProbability: "Jev 选择概率",
+			colWeight: "工作区权重",
+			colTag: "标签",
+			colRole: "角色",
+			srcUser: "用户",
+			srcLearned: "学习",
+			srcNone: "无证据",
+			filtered: "已过滤",
+			weightsTitle: "工作区权重",
+			noWeights: "暂无权重记录。",
+			lastAuto: "已自动调整 {n} 项",
+			pauseAuto: "暂停自动",
+			revertLast: "恢复上一版本",
+			reverted: "已恢复",
+			pendingTitle: "待确认的权重调整 (v{v})",
+			pendingUpdated: "已更新",
+			basis: "依据",
+			target: "目标",
+			uncertainty: "不确定度 {x}（Jev 未校准）",
+			evidence: "{n} 条证据",
+			approve: "批准此版本",
+			keepCurrent: "保持当前",
+			feedbackNote: "对回答的原生点赞/点踩（可选分类：结果、指令、成本等）会作为学习证据。",
+			actionFailed: "服务端未接受此操作。"
 		};
 		const NS = "plugins.dshAutoctx";
 		const CONFIG_KEY = "dsh-autoctx#dsh-autoctx";
@@ -285,11 +409,12 @@ window.__ModuleLoader__.load({
 			d: "M9 1L3 9h4l-1 6 6-8H8l1-6z",
 			fill: "currentColor"
 		}) });
-		const CSS = `.dac-chip{box-sizing:border-box;display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 8px;border-radius:var(--dsw-radius-md);border:.5px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:20px;cursor:default;user-select:none;position:relative}
+		const CSS = `.dac-chip{box-sizing:border-box;display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 8px;border-radius:var(--dsw-radius-md);border:.5px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:20px;cursor:pointer;user-select:none;position:relative}
 .dac-chip:hover,.dac-chip:focus-visible{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-3);outline:none}
 .dac-chipNums{font-variant-numeric:tabular-nums;display:inline-flex;align-items:center;gap:3px}
 .dac-ring{flex:none}
-.dac-card{position:absolute;bottom:calc(100% + 8px);right:0;z-index:20;box-sizing:border-box;width:264px;padding:12px 14px;border-radius:var(--dsw-radius-lg);border:.5px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-2);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px}
+.dac-pop{position:absolute;bottom:100%;right:0;z-index:20;padding-bottom:8px;cursor:auto;user-select:text}
+.dac-card{box-sizing:border-box;width:320px;max-width:calc(100vw - 24px);max-height:70vh;overflow-y:auto;padding:12px 14px;border-radius:var(--dsw-radius-lg);border:.5px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-2);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px}
 .dac-cardTitle{margin:0 0 8px;font-size:13px;font-weight:500;line-height:20px}
 .dac-grid{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;align-items:baseline}
 .dac-key{color:var(--dsw-alias-label-secondary)}
@@ -309,15 +434,145 @@ window.__ModuleLoader__.load({
 .dac-segItem:hover:not(:disabled){color:var(--dsw-alias-label-primary)}
 .dac-segItem[aria-checked=true]{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);box-shadow:0 1px 2px rgba(0,0,0,.08),0 0 0 .5px var(--dsw-alias-border-l3);font-weight:500}
 .dac-segItem:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-alias-state-business-primary);outline-offset:1px}
-.dac-hint{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}`;
+.dac-hint{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.dac-dot{position:absolute;top:-3px;right:-3px;width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-state-warn-primary);box-shadow:0 0 0 1.5px var(--dsw-alias-bg-layer-1)}
+.dac-dotInline{position:static;display:inline-block;box-shadow:none}
+.dac-val{min-width:0;overflow-wrap:anywhere}
+.dac-sub{color:var(--dsw-alias-label-secondary);font-size:11.5px}
+.dac-expand{font:inherit;display:flex;align-items:center;gap:6px;width:100%;margin-top:10px;padding:8px 0 0;border:0;border-top:.5px solid var(--dsw-alias-border-l2);background:none;color:var(--dsw-alias-label-secondary);font-weight:500;text-align:left;cursor:pointer}
+.dac-expand:hover{color:var(--dsw-alias-label-primary)}
+.dac-sched{display:flex;flex-direction:column;gap:12px;margin-top:8px}
+.dac-block{display:flex;flex-direction:column;gap:4px}
+.dac-blockHead{font-weight:500;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.dac-pending{padding:8px 10px;border-radius:var(--dsw-radius-md);border:.5px solid var(--dsw-alias-state-warn-primary);background:var(--dsw-alias-bg-layer-3)}
+.dac-item{padding:4px 0;border-top:.5px solid var(--dsw-alias-border-l2)}
+.dac-tbl{display:grid;gap:2px 10px;font-variant-numeric:tabular-nums}
+.dac-tbl>span{min-width:0;overflow-wrap:anywhere}
+.dac-th{color:var(--dsw-alias-label-tertiary);font-size:11px}
+.dac-strong{font-weight:500}
+.dac-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+.dac-btn{font:inherit;font-size:12px;line-height:18px;padding:2px 10px;border-radius:var(--dsw-radius-md);border:.5px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);cursor:pointer}
+.dac-btn[data-primary=true]{background:var(--dsw-alias-state-business-primary);border-color:transparent;color:#fff}
+.dac-btn:disabled{opacity:.5;cursor:default}
+.dac-badge{padding:0 6px;border-radius:var(--dsw-radius-xs);background:var(--dsw-alias-state-warn-primary);color:#fff;font-size:11px;line-height:16px;font-weight:500}
+.dac-segSm .dac-segItem{min-width:0;padding:2px 10px;font-size:12px}`;
+		const usd = (n) => "$" + (Number(n) || 0).toFixed(Math.abs(n) >= 1 ? 2 : 4);
+		const pct = (p) => p == null ? "–" : Math.round(p * 100) + "%";
+		const fixed2 = (n) => n == null ? "–" : Number(n).toFixed(2);
+		const text = (v) => v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+		const cap = (s) => s[0].toUpperCase() + s.slice(1);
+		const VIAS = ["jev", "kept", "none", "checkpoint", "choice", "fallback", "config"];
+		const LEARN_MODES = ["auto", "manual", "frozen"];
+		const SOURCES = { user: "srcUser", learned: "srcLearned", none: "srcNone" };
+		const viaLabel = (t, via) => VIAS.includes(via) ? t("via" + cap(via)) : text(via) || "–";
+		const keyParts = (key) => { const [tag, model, role] = String(key).split("|"); return [tag || "–", model || "–", role || "–"]; };
+		const weightLabel = (t, weight, source, n) => [fixed2(weight), SOURCES[source] ? t(SOURCES[source]) : text(source),
+			source !== "none" && n > 0 ? "n=" + n : null].filter(Boolean).join(" · ");
+		const row = (label, value) => jsxs(react.Fragment, { children: [
+			jsx("span", { className: "dac-key", children: label }),
+			jsxs("div", { className: "dac-val", children: value })
+		] });
+		const table = (columns, head, rows) => jsx("div", { className: "dac-tbl", style: { gridTemplateColumns: columns }, children: [
+			...head.map((label, i) => jsx("span", { className: "dac-th", children: label }, "h" + i)),
+			...rows.flatMap((cells, r) => cells.map((cell, i) => jsx("span", {
+				className: cell?.className, title: cell?.title, children: typeof cell === "object" && cell ? cell.text : cell
+			}, r + ":" + i)))
+		] });
+		function SchedulePanel({ t, stats, ledger, busy, failed, updated, post }) {
+			const mode = ledger?.mode ?? stats.learning?.mode;
+			const history = ledger?.history ?? [];
+			const lastAuto = [...history].reverse().find((entry) => entry.via === "auto");
+			const reverted = !!lastAuto && history.some((entry) => entry.via === "revert" && entry.of === lastAuto.version);
+			const changed = (lastAuto?.changes ?? []).filter((change) => "to" in change);
+			const pending = ledger?.pending;
+			const weights = ledger?.weights ?? [];
+			const button = (label, onClick, primary) => jsx("button", {
+				type: "button", className: "dac-btn", "data-primary": !!primary, disabled: busy, onClick, children: label
+			}, label);
+			return jsxs("div", { className: "dac-sched", children: [
+				mode ? jsxs("div", { className: "dac-block", children: [
+					jsx("div", { className: "dac-blockHead", children: t("learnMode") }),
+					jsx("div", { className: "dac-seg dac-segSm", role: "radiogroup", "aria-label": t("learnMode"), children: LEARN_MODES.map((value) => jsx("button", {
+						type: "button", role: "radio", "aria-checked": mode === value, disabled: busy || !ledger, className: "dac-segItem",
+						onClick: () => { if (mode !== value) post({ action: "mode", mode: value }); }, children: t("learn" + cap(value))
+					}, value)) }),
+					LEARN_MODES.includes(mode) ? jsx("div", { className: "dac-hint", children: t("learn" + cap(mode) + "Hint") }) : null,
+					stats.learning?.reason ? jsx("div", { className: "dac-hint", children: text(stats.learning.reason) }) : null
+				] }) : null,
+				pending ? jsxs("div", { className: "dac-block dac-pending", children: [
+					jsxs("div", { className: "dac-blockHead", children: [
+						t("pendingTitle", { v: String(pending.version) }),
+						updated ? jsx("span", { className: "dac-badge", children: t("pendingUpdated") }) : null
+					] }),
+					...Object.entries(pending.items ?? {}).map(([key, item]) => jsxs("div", {
+						className: "dac-item", title: item.target != null ? t("target") + " " + fixed2(item.target) : undefined, children: [
+							jsx("div", { className: "dac-strong", children: keyParts(key).join(" · ") }),
+							jsx("div", { children: fixed2(item.current) + " → " + fixed2(item.proposed) }),
+							jsx("div", { className: "dac-hint", children: [
+								item.basis != null ? t("basis") + ": " + text(item.basis) : null,
+								item.uncertainty != null ? t("uncertainty", { x: fixed2(item.uncertainty) }) : null,
+								t("evidence", { n: String(item.evidence?.length ?? 0) })
+							].filter(Boolean).join(" · ") })
+						]
+					}, key)),
+					jsxs("div", { className: "dac-actions", children: [
+						button(t("approve"), () => post({ action: "approve", version: pending.version }), true),
+						button(t("keepCurrent"), () => post({ action: "reject", version: pending.version }))
+					] })
+				] }) : null,
+				...Object.entries(stats.choices ?? {}).map(([role, choice]) => jsxs("div", { className: "dac-block", children: [
+					jsxs("div", { className: "dac-blockHead", children: [role + " ·", jsx("span", { children: choice.model ?? "–" })] }),
+					jsx("div", { className: "dac-sub", children: [
+						t("planVia", { via: viaLabel(t, choice.via) }), choice.tag,
+						choice.confidence != null ? t("choiceConfidence") + " " + pct(choice.confidence) : null
+					].filter(Boolean).join(" · ") }),
+					choice.candidates?.length ? table("minmax(0,1fr) auto auto", [t("colModel"), t("colProbability"), t("colWeight")],
+						choice.candidates.map((candidate) => [
+							{ text: candidate.model, title: candidate.summary, className: candidate.model === choice.model ? "dac-strong" : undefined },
+							pct(candidate.probability),
+							{ text: weightLabel(t, candidate.weight, candidate.source, candidate.n), title: candidate.summary }
+						])) : null,
+					choice.filtered?.length ? jsx("div", { className: "dac-hint", children: t("filtered") + ": "
+						+ choice.filtered.map((entry) => entry.model + " (" + text(entry.reason) + ")").join(", ") }) : null
+				] }, role)),
+				ledger ? jsxs("div", { className: "dac-block", children: [
+					jsx("div", { className: "dac-blockHead", children: t("weightsTitle") }),
+					weights.length ? table("auto minmax(0,1fr) auto auto", [t("colTag"), t("colModel"), t("colRole"), t("colWeight")],
+						weights.map((entry) => [...keyParts(entry.key), weightLabel(t, entry.weight, entry.source, entry.n)]
+							.map((cell) => ({ text: cell, title: entry.summary }))))
+						: jsx("div", { className: "dac-hint", children: t("noWeights") })
+				] }) : null,
+				lastAuto ? jsxs("div", { className: "dac-block", children: [
+					jsx("div", { className: "dac-blockHead", children: t("lastAuto", { n: String(changed.length) }) }),
+					...changed.map((change) => jsx("div", { className: "dac-sub",
+						children: keyParts(change.key).join(" · ") + ": " + fixed2(change.from) + " → " + fixed2(change.to) }, change.key)),
+					jsxs("div", { className: "dac-actions", children: [
+						mode === "auto" ? button(t("pauseAuto"), () => post({ action: "mode", mode: "manual" })) : null,
+						reverted ? jsx("span", { className: "dac-hint", children: t("reverted") })
+							: button(t("revertLast"), () => post({ action: "revert", version: lastAuto.version }))
+					] })
+				] }) : null,
+				failed ? jsx("div", { className: "dac-hint", children: t("actionFailed") }) : null,
+				jsx("div", { className: "dac-hint", children: t("feedbackNote") })
+			] });
+		}
 		function StatsChip({ sessionId, t }) {
 			const [stats, setStats] = react.useState(null);
-			const [open, setOpen] = react.useState(false);
+			const [peek, setPeek] = react.useState(false);
+			const [pinned, setPinned] = react.useState(false);
+			const [sched, setSched] = react.useState(false);
+			const [ledger, setLedger] = react.useState(null);
+			const [busy, setBusy] = react.useState(false);
+			const [failed, setFailed] = react.useState(false);
+			const [updated, setUpdated] = react.useState(false);
+			const pendingRef = react.useRef(null);
+			const open = peek || pinned;
 			react.useEffect(() => {
 				if (!sessionId) return;
 				const url = new URL("./api/dsh-autoctx/stats?session=" + encodeURIComponent(sessionId), document.baseURI);
 				let alive = true;
 				setStats(null);
+				setLedger(null);
 				const pull = () => {
 					if (document.visibilityState !== "visible") return;
 					fetch(url).then((response) => response.ok ? response.json() : null)
@@ -328,6 +583,52 @@ window.__ModuleLoader__.load({
 				const timer = setInterval(pull, 3000);
 				return () => { alive = false; clearInterval(timer); };
 			}, [sessionId]);
+			// A pending card whose version changes under the user is flagged "updated" so approval needs a fresh look.
+			const receive = (body, stale) => {
+				if (!body?.ledger) return;
+				const version = body.ledger.pending?.version ?? null;
+				if (version === null) setUpdated(false);
+				else if (stale || (pendingRef.current !== null && version !== pendingRef.current)) setUpdated(true);
+				pendingRef.current = version;
+				setLedger(body.ledger);
+			};
+			react.useEffect(() => {
+				if (!sessionId) return;
+				const url = new URL("./api/dsh-autoctx/ledger?session=" + encodeURIComponent(sessionId), document.baseURI);
+				let alive = true;
+				pendingRef.current = null;
+				if (!open) setUpdated(false);
+				const pull = () => {
+					if (document.visibilityState !== "visible") return;
+					fetch(url).then((response) => response.ok ? response.json() : null)
+						.then((body) => { if (alive) receive(body); })
+						.catch(() => {});
+				};
+				pull();
+				const timer = open ? setInterval(pull, 3000) : null;
+				return () => { alive = false; clearInterval(timer); };
+			}, [sessionId, open]);
+			react.useEffect(() => {
+				if (!pinned) return;
+				const onKey = (event) => { if (event.key === "Escape") { setPinned(false); setPeek(false); } };
+				document.addEventListener("keydown", onKey);
+				return () => document.removeEventListener("keydown", onKey);
+			}, [pinned]);
+			const post = async (payload) => {
+				setBusy(true);
+				setFailed(false);
+				try {
+					const response = await fetch(new URL("./api/dsh-autoctx/ledger", document.baseURI), {
+						method: "POST", headers: { "content-type": "application/json" },
+						body: JSON.stringify({ session: sessionId, ...payload })
+					});
+					const body = await response.json().catch(() => null);
+					if (response.status === 409 && body?.ledger) receive(body, true);
+					else if (response.ok) receive(body);
+					else setFailed(true);
+				} catch { setFailed(true); }
+				finally { setBusy(false); }
+			};
 			if (!stats) return null;
 			const decisions = stats.maxDecisions > 0 ? Math.min(1, stats.decisions / stats.maxDecisions) : 0;
 			const context = stats.pressureTokens > 0 && stats.contextTokens !== null
@@ -336,12 +637,25 @@ window.__ModuleLoader__.load({
 				className: "dac-barFill", "data-warn": ratio >= 0.8,
 				style: { width: Math.round(ratio * 100) + "%" }
 			}) }, "bar");
+			const hasPending = stats.learning && !open ? stats.learning.pending != null : !!ledger?.pending;
+			const toggle = () => {
+				if (pinned) { setPinned(false); setPeek(false); }
+				else setPinned(true);
+			};
+			const cost = stats.cost;
+			const cache = Object.entries(stats.cache ?? {});
+			const plan = stats.plan;
+			const showSched = !!(stats.choices || stats.learning || ledger);
 			return jsxs("div", {
-				className: "dac-chip", tabIndex: 0,
-				onMouseEnter: () => setOpen(true), onMouseLeave: () => setOpen(false),
-				onFocus: () => setOpen(true), onBlur: () => setOpen(false),
-				onClick: () => setOpen(true),
-				onKeyDown: (event) => { if (event.key === "Escape") setOpen(false); },
+				className: "dac-chip", tabIndex: 0, "aria-expanded": open,
+				onMouseEnter: () => setPeek(true), onMouseLeave: () => setPeek(false),
+				onFocus: () => setPeek(true),
+				onBlur: (event) => { if (!event.currentTarget.contains(event.relatedTarget)) setPeek(false); },
+				onClick: toggle,
+				onKeyDown: (event) => {
+					if (event.key === "Escape") { setPinned(false); setPeek(false); }
+					else if ((event.key === "Enter" || event.key === " ") && event.target === event.currentTarget) { event.preventDefault(); toggle(); }
+				},
 				children: [
 					spark,
 					ring(stats.contextTokens ?? 0, stats.pressureTokens),
@@ -349,7 +663,8 @@ window.__ModuleLoader__.load({
 						stats.decisions + "/" + stats.maxDecisions,
 						stats.activeChildren > 0 ? jsxs(react.Fragment, { children: [" · ", bolt, stats.activeChildren] }) : null
 					] }),
-					open ? jsxs("div", { className: "dac-card", children: [
+					hasPending ? jsx("span", { className: "dac-dot", title: t("pendingDot"), "aria-label": t("pendingDot") }) : null,
+					open ? jsx("div", { className: "dac-pop", onClick: (event) => { event.stopPropagation(); setPinned(true); }, children: jsxs("div", { className: "dac-card", children: [
 						jsx("p", { className: "dac-cardTitle", children: t("title") }),
 						jsxs("div", { className: "dac-grid", children: [
 							jsx("span", { className: "dac-key", children: t("statsMode") }),
@@ -371,8 +686,32 @@ window.__ModuleLoader__.load({
 							jsx("span", { className: "dac-key", children: t("statsCompactions") }),
 							jsxs("span", { children: [
 								stats.compactions,
-								stats.tokensSaved > 0 ? " · " + t("statsSaved", { n: "~" + compact(stats.tokensSaved) }) : null
+								stats.tokensSaved > 0 ? " · " + t("statsSaved", { n: "~" + compact(stats.tokensSaved) }) : null,
+								stats.deferrals > 0 ? " · " + t("statsDeferrals", { n: String(stats.deferrals) }) : null
 							] }),
+							cost ? row(t("statsCost"), [
+								usd((cost.executor ?? 0) + (cost.children ?? 0) + (cost.jev ?? 0) + (cost.compaction ?? 0)),
+								jsx("div", { className: "dac-sub", children: [
+									...[["costExecutor", cost.executor], ["costChildren", cost.children], ["costJev", cost.jev], ["costCompaction", cost.compaction]]
+										.map(([key, value]) => t(key) + " " + usd(value)),
+									stats.unpriced > 0 ? t("costUnpriced", { n: String(stats.unpriced) }) : null
+								].filter(Boolean).join(" · ") }, "sub")
+							]) : null,
+							cache.length ? row(t("statsCache"), [
+								jsx("div", { className: "dac-sub", children: t("cacheReported") }, "head"),
+								...cache.map(([key, entry]) => jsx("div", { children: (key === "executor" ? t("cacheExecutor") : key) + " "
+									+ pct(entry.input > 0 ? entry.cacheRead / entry.input : null) + " · " + t("cacheCalls", { n: String(entry.calls ?? 0) }) }, key))
+							]) : null,
+							stats.forks > 0 ? row(t("statsPrefix"), [
+								t("prefixValue", { seeded: String(stats.historySeeded ?? 0), forks: String(stats.forks) }),
+								jsx("div", { className: "dac-hint", children: t("prefixHint") }, "hint")
+							]) : null,
+							plan ? row(t("statsPlan"), [[
+								plan.tag ?? t("planNoTag"),
+								plan.effort ? t("thinkingOn", { effort: String(plan.effort) }) : t("thinkingOff"),
+								plan.highReasoning != null ? t("planProb", { p: pct(plan.highReasoning) }) : null,
+								t("planVia", { via: viaLabel(t, plan.via) })
+							].filter(Boolean).join(" · ")]) : null,
 							stats.jevUnavailable != null ? jsxs(react.Fragment, { children: [
 								jsx("span", { className: "dac-key", children: t("statsJevUnavailable") }),
 								jsx("span", { children: t("statsJevUnavailableHint", { status: String(stats.jevUnavailable) }) })
@@ -385,8 +724,13 @@ window.__ModuleLoader__.load({
 								jsx("span", { className: "dac-key", children: t("statsLastRoute") }),
 								jsx("span", { children: stats.lastDecision })
 							] }) : null
-						] })
-					] }) : null
+						] }),
+						showSched ? jsxs("button", { type: "button", className: "dac-expand", "aria-expanded": sched, onClick: () => setSched(!sched), children: [
+							(sched ? "▾ " : "▸ ") + t("schedTitle"),
+							hasPending ? jsx("span", { className: "dac-dot dac-dotInline", title: t("pendingDot") }) : null
+						] }) : null,
+						showSched && sched ? jsx(SchedulePanel, { t, stats, ledger, busy, failed, updated, post }) : null
+					] }) }) : null
 				]
 			});
 		}

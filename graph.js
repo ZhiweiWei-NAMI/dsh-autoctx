@@ -522,7 +522,8 @@ export function hasRead(graph, path) {
   return !!own(graph.files, path)?.reads.length;
 }
 
-export function merge(target, source, label) {
+// skipReadsOf: paths the target edited after the source started; the source's reads of them are stale.
+export function merge(target, source, label, { skipReadsOf } = {}) {
   if (target === source) return target;
   // Watermarks survive eviction of bounded histories and prevent replay after restore.
   const seen = {};
@@ -535,6 +536,7 @@ export function merge(target, source, label) {
   target.steps = Math.max(target.steps, source.steps);
   for (const [path, file] of Object.entries(source.files)) {
     for (const read of file.reads) {
+      if (skipReadsOf?.has(path)) continue;
       const entry = contribution(read);
       if (entry) addRead(target, path, entry);
     }

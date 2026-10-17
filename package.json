@@ -1,6 +1,6 @@
 {
   "name": "dsh-autoctx",
-  "version": "1.1.6",
+  "version": "1.2.0",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -17,6 +17,7 @@
     "graph.js",
     "models.js",
     "models.json",
+    "ledger.js",
     "cordis.patch.yml",
     "off.patch.yml",
     "README.md",

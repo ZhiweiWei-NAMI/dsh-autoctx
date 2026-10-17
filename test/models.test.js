@@ -10,9 +10,12 @@ import {
   knowledge,
 } from '../models.js';
 
-test('costUSD prices uncached and cached tokens per 1M',()=>{
+test('costUSD prices disjoint host usage per 1M, with the long-prompt tier',()=>{
   assert.equal(costUSD('deepseek-v4.1-flash',{input:1e6,output:1e6,cacheRead:1e6}),0.753);
-  assert.equal(costUSD('claude-haiku-5-5',{input:200000,output:1000,cacheRead:5000,cacheWrite:10000}),0.0218);
+  assert.equal(costUSD('deepseek-v4.1-flash',{inputTokens:1e6,outputTokens:1e6,cacheReadTokens:1e6}),0.753);
+  assert.equal(costUSD('claude-haiku-5-5',{input:20000,output:1000,cacheRead:5000,cacheWrite:10000}),0.0038);
+  // 215K prompt tokens > 100K: every input-side price scales 5x and output uses the tier price.
+  assert.equal(costUSD('claude-haiku-5-5',{input:200000,output:1000,cacheRead:5000,cacheWrite:10000}),0.109);
   assert.equal(costUSD('deepseek-v4.1-flash',{}),undefined);
   assert.equal(costUSD('no-such-model',{input:1e6}),undefined);
 });
@@ -33,25 +36,15 @@ test('availableModels keeps configured routes and hides paid ones unless allowed
   assert.deepEqual(availableModels(undefined).length,0);
 });
 
-test('pickModel reviewer avoids the executor family',()=>{
+test('pickModel ranks by effective weight, then brief cost; family is no rule',()=>{
   const available=availableModels({'deepseek-v4.1-flash':'workbuddy','glm-5.3-flash':'workbuddy',
     'claude-haiku-5-5':'opencode-go-anthropic','deepseek-v4-pro':'workbuddy'},{allowPaid:true});
-  const choice=pickModel('reviewer',{executor:'deepseek-v4.1-flash',available,exclude:['glm-5.3-flash']});
-  assert.equal(choice.family,'claude');
-});
-
-test('pickModel advisor prefers a pro tier and then a different family',()=>{
-  const available=availableModels({'claude-haiku-5-5':'opencode-go-anthropic','deepseek-v4-pro':'workbuddy','glm-5.3':'opencode-go'},{allowPaid:true});
-  const choice=pickModel('advisor',{executor:'deepseek-v4.1-flash',available});
-  assert.equal(choice.tier,'pro');
-  assert.equal(choice.id,'glm-5.3');
-});
-
-test('pickModel worker reuses the executor model and honors exclude',()=>{
-  const available=availableModels({'deepseek-v4.1-flash':'workbuddy','glm-5.3-flash':'workbuddy'},{allowPaid:true});
-  assert.equal(pickModel('worker',{executor:'deepseek-v4.1-flash',available}).id,'deepseek-v4.1-flash');
-  assert.equal(pickModel('worker',{executor:'deepseek-v4.1-flash',available,exclude:['deepseek-v4.1-flash']}).id,'glm-5.3-flash');
-  assert.equal(pickModel('advisor',{executor:'deepseek-v4.1-flash',available}),undefined);
+  // No evidence: every weight is neutral, so the cheapest brief wins, the executor's own model included.
+  assert.equal(pickModel('reviewer',{available}).id,'claude-haiku-5-5');
+  const weights={'deepseek-v4.1-flash':0.8};
+  assert.equal(pickModel('reviewer',{available,weightOf:id=>weights[id]??0.5}).id,'deepseek-v4.1-flash');
+  assert.equal(pickModel('reviewer',{available,weightOf:id=>weights[id]??0.5,exclude:['deepseek-v4.1-flash']}).id,'claude-haiku-5-5');
+  assert.equal(pickModel('advisor',{available:[]}),undefined);
 });
 
 test('knowledge is sorted, deterministic and bounded',()=>{
@@ -61,12 +54,12 @@ test('knowledge is sorted, deterministic and bounded',()=>{
   assert.equal(knowledge([]),'');
   const ids=first.split('\n').map(row=>row.split(' | ')[0]);
   assert.deepEqual(ids,[...ids].sort());
-  assert.ok(first.includes('measured 37/48, 42 calls/task, 11 hit call cap'));
-  assert.ok(first.includes('deepseek-v4.1-flash | deepseek/flash | $0.15/0.6/0.003 per 1M | roles: executor,worker'));
-  const long=CATALOG.models.map(entry=>({...entry,strengths:'研究🚀'.repeat(2000),weaknesses:'long '.repeat(2000)}));
+  assert.ok(first.includes('measured as executor: 37/48, 42 calls/task, 11 hit call cap'));
+  assert.ok(first.includes('deepseek-v4.1-flash | deepseek/flash | $0.15/0.6/0.003 per 1M | context 1000000 | prior: '));
+  const long=CATALOG.models.map(entry=>({...entry,prior:'研究🚀'.repeat(2000)}));
   const shortened=knowledge(long);
   assert.ok(Buffer.byteLength(shortened,'utf8')<=4000);
-  assert.ok(shortened.includes(' | + 研究🚀'));
+  assert.ok(shortened.includes(' | prior: 研究🚀'));
   assert.ok(!shortened.includes('\ufffd'));
   assert.deepEqual(shortened.split('\n').map(row=>row.split(' | ')[0]),ids);
   assert.equal(knowledge([...long].reverse()),shortened);
@@ -76,19 +69,19 @@ test('knowledge is sorted, deterministic and bounded',()=>{
 
 test('malformed entries are skipped by selection and knowledge stays lenient',()=>{
   const valid=modelInfo('glm-5.3-flash');
-  const broken=[{id:'no-price',roles:['reviewer']},{id:'no-roles',price:valid.price},null];
+  const broken=[{id:'no-price',roles:['reviewer']},null];
   const count=CATALOG.models.length;
   try {
     CATALOG.models.push(...broken);
-    assert.deepEqual(availableModels({'no-price':'workbuddy','no-roles':'workbuddy',[valid.id]:'workbuddy'}),[valid]);
+    assert.deepEqual(availableModels({'no-price':'workbuddy',[valid.id]:'workbuddy'}),[valid]);
   } finally {
     CATALOG.models.length=count;
   }
-  assert.equal(pickModel('reviewer',{executor:'deepseek-v4.1-flash',available:[...broken,valid]}),valid);
+  assert.equal(pickModel('reviewer',{available:[...broken,valid]}),valid);
   assert.equal(knowledge([...broken,valid]),knowledge([valid]));
   const unmeasured=knowledge([{...valid,measured:undefined}]);
   assert.equal(knowledge([{...valid,measured:{}}]),unmeasured);
   assert.equal(knowledge([{...valid,measured:{resolved:3,cases:null,callsPerCase:'bad',callCapped:0}}]),
-    unmeasured+' | measured 3 resolved, 0 hit call cap');
+    unmeasured+' | measured as executor: 3 resolved, 0 hit call cap');
   assert.equal(briefCost({id:'broken'}),Infinity);
 });

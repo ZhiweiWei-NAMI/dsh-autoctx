@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import subprocess
+import threading
 import time
 import urllib.request
 import uuid
@@ -35,6 +36,11 @@ COMPACTION_THRESHOLD_RATIO = 0.1875
 ARMS = ('A', 'B', 'C', 'H')
 # Jev model for arm A, set from --jev-model; jev-1.13 is billed to the key's workspace, jev-1.13-free is rate limited.
 JEV_MODEL = 'jev-1.13'
+# Plugin learning mode for arm A, set from --learning. frozen: every case starts from the same (empty)
+# ledger and nothing is applied. auto: the ledger is carried across the run's cases in completion order;
+# each case starts from the carried ledger and its applied steps are replayed onto it afterwards.
+LEARNING = 'frozen'
+CARRY_LOCK = threading.Lock()
 # Arm A stops scheduling cases once this many Jev calls failed: its results would measure Auto without Jev.
 JEV_FAILURE_LIMIT = 2
 # dsh effort level -> wire value; WorkBuddy honors reasoning_effort (no field = no thinking).
@@ -102,7 +108,7 @@ def configure_home(home, model, arm, plugin, relay, extra_models, routes, review
             {'insert': [{'id': 'dsh-autoctx', 'name': str(plugin / 'index.js'), 'config': {
                 # The same heterogeneous pool native arm H offers, as Jev-ranked delegation routes.
                 'routes': [{'id': m, 'label': m, 'model': m, 'provider': routes[m],
-                            'description': (next((c for c in catalog() if c.get('id') == m), {}).get('strengths')
+                            'description': (next((c for c in catalog() if c.get('id') == m), {}).get('prior')
                                             or m),
                             'efforts': list(EFFORTS) if routes[m] == 'workbuddy' else []} for m in pool],
                 'mode': 'auto', 'apiKey': 'bench-observer', 'jevEndpoint': relay + '/jev', 'jevModel': JEV_MODEL,
@@ -115,6 +121,8 @@ def configure_home(home, model, arm, plugin, relay, extra_models, routes, review
                 'advisorModel': advisor,
                 # Auto's context policy under pressure (jev or summary); recorded in run-config.json.
                 'contextSelection': os.environ.get('BENCH_CONTEXT_SELECTION', 'jev'),
+                # Controlled runs: a fixed (empty) ledger per case and no learning from graded answers.
+                'learning': LEARNING,
                 'allowPaidModels': any(route.startswith('opencode') for route in routes.values()),
                 'recordFile': str(home / 'auto-events.jsonl')}}]},
         ]
@@ -176,6 +184,49 @@ def prompt_for(task, arm):
                      'Complete the code fix and report what was tested.\n\n' + task['problem_statement'])
 
 
+def seed_ledger(home, carry_file):
+    """Write the carried ledger into the case's plugin storage; returns the seed version (None: empty)."""
+    if not carry_file or not carry_file.exists():
+        return None
+    carry = json.loads(carry_file.read_text())
+    table = home / 'storages/dsh_auto/ledger'
+    table.mkdir(parents=True, exist_ok=True)
+    (table / carry['name']).write_text(json.dumps({'version': 1, 'record': carry['ledger']}))
+    return carry['ledger']['version']
+
+
+def carry_ledger(home, carry_file, seed_version):
+    """Replay the case's auto-applied steps onto the carried ledger (serializes parallel cases)."""
+    files = sorted((home / 'storages/dsh_auto/ledger').glob('*.json'))
+    if not carry_file or not files:
+        return 0
+    case = json.loads(files[0].read_text())['record']
+    new = [entry for entry in case.get('history', []) if entry['version'] > (seed_version or 0)
+           and entry.get('via') == 'auto']
+    with CARRY_LOCK:
+        carry = json.loads(carry_file.read_text()) if carry_file.exists() else {
+            'name': files[0].name, 'ledger': {**case, 'version': 0, 'weights': {}, 'history': [], 'consumed': [],
+                                              'pending': None}}
+        ledger = carry['ledger']
+        for entry in new:
+            changes = []
+            for change in entry['changes']:
+                if change.get('target') is None:
+                    continue
+                weight = ledger['weights'].get(change['key'], {})
+                learned, n = weight.get('learned', 0.5), weight.get('n', 0)
+                to = round(min(1, max(0, learned + (change['target'] - learned) / (n + 2))), 3)
+                ledger['weights'][change['key']] = {**weight, 'learned': to, 'n': n + 1,
+                                                    'summary': case['weights'].get(change['key'], {}).get('summary'),
+                                                    'updatedAt': entry['at']}
+                changes.append({**change, 'from': learned, 'to': to})
+            ledger['version'] += 1
+            ledger['history'] = (ledger['history'] + [{**entry, 'version': ledger['version'], 'changes': changes}])[-20:]
+        ledger['consumed'] = list(dict.fromkeys(ledger.get('consumed', []) + case.get('consumed', [])))[-1000:]
+        carry_file.write_text(json.dumps(carry, indent=1))
+    return len(new)
+
+
 def run_case(task, arm, repeat, case, model, plugin, extra_models, routes, reviewer='same',
              advisor='off', max_usd=0.50):
     case.mkdir(parents=True, exist_ok=True)
@@ -201,6 +252,11 @@ def run_case(task, arm, repeat, case, model, plugin, extra_models, routes, revie
         stack.callback(relay.close)
         configure_home(home, model, arm, plugin, f'http://{gateway}:{port}', extra_models, routes,
                        reviewer, advisor)
+        carry_file = case.parent.parent / 'ledger-carry.json' if arm == 'A' and LEARNING == 'auto' else None
+        if carry_file:
+            with CARRY_LOCK:
+                seed_version = seed_ledger(home, carry_file)
+            outcome['ledgerSeedVersion'] = seed_version
         volumes = ['--volume', f'{NODE}:{NODE}:ro', '--volume', f'{home}:{home}:rw']
         if arm == 'A':
             volumes += ['--volume', f'{plugin}:{plugin}:ro']
@@ -248,6 +304,8 @@ def run_case(task, arm, repeat, case, model, plugin, extra_models, routes, revie
         outcome['patchBytes'] = len(patch)
         outcome['solveAndExportSeconds'] = round(time.perf_counter() - started, 4)
         lifecycle = events(home / 'native-events.jsonl') + events(home / 'auto-events.jsonl')
+        if carry_file:
+            outcome['ledgerStepsCarried'] = carry_ledger(home, carry_file, seed_version)
         write_json(case / 'decisions-and-children.json', lifecycle)
     calls = observer.calls
     infrastructure = sorted({f"{c['kind']}:{c.get('httpStatus') or c.get('transportError')}" for c in calls
@@ -294,7 +352,7 @@ def jev_failures(case):
 
 
 def main():
-    global JEV_MODEL
+    global JEV_MODEL, LEARNING
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', required=True, choices=MODEL_IDS)
     parser.add_argument('--arms', default='A,B,C')
@@ -304,6 +362,8 @@ def main():
     parser.add_argument('--max-usd', type=float, default=0.50)
     parser.add_argument('--jev-model', default=JEV_MODEL,
                         help='Jev model for arm A: jev-1.13 (billed) or jev-1.13-free (free tier, rate limited)')
+    parser.add_argument('--learning', default=LEARNING, choices=('frozen', 'auto'),
+                        help='Plugin learning mode for arm A; auto carries the ledger across this run\'s cases')
     parser.add_argument('--tasks', type=Path, default=Path(__file__).with_name('tasks.json'))
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--plugin', type=Path, required=True)
@@ -311,6 +371,7 @@ def main():
     parser.add_argument('--repeat', type=int, default=1)
     args = parser.parse_args()
     JEV_MODEL = args.jev_model
+    LEARNING = args.learning
     arms = [arm.strip().upper() for arm in args.arms.split(',') if arm.strip()]
     if not arms or len(set(arms)) != len(arms) or any(arm not in ARMS for arm in arms):
         parser.error('--arms must be a comma-separated subset of A,B,C,H')
@@ -340,7 +401,7 @@ def main():
               'extraModels': extra_models, 'modelRoutes': routes,
               'reviewer': args.reviewer, 'advisor': args.advisor, 'maxUsd': args.max_usd,
               'contextSelection': os.environ.get('BENCH_CONTEXT_SELECTION', 'jev'),
-              'jevModel': JEV_MODEL}
+              'jevModel': JEV_MODEL, 'learning': LEARNING}
     config_file = root / 'run-config.json'
     write_json(root / 'tasks.json', manifest)
     write_json(config_file, config)

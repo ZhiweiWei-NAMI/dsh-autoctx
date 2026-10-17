@@ -184,7 +184,7 @@ test("a root turn that changed a file gets one review, and the report is steered
   assert.equal(app.children.length, 1);
   assert.equal(app.children[0].mode, "one-shot");
   assert.match(app.children[0].prompt, /Original issue:\nFix the missing widget\./);
-  assert.deepEqual(app.children[0].toolFilter, { deny: ["subagent", "subagent_fork"] });
+  assert.equal(app.children[0].toolFilter, undefined);
   assert.deepEqual(records.filter((r) => r.kind === "review_start").length, 1);
   await app.stop(1);
   assert.equal(app.started, 1);

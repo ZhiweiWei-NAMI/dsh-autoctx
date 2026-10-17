@@ -1,112 +1,225 @@
 {
-  "version": "2026-10-16",
+  "version": "2026-10-17",
   "units": "USD per 1M tokens",
   "sources": {
     "price": "OpenCode Go published rates (deepseek, glm, mimo, luna); Anthropic first-party rates for claude-haiku-5-5 (prompts up to 100K tokens).",
-    "notes": "Written by Claude Opus 5.5 from public model descriptions and dsh-bench measurements. measured = dsh-bench: 12 SWE-bench Verified pytest tasks, 600 s and 64 model calls per task, single agent and native subagents pooled over 2 runs (48 cases)."
+    "notes": "prior = short public or catalog facts, not measurements; it is the cold-start basis and is weighed below measured data and the workspace adaptation ledger. measured = dsh-bench executor runs: 12 SWE-bench Verified pytest tasks, 600 s and 64 model calls per task, single agent and native subagents pooled over 2 runs (48 cases)."
   },
   "models": [
     {
       "id": "deepseek-v4.1-flash",
       "family": "deepseek",
       "tier": "flash",
-      "routes": ["workbuddy", "opencode-go"],
-      "price": { "input": 0.15, "output": 0.6, "cacheRead": 0.003 },
+      "routes": [
+        "workbuddy",
+        "opencode-go"
+      ],
+      "price": {
+        "input": 0.15,
+        "output": 0.6,
+        "cacheRead": 0.003
+      },
       "context": 1000000,
-      "roles": ["executor", "worker"],
-      "strengths": "Cheapest strong coding executor; cache reads are 2% of input, so long append-only sessions are very cheap; reliable tool-call format.",
-      "weaknesses": "About one tool call per step and frequent re-reads, so it runs out of a call budget on hard tasks; tends to stop once its own reproduction passes.",
-      "measured": { "resolved": 37, "cases": 48, "callsPerCase": 42.0, "callCapped": 11 }
+      "roles": [
+        "executor",
+        "worker"
+      ],
+      "measured": {
+        "resolved": 37,
+        "cases": 48,
+        "callsPerCase": 42.0,
+        "callCapped": 11,
+        "role": "executor"
+      },
+      "prior": "Coding executor; about one tool call per step; cache reads cost 2% of input."
     },
     {
       "id": "deepseek-v4-flash",
       "family": "deepseek",
       "tier": "flash",
-      "routes": ["workbuddy", "opencode-go"],
-      "price": { "input": 0.15, "output": 0.6, "cacheRead": 0.003 },
+      "routes": [
+        "workbuddy",
+        "opencode-go"
+      ],
+      "price": {
+        "input": 0.15,
+        "output": 0.6,
+        "cacheRead": 0.003
+      },
       "context": 1000000,
-      "roles": ["executor", "worker"],
-      "strengths": "Same profile and price as v4.1-flash; a decorrelated second opinion within the family is weak.",
-      "weaknesses": "Hits the call budget most often of the measured models.",
-      "measured": { "resolved": 36, "cases": 48, "callsPerCase": 41.7, "callCapped": 13 }
+      "roles": [
+        "executor",
+        "worker"
+      ],
+      "measured": {
+        "resolved": 36,
+        "cases": 48,
+        "callsPerCase": 41.7,
+        "callCapped": 13,
+        "role": "executor"
+      },
+      "prior": "Earlier version of deepseek-v4.1-flash at the same price."
     },
     {
       "id": "glm-5.3-flash",
       "family": "glm",
       "tier": "flash",
-      "routes": ["workbuddy", "opencode-go"],
-      "price": { "input": 0.15, "output": 0.5, "cacheRead": 0.03 },
+      "routes": [
+        "workbuddy",
+        "opencode-go"
+      ],
+      "price": {
+        "input": 0.15,
+        "output": 0.5,
+        "cacheRead": 0.03
+      },
       "context": 1000000,
-      "roles": ["executor", "worker", "reviewer"],
-      "strengths": "Batches tool calls: about 37% fewer calls per task than deepseek flash at similar resolution, rarely hits the call budget; solves some tasks deepseek flash misses, so it is a decorrelated reviewer for deepseek executors.",
-      "weaknesses": "Cache reads cost 10x deepseek flash; slower per call; misses some tasks deepseek flash solves.",
-      "measured": { "resolved": 35, "cases": 48, "callsPerCase": 26.5, "callCapped": 2 }
+      "roles": [
+        "executor",
+        "worker",
+        "reviewer"
+      ],
+      "measured": {
+        "resolved": 35,
+        "cases": 48,
+        "callsPerCase": 26.5,
+        "callCapped": 2,
+        "role": "executor"
+      },
+      "prior": "Coding executor that batches tool calls; cache reads cost 10x deepseek flash."
     },
     {
       "id": "mimo-v2.6-flash",
       "family": "mimo",
       "tier": "flash",
-      "routes": ["opencode-go"],
-      "price": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028 },
+      "routes": [
+        "opencode-go"
+      ],
+      "price": {
+        "input": 0.14,
+        "output": 0.28,
+        "cacheRead": 0.0028
+      },
       "context": 1048576,
-      "roles": ["worker", "reviewer"],
-      "strengths": "Lowest output price; a third model family, so its review errors are least correlated with deepseek and glm executors.",
-      "weaknesses": "Not yet measured on dsh-bench; paid route only."
+      "roles": [
+        "worker",
+        "reviewer"
+      ],
+      "prior": "Lowest output price here."
     },
     {
       "id": "deepseek-v4-pro",
       "family": "deepseek",
       "tier": "pro",
-      "routes": ["workbuddy", "opencode-go"],
-      "price": { "input": 0.66, "output": 1.98, "cacheRead": 0.022 },
+      "routes": [
+        "workbuddy",
+        "opencode-go"
+      ],
+      "price": {
+        "input": 0.66,
+        "output": 1.98,
+        "cacheRead": 0.022
+      },
       "context": 1000000,
-      "roles": ["advisor", "reviewer"],
-      "strengths": "Deeper reasoning than flash at about 4x the price; good for one-off diagnosis and plans from a compact brief.",
-      "weaknesses": "Same family as deepseek flash, so it shares some blind spots; too expensive as the step-by-step executor under a call budget."
+      "roles": [
+        "advisor",
+        "reviewer"
+      ],
+      "prior": "Pro tier at about 4x the flash price."
     },
     {
       "id": "glm-5.3",
       "family": "glm",
       "tier": "pro",
-      "routes": ["workbuddy", "opencode-go"],
-      "price": { "input": 1.4, "output": 4.4, "cacheRead": 0.26 },
+      "routes": [
+        "workbuddy",
+        "opencode-go"
+      ],
+      "price": {
+        "input": 1.4,
+        "output": 4.4,
+        "cacheRead": 0.26
+      },
       "context": 1000000,
-      "roles": ["advisor"],
-      "strengths": "Strong agentic coder and reviewer from a different family than deepseek.",
-      "weaknesses": "Most expensive model here; use for short advisor consultations only."
+      "roles": [
+        "advisor"
+      ],
+      "prior": "Pro tier; the most expensive model here."
     },
     {
       "id": "mimo-v2.6-pro",
       "family": "mimo",
       "tier": "pro",
-      "routes": ["opencode-go"],
-      "price": { "input": 0.435, "output": 0.87, "cacheRead": 0.003625 },
+      "routes": [
+        "opencode-go"
+      ],
+      "price": {
+        "input": 0.435,
+        "output": 0.87,
+        "cacheRead": 0.003625
+      },
       "context": 1048576,
-      "roles": ["advisor", "reviewer"],
-      "strengths": "Cheapest pro-tier reasoning per output token; third family.",
-      "weaknesses": "Not yet measured on dsh-bench; paid route only."
+      "roles": [
+        "advisor",
+        "reviewer"
+      ],
+      "prior": "Pro tier with a low output price."
     },
     {
       "id": "claude-haiku-5-5",
       "family": "claude",
       "tier": "small",
-      "routes": ["opencode-go-anthropic"],
-      "price": { "input": 0.1, "output": 0.5, "cacheRead": 0.01, "cacheWrite": 0.125 },
+      "routes": [
+        "opencode-go-anthropic"
+      ],
+      "price": {
+        "input": 0.1,
+        "output": 0.5,
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125,
+        "above": {
+          "tokens": 100000,
+          "input": 0.5,
+          "output": 2.5
+        }
+      },
       "context": 1000000,
-      "roles": ["reviewer", "advisor", "worker"],
-      "strengths": "Careful instruction following and concise, well-calibrated reviews at flash-tier price; a family independent of all executors here.",
-      "weaknesses": "Price rises to 0.5 / 2.5 above 100K-token prompts, so give it compact briefs; paid route only; not yet measured on dsh-bench."
+      "roles": [
+        "reviewer",
+        "advisor",
+        "worker"
+      ],
+      "prior": "Small model; prompts above 100K tokens cost 5x."
     },
     {
       "id": "gpt-6-luna",
       "family": "gpt",
       "tier": "small",
       "routes": [],
-      "price": { "input": 0.1, "output": 0.5, "cacheRead": 0.01, "cacheWrite": 0.125 },
+      "price": {
+        "input": 0.1,
+        "output": 0.5,
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125
+      },
       "context": 1050000,
-      "roles": ["reviewer", "advisor"],
-      "strengths": "Low price with strong reasoning for its tier.",
-      "weaknesses": "Unavailable from this deployment: the provider rejects the region (unsupported_country_region_territory)."
+      "roles": [
+        "reviewer",
+        "advisor"
+      ],
+      "prior": "Small model."
     }
-  ]
+  ],
+  "jev": {
+    "jev-1.13": {
+      "input": 0.042,
+      "output": 0,
+      "source": "docs.typesafe.ai/models (owner-supplied, 2026-10-17)"
+    },
+    "jev-1.13-free": {
+      "input": 0,
+      "output": 0,
+      "source": "free tier, rate limited"
+    }
+  }
 }

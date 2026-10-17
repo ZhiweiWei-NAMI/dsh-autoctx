@@ -35,11 +35,29 @@ import {
   fromJSON,
 } from "./graph.js";
 import {
+  CATALOG,
   modelInfo,
   availableModels,
   pickModel,
   knowledge,
+  costUSD,
+  jevCostUSD,
 } from "./models.js";
+import {
+  emptyLedger,
+  weightKey,
+  parseKey,
+  effective,
+  experienceRows,
+  propose,
+  approve,
+  reject,
+  setMode,
+  revert,
+  setUser,
+  FIT_LEVELS,
+  MODES,
+} from "./ledger.js";
 
 export const name = "dsh-autoctx";
 export const inject = [
@@ -104,7 +122,14 @@ export const Config = z.object({
     .default("high")
     .volatile()
     .description(
-      "Reasoning effort the root executor gets at decision points (turn start, test failure, review/advisor reports, stalls); off keeps its default",
+      "Reasoning effort used when Jev judges a phase needs it; it stays for the turn and changes only at a context checkpoint. off keeps the default",
+    ),
+  learning: z
+    .union(["auto", "manual", "frozen"])
+    .default("auto")
+    .volatile()
+    .description(
+      "Workspace adaptation weights: auto applies Jev's proposals, manual waits for approval, frozen only records them",
     ),
   advisorMaxConsults: z
     .number()
@@ -216,6 +241,39 @@ const delegation = new Set(["subagent", "subagent_fork"]);
 const HELPER_LABELS = new Set(["Independent review", "Advisor"]);
 // Tools whose successful result means the turn changed files on disk.
 const fileChanging = new Set(["edit", "write", "apply_patch", "multi_edit"]);
+const changesFilesCall = (name, args) =>
+  fileChanging.has(name) ||
+  (name === "str_replace_editor" && ["create", "str_replace", "insert"].includes(args?.command));
+// Task tags key the workspace ledger; Jev picks one per root turn.
+const TASK_TAGS = {
+  debugging: "Find and fix the cause of a reported failure or wrong behavior.",
+  implementation: "Add or change behavior from a specification.",
+  review: "Inspect code or a change and report findings; editing is not the main goal.",
+  retrieval: "Answer a question about the code or gather information.",
+  planning: "Design or explain an approach before any change.",
+};
+const TAG_QUESTION = {
+  type: "choice",
+  instructions: "Which kind of task is the user's current request? Judge the request, not the tools used so far.",
+  criteria: TASK_TAGS,
+};
+const LEARNED_ROLES = new Set(["reviewer", "advisor", "worker"]);
+// Measured on deepseek-v4.1-flash through WorkBuddy (same affinity id): thinking on and off are separate
+// provider cache spaces. Other routes were not measured.
+const thinkingCacheFact = (model) =>
+  modelInfo(model)?.family === "deepseek"
+    ? "measured: on this model family, requests with thinking on and off use separate provider cache spaces; a switch re-reads the whole context uncached once, then the new setting caches again"
+    : "unknown: whether switching thinking invalidates the provider cache was not measured for this model";
+// The user's preference vector (strategy weights) named as the dominant need.
+const needOf = (weights) => {
+  if (!weights) return "balanced";
+  const { quality = 0.5, latency = 0.5, usage = 0.5 } = weights;
+  if (quality >= Math.max(latency, usage) + 0.2) return "quality";
+  if (usage >= Math.max(quality, latency) + 0.2) return "cost";
+  if (latency >= Math.max(quality, usage) + 0.2) return "speed";
+  return "balanced";
+};
+const round = (value, digits = 6) => Math.round(value * 10 ** digits) / 10 ** digits;
 const REVIEW_PROMPT =
   "Independently check the change the parent just made against the original issue. Inspect `git diff`, re-read the issue, run a minimal reproduction and the single most relevant existing test file. Never run the whole test suite; keep every command under 60 seconds; batch independent checks into one step. Do NOT edit files. Report only defects in the change itself: failures that also happen without the change, untested extras and style are not defects. Start the first line with exactly `LGTM` (then one line of evidence) or `DEFECTS` (then each concrete defect with evidence).";
 const reviewMessage = (report) =>
@@ -231,6 +289,11 @@ const syncMessage = (edits) =>
   "Collaborator changes since your last step:\n" +
   edits.map((edit) => "- " + edit.path + " edited by " + edit.label).join("\n") +
   "\nRe-read these before relying on earlier content.";
+const staleMessage = (label, paths, newUserMessage) =>
+  label + " started before " +
+  [paths.length ? "your edits to " + paths.join(", ") : "", newUserMessage ? "the latest user message" : ""]
+    .filter(Boolean).join(" and ") +
+  "; its result describes the earlier state. Check it against the current files and request before relying on it.";
 const ledgerNote = (graph) =>
   "Evidence ledger of this session (files, tests and searches you already examined; re-read only what you need):\n" +
   digest(graph, 2000);
@@ -335,14 +398,21 @@ export function apply(ctx, options) {
     advisorChildren = new Set(),
     advisorPending = new Set(),
     chosenModels = new Map(),
-    // Adaptive executor effort: why the root's next execution request should think (session -> reason).
-    effortDue = new Map(),
+    // Sticky executor effort: one Jev turn plan (task tag + thinking) per root turn, revisited only at a
+    // context checkpoint, so the cached prefix is not split between thinking on and off.
+    turnPlans = new Map(),
     effortSupported = new Map(),
-    effortStall = new Map(),
     effortInstalled = new Set(),
+    // Per-root accounting of the current turn: role use, cost and cache by category.
+    turnUses = new Map(),
+    childRoles = new Map(),
+    childStarts = new Map(),
+    deferredSelection = new Map(),
+    filteredByRoot = new Map(),
     modelKnowledge = new Map(),
     availableByRoot = new Map(),
-    providersByRoot = new Map();
+    providersByRoot = new Map(),
+    lastCached = new Map();
   const childLabels = new Map();
   const graphFor = (id) => {
     if (!graphs.has(id)) graphs.set(id, createGraph());
@@ -444,6 +514,11 @@ export function apply(ctx, options) {
         "sync_note",
         "ledger_note",
         "model_choice",
+        "execution_call",
+        "turn_plan",
+        "effort_checkpoint",
+        "context_deferred",
+        "learning",
       ].includes(value.kind)
     )
       return;
@@ -470,7 +545,62 @@ export function apply(ctx, options) {
         }),
       "dsh-autoctx: stats route",
     );
+    c.effect(
+      () =>
+        c.connection.fetch.register({
+          path: "/api/dsh-autoctx/ledger",
+          methods: ["GET", "POST"],
+          requestBody: "buffered",
+          fetch: (request) => ledgerRoute(request),
+        }),
+      "dsh-autoctx: ledger route",
+    );
   });
+  const json = (value, status = 200) =>
+    new Response(JSON.stringify(value), {
+      status,
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    });
+  // Ledger view for the UI: effective weights with their source and evidence count, the pending card,
+  // and the last changes. Values are never invented: an unused key is simply absent.
+  const ledgerView = (ledger) => ({
+    mode: ledger.mode,
+    version: ledger.version,
+    weights: Object.entries(ledger.weights).map(([key, entry]) => ({
+      key,
+      ...effective(ledger, key),
+      ...(entry.learned === undefined ? {} : { learned: entry.learned }),
+      ...(entry.user === undefined ? {} : { user: entry.user }),
+      updatedAt: entry.updatedAt,
+    })),
+    pending: ledger.pending,
+    history: ledger.history.slice(-8),
+  });
+  async function ledgerRoute(request) {
+    const url = new URL(request.url);
+    const body = request.method === "POST" ? await request.json().catch(() => ({})) : {};
+    const session = body.session ?? url.searchParams.get("session");
+    const cwd =
+      body.cwd ?? url.searchParams.get("cwd") ??
+      (session ? ctx.agents.get(statsRoot(session))?.session.header.cwd : undefined) ?? "";
+    if (request.method === "GET") return json({ cwd, ledger: ledgerView(await readLedger(cwd)) });
+    const now = Date.now();
+    const actions = {
+      approve: (ledger) => approve(ledger, body.version, now),
+      reject: (ledger) => reject(ledger, body.version, now),
+      revert: (ledger) => revert(ledger, body.version, now),
+      mode: (ledger) => ({ ledger: setMode(ledger, body.mode) }),
+      user: (ledger) => ({ ledger: setUser(ledger, body.key, body.value ?? null, now) }),
+    };
+    if (!actions[body.action] || (body.action === "mode" && !MODES.includes(body.mode)))
+      return json({ error: "unknown action" }, 400);
+    if (body.action === "user" && (typeof body.key !== "string" || (body.value !== null && !(body.value >= 0 && body.value <= 1))))
+      return json({ error: "user weight needs a key and a value in [0, 1] or null" }, 400);
+    const result = await updateLedger(cwd, actions[body.action]);
+    record({ kind: "ledger_action", cwd, action: body.action, version: body.version, error: result.error });
+    return json({ cwd, ledger: ledgerView(result.ledger), ...(result.error ? { error: result.error } : {}) },
+      result.error === "stale" ? 409 : result.error ? 404 : 200);
+  }
   ctx.on("dispose", () => {
     statsMap.clear();
     memos.clear();
@@ -492,12 +622,75 @@ export function apply(ctx, options) {
           policies: domainTable(schema.json()),
           assignments: domainTable(schema.json()),
           graphs: domainTable(schema.json()),
+          ledger: domainTable(schema.json()),
+          uses: domainTable(schema.json()),
         },
       }),
     ));
   ctx.on("dispose", async () => {
     if (storePromise) await (await storePromise).close();
   });
+
+  // Workspace ledger: one record per workspace; every change is one serialized storage update.
+  const workspaceOf = (agent) => agent?.session.header.cwd ?? "";
+  const ledgerInits = new Map();
+  // Per-record storage keys must be path-safe, so a workspace path is stored by its hash.
+  const ledgerKey = (cwd) => "ws_" + createHash("sha256").update(cwd).digest("hex").slice(0, 32);
+  const useKey = (session, turn) => session.replace(/[^a-zA-Z0-9_-]/g, "_") + "_" + String(turn).replace(/[^a-zA-Z0-9_-]/g, "_");
+  const readLedger = async (cwd) =>
+    (await storage()).table("ledger").get(ledgerKey(cwd)) ?? emptyLedger(config.learning);
+  async function updateLedger(cwd, fn) {
+    const table = (await storage()).table("ledger"),
+      key = ledgerKey(cwd);
+    if (table.get(key) === undefined) {
+      if (!ledgerInits.has(key))
+        ledgerInits.set(key, table.put(key, emptyLedger(config.learning)).finally(() => ledgerInits.delete(key)));
+      await ledgerInits.get(key);
+    }
+    let result;
+    await table.update(key, (current) => {
+      result = fn(current);
+      return result.ledger;
+    });
+    return result;
+  }
+
+  const newUse = (turn) => ({
+    turn,
+    startedAt: Date.now(),
+    roles: {},
+    cost: { executor: 0, children: 0, jev: 0, compaction: 0 },
+    unpriced: 0,
+  });
+  const useOf = (root) => {
+    if (!turnUses.has(root)) turnUses.set(root, newUse(currentTurn.get(root)));
+    return turnUses.get(root);
+  };
+  const roleUse = (root, role, model) => {
+    const roles = useOf(root).roles,
+      key = role + "|" + model;
+    return (roles[key] ??= { role, model, children: 0, completed: 0, calls: 0, usd: 0, ms: 0, input: 0, cacheRead: 0, reports: [] });
+  };
+  // Host usage is disjoint: inputTokens is the uncached part; cache reads and writes are separate.
+  function account(agent, options, usage, ms) {
+    const id = agent.session.id,
+      root = rootOf(agent);
+    const category = options.purpose !== undefined ? "compaction" : id === root ? "executor" : "children";
+    const role = category === "compaction" ? undefined : id === root ? "executor" : childRoles.get(id) ?? "worker";
+    const usd = usage ? costUSD(options.model, usage) : undefined;
+    const use = useOf(root);
+    if (usd === undefined) use.unpriced++;
+    else use.cost[category] += usd;
+    if (role) {
+      const entry = roleUse(root, role, modelInfo(options.model)?.id ?? options.model);
+      entry.calls++;
+      entry.ms += ms;
+      if (usd !== undefined) entry.usd += usd;
+      entry.input += (usage?.inputTokens ?? 0) + (usage?.cacheReadTokens ?? 0) + (usage?.cacheWriteTokens ?? 0);
+      entry.cacheRead += usage?.cacheReadTokens ?? 0;
+    }
+    return { category, role, usd };
+  }
 
   const memoFor = (root) => {
     if (!memos.has(root)) memos.set(root, createDecisionMemo());
@@ -511,7 +704,8 @@ export function apply(ctx, options) {
     jevDown.set(root, { status, detail });
     record({ kind: "jev_unavailable", session, model: config.jevModel, httpStatus: status, error: detail });
   }
-  async function decide(agent, request, signal) {
+  // `unbudgeted` is for the turn-end learning call, which must not compete with the task's decisions.
+  async function decide(agent, request, signal, { unbudgeted = false } = {}) {
     const root = rootOf(agent),
       state = budget(root);
     const down = jevDown.get(root);
@@ -525,9 +719,9 @@ export function apply(ctx, options) {
     });
     const key = createHash("sha256").update(body).digest("hex");
     return memoFor(root)(key, async () => {
-      if (state.decisions >= config.maxDecisions)
+      if (!unbudgeted && state.decisions >= config.maxDecisions)
         throw new Error("Jev task decision budget exhausted.");
-      state.decisions++;
+      if (!unbudgeted) state.decisions++;
       updateStats(root);
       const started = performance.now();
       let response;
@@ -562,12 +756,16 @@ export function apply(ctx, options) {
         throw new Error(
           `Jev decision returned an invalid answer (HTTP ${response.status}): ${problem}. ${bodyText}`,
         );
+      const usd = jevCostUSD(config.jevModel, result.usage);
+      if (usd !== undefined) useOf(root).cost.jev += usd;
+      else useOf(root).unpriced++;
       record({
         kind: "jev",
         session: agent.session.id,
         trigger: request.trigger,
         httpStatus: response.status,
         wallMs: performance.now() - started,
+        ...(usd === undefined ? {} : { usd }),
         ...result,
       });
       return result;
@@ -586,13 +784,22 @@ export function apply(ctx, options) {
       ...(config.modelRoutes ?? {}),
       ...(executor ? { [executor]: agent.options.provider } : {}),
     };
-    const available = [];
-    for (const entry of availableModels(routes, { allowPaid: config.allowPaidModels === true })) {
+    const available = [],
+      routable = availableModels(routes, { allowPaid: config.allowPaidModels === true });
+    // Every catalog model that is not a candidate keeps its reason for the UI.
+    const filtered = (CATALOG.models ?? [])
+      .filter((entry) => !routable.some((x) => x.id === entry.id))
+      .map((entry) => ({
+        model: entry.id,
+        reason: Object.hasOwn(routes, entry.id) ? "paid route not allowed (allowPaidModels)" : "no dsh route configured",
+      }));
+    for (const entry of routable) {
       try {
         await ctx.llm.prepareCall({ provider: routes[entry.id], model: entry.id }, signal);
         available.push(entry);
       } catch (error) {
         if (signal.aborted) throw error;
+        filtered.push({ model: entry.id, reason: "route preparation failed" });
         record({
           kind: "profile_unavailable",
           session: root,
@@ -602,6 +809,7 @@ export function apply(ctx, options) {
       }
     }
     availableByRoot.set(root, available);
+    filteredByRoot.set(root, filtered);
     providersByRoot.set(root, routes);
     if (available.length) modelKnowledge.set(root, knowledge(available));
     return available;
@@ -720,6 +928,12 @@ export function apply(ctx, options) {
   }
 
   ctx.tools.guard((exec) => {
+    // Role limits for helper children are enforced here rather than by a tool filter, so a forked
+    // child keeps the parent's exact tool block (and its cached prefix where the route shares it).
+    const role = exec.agent ? childRoles.get(exec.agent.session.id) : undefined;
+    if (role === "reviewer" && changesFilesCall(exec.name, exec.arguments))
+      return "The independent reviewer reports defects; it does not edit files.";
+    if (role === "advisor") return "The advisor answers from its brief without tools.";
     if (!delegation.has(exec.name)) return;
     const mode = exec.agent ? modeOf(exec.agent) : config.mode;
     if (mode === "single") return "This task permits one main agent only.";
@@ -742,11 +956,7 @@ export function apply(ctx, options) {
   ctx.on("tools/result", (exec, result) => {
     if (exec.agent && !delegation.has(exec.name) && !result.isError)
       declinedDelegation.delete(exec.agent.session.id);
-    const changesFiles =
-      fileChanging.has(exec.name) ||
-      (exec.name === "str_replace_editor" &&
-        ["create", "str_replace", "insert"].includes(exec.arguments?.command));
-    if (exec.agent && changesFiles && !result.isError) {
+    if (exec.agent && changesFilesCall(exec.name, exec.arguments) && !result.isError) {
       const session = exec.agent.session.id;
       changedTurn.set(session, currentTurn.get(session));
     }
@@ -768,15 +978,6 @@ export function apply(ctx, options) {
         },
       );
       noteEdits(root, id, id === root ? "parent" : childLabels.get(id) ?? id, since);
-      if (id === root) {
-        // A failing test run is where a flash executor most often misdiagnoses; think on the next step.
-        const latest = Object.values(graphFor(id).tests)
-          .flatMap((test) => test.runs)
-          .filter((run) => run.via === undefined && run.event > since)
-          .at(-1);
-        if (latest && (latest.outcome === "fail" || latest.outcome === "error"))
-          wantEffort(exec.agent, "test_failure");
-      }
     }
     if (!delegation.has(exec.name) || !exec.agent) return;
     budget(rootOf(exec.agent)).pending.delete(exec.callId);
@@ -798,6 +999,13 @@ export function apply(ctx, options) {
       advisor = advisorPending.has(parent);
     if (advisor || reviewPending.has(parent)) state.helpers.add(info.id);
     else state.children.add(info.id);
+    childRoles.set(info.id, advisor ? "advisor" : reviewPending.has(parent) ? "reviewer" : "worker");
+    // What the child's result is based on: later parent edits or user messages make parts of it stale.
+    const root = ctx.agents.get(parent);
+    childStarts.set(info.id, {
+      edits: editLog(parent).length,
+      users: root ? root.session.snapshotEvents().filter((event) => event.type === "user/message").length : 0,
+    });
     active.set(info.id, { parent, runId: info.runId });
     if (advisor) advisorChildren.add(info.id);
     const assignment = assignments.get(info.id);
@@ -844,18 +1052,72 @@ export function apply(ctx, options) {
     });
   }
 
-  // Effort is a request parameter, not prompt text, so raising it for one step keeps the cached prefix.
-  function wantEffort(agent, reason) {
-    if (!config.adaptiveEffort || config.adaptiveEffort === "off") return;
-    if (agent.session.header.parentSession !== undefined) return;
-    // The first turn's trigger fires before the root is initialized; use the configured mode then.
-    if ((roots.has(agent.session.id) ? modeOf(agent) : config.apiKey ? config.mode : "native") !== "auto") return;
-    if (!effortDue.has(agent.session.id)) effortDue.set(agent.session.id, reason);
+  // One Jev turn plan per root turn: the task tag keys the workspace ledger, and the thinking setting
+  // stays for the whole turn. Toggling it per event split the cache (thinking on and off are separate
+  // cache spaces on the measured route), so it changes only here and at a context checkpoint.
+  async function planTurn(agent, signal) {
+    const id = agent.session.id,
+      turn = currentTurn.get(id),
+      previous = turnPlans.get(id);
+    const effortOn = config.adaptiveEffort && config.adaptiveEffort !== "off" && effortSupported.get(id) === true;
+    // Without an effort to decide, nothing is asked here: the task tag rides on the first later decision
+    // that needs it (role choice or learning).
+    if (!effortOn) {
+      turnPlans.set(id, { turn, via: "none" });
+      return turnPlans.get(id);
+    }
+    const plan = { turn, effort: previous?.effort, via: "kept" };
+    const questions = {
+      task_tag: TAG_QUESTION,
+      ...(effortOn
+        ? {
+            high_reasoning: {
+              type: "noul",
+              instructions:
+                "Should the executor keep extended reasoning (thinking) on for the rest of this turn? It adds output tokens and time to every request; it pays off when the cause is unclear or several hypotheses must be weighed, less when the next steps are mechanical. A change from the current setting has the cache effect in `executor.thinkingCache`. Answer the probability that thinking on gives the better outcome under the user's preference.",
+            },
+          }
+        : {}),
+    };
+    const anchor = pressureAnchors.get(id);
+    const request = {
+      task: tasks.get(id),
+      trigger: "turn_plan",
+      preference: roots.get(id)?.policy?.weights,
+      executor: {
+        model: agent.options?.model,
+        route: agent.options?.provider,
+        thinkingNow: previous?.effort ? "on (" + previous.effort + ")" : "off",
+        thinkingCache: thinkingCacheFact(agent.options?.model),
+        contextTokens: anchor?.input ?? ctx.tokenMeter.measure(agent.session).totalTokens,
+        ...(lastCached.has(id) ? { lastCachedTokens: lastCached.get(id) } : {}),
+      },
+      questions,
+    };
+    try {
+      const answers = (await decide(agent, request, signal)).answers;
+      plan.tag = answers.task_tag.choice;
+      plan.tagConfidence = answers.task_tag.confidence;
+      if (effortOn) {
+        plan.highReasoning = answers.high_reasoning.noul;
+        plan.effort = answers.high_reasoning.noul >= 0.5 ? config.adaptiveEffort : undefined;
+      }
+      plan.via = "jev";
+    } catch (error) {
+      if (signal.aborted) throw error;
+      // Without Jev the current setting stays: a switch would only cost a cache rebuild.
+      plan.error = String(error).slice(0, 200);
+    }
+    turnPlans.set(id, plan);
+    record({ kind: "turn_plan", session: id, turn, tag: plan.tag ?? null, effort: plan.effort ?? null, via: plan.via,
+      ...(plan.highReasoning === undefined ? {} : { highReasoning: plan.highReasoning }),
+      ...(plan.error ? { error: plan.error } : {}) });
+    return plan;
   }
 
-  // Per-step executor effort through dsh's request-config waterfall on the agent's own scoped context,
-  // as dsh's native model selection does. A raised effort persists in the request header, so a non-due
-  // step strips it again unless the user configured an effort for this agent.
+  // The root's sticky effort through dsh's request-config waterfall on the agent's own scoped context, as
+  // dsh's native model selection does. Same-model children inherit it, so a forked branch stays in the
+  // parent's cache space. A user-configured effort on the agent always wins.
   function installEffort(agent) {
     const id = agent.session.id;
     if (effortInstalled.has(id) || !agent.ctx || !config.adaptiveEffort || config.adaptiveEffort === "off") return;
@@ -863,15 +1125,16 @@ export function apply(ctx, options) {
     // Prepended so it runs outermost: dsh's model selection drops any effort an inner listener sets.
     agent.ctx.on("agent/request", async (payload, next) => {
       const resolved = await next();
-      if (effortSupported.get(id) !== true || agent.options?.reasoningEffort !== undefined) return resolved;
-      if (effortDue.has(id)) {
-        const reason = effortDue.get(id);
-        effortDue.delete(id);
-        record({ kind: "effort_raised", session: id, effort: config.adaptiveEffort, reason, step: payload.step });
-        return { ...resolved, reasoningEffort: config.adaptiveEffort };
-      }
-      if (resolved.reasoningEffort === undefined) return resolved;
-      const { reasoningEffort: _raised, ...withoutEffort } = resolved;
+      if (agent.options?.reasoningEffort !== undefined) return resolved;
+      const root = rootOf(agent),
+        rootModel = ctx.agents.get(root)?.options?.model;
+      const effort =
+        effortSupported.get(root) === true && (id === root || resolved.model === rootModel)
+          ? turnPlans.get(root)?.effort
+          : undefined;
+      if (effort === resolved.reasoningEffort) return resolved;
+      if (effort !== undefined) return { ...resolved, reasoningEffort: effort };
+      const { reasoningEffort: _dropped, ...withoutEffort } = resolved;
       return withoutEffort;
     }, { prepend: true });
   }
@@ -887,21 +1150,27 @@ export function apply(ctx, options) {
     );
   }
 
-  // Explicit ids are honored only when native preparation accepted them; "auto"
-  // spends one Jev question, then falls back to local price/role ranking.
+  // Explicit ids are honored only when native preparation accepted them. "auto" asks Jev once per role per
+  // root task over every routed model that fits the brief, with priors, measured records and this
+  // workspace's experience; without an answer, the best effective weight wins, then the cheaper brief.
   async function chooseModel(role, agent, reason, signal) {
     const root = rootOf(agent),
       setting = role === "reviewer" ? config.reviewerModel : config.advisorModel;
     const available = await ensureAvailable(agent, signal);
     const found = (id) => available.find((entry) => entry.id === id);
-    const finish = (model, via) => {
+    let tag = turnPlans.get(root)?.tag;
+    const ledger = await readLedger(workspaceOf(agent));
+    const weight = (model) => effective(ledger, weightKey(tag ?? "general", model, role));
+    const finish = (model, via, detail = {}) => {
       if (model && setting === "auto") chosenModels.set(root + "\u0000" + role, model.id);
       record({
         kind: "model_choice",
         session: root,
         role,
+        tag: tag ?? null,
         ...(model ? { model: model.id } : {}),
         via,
+        ...detail,
       });
       return model;
     };
@@ -916,40 +1185,68 @@ export function apply(ctx, options) {
     // One Jev choice per role per root task: the catalog and the task do not change between consults.
     const memo = chosenModels.get(root + "\u0000" + role);
     if (setting === "auto" && memo && found(memo)) return found(memo);
-    if (setting === "auto" && budget(root).decisions < config.maxDecisions) {
-      const candidates = available
-        .filter((entry) => entry.roles.includes(role))
-        .slice(0, 4);
-      if (candidates.length) {
-        const criteria = Object.fromEntries(candidates.map((entry) => [entry.id, knowledge([entry])]));
-        const models = modelKnowledge.get(root);
-        const request = {
-          ...(models ? { models } : {}),
-          task: tasks.get(root),
-          ledger: digest(rootGraph(agent), 1500),
-          trigger: role + ": " + reason,
-          questions: {
-            model: {
-              type: "choice",
-              instructions:
-                "Which model should act as " + role + " now? Weigh measured strengths, family independence from the executor, and price.",
-              criteria,
-            },
+    // Hard capability only: the brief must fit the context window. Route availability was checked natively.
+    const briefTokens = ctx.tokenMeter.estimateMessage(note(tasks.get(root) ?? "")) + 4000;
+    const filtered = [...(filteredByRoot.get(root) ?? [])],
+      candidates = [];
+    for (const entry of available)
+      if (Number.isFinite(entry.context) && entry.context < 2 * briefTokens)
+        filtered.push({ model: entry.id, reason: "context window " + entry.context + " is below twice the brief" });
+      else candidates.push(entry);
+    const rowsNow = () => candidates.map((entry) => ({ model: entry.id, ...weight(entry.id) }));
+    const rows = rowsNow();
+    const fallback = () =>
+      pickModel(role, { available: candidates, weightOf: (id) => weight(id).weight });
+    if (setting === "auto" && candidates.length && budget(root).decisions < config.maxDecisions) {
+      const criteria = Object.fromEntries(candidates.map((entry) => [entry.id, knowledge([entry])]));
+      const models = modelKnowledge.get(root);
+      const request = {
+        ...(models ? { models } : {}),
+        experience: {
+          note: "Workspace weights for the " + role + " role by task tag, learned from finished tasks (no row means no evidence; user-set weights are explicit preferences). Use the rows of this task's tag.",
+          rows: Object.keys(ledger.weights)
+            .map(parseKey)
+            .filter((key) => key.role === role && candidates.some((entry) => entry.id === key.model))
+            .map((key) => ({ tag: key.tag, ...experienceRows(ledger, [weightKey(key.tag, key.model, role)])[0] }))
+            .map(({ key: _key, role: _role, ...row }) => row),
+        },
+        preference: roots.get(root)?.policy?.weights,
+        executor: agent.options?.model,
+        task: tasks.get(root),
+        ledger: digest(rootGraph(agent), 1500),
+        trigger: role + ": " + reason,
+        questions: {
+          ...(tag === undefined ? { task_tag: TAG_QUESTION } : {}),
+          model: {
+            type: "choice",
+            instructions:
+              "Which model should act as " + role + " now? Prefer measured records and workspace experience over priors; weigh the expected quality of its " + role + " work first, then total cost (its price for this brief) and time under the user's preference. The executor's own model is a candidate; family relation to it is information, not a rule.",
+            criteria,
           },
-        };
-        try {
-          if (Buffer.byteLength(JSON.stringify(request)) <= STATE_BYTES) {
-            const decision = await decide(agent, request, signal);
-            const answer = decision.answers?.model;
-            const chosen = criteria[answer?.choice] ? found(answer.choice) : undefined;
-            if (chosen && answer.confidence >= 0.4) return finish(chosen, "jev");
+        },
+      };
+      try {
+        if (Buffer.byteLength(JSON.stringify(request)) <= STATE_BYTES) {
+          const decision = await decide(agent, request, signal);
+          if (tag === undefined) {
+            tag = decision.answers.task_tag.choice;
+            turnPlans.set(root, { ...turnPlans.get(root), tag, via: turnPlans.get(root)?.via ?? "choice" });
           }
-        } catch (error) {
-          if (signal.aborted) throw error;
+          const answer = decision.answers?.model;
+          const chosen = criteria[answer?.choice] ? found(answer.choice) : undefined;
+          const detail = {
+            confidence: answer?.confidence,
+            candidates: rowsNow().map((row) => ({ ...row, probability: answer?.probabilities?.[row.model] })),
+            filtered,
+          };
+          if (chosen && answer.confidence >= 0.4) return finish(chosen, "jev", detail);
+          return finish(fallback(), "fallback", { ...detail, reasonFallback: "low confidence" });
         }
+      } catch (error) {
+        if (signal.aborted) throw error;
       }
     }
-    return finish(pickModel(role, { executor: agent.options?.model, available }), "fallback");
+    return finish(fallback(), "fallback", { candidates: rows, filtered });
   }
 
   async function independentReview(agent, turn, signal) {
@@ -959,45 +1256,54 @@ export function apply(ctx, options) {
         changedTurn.get(id) === turn ||
         (start?.turn === turn && Object.values(graphFor(id).files).some((file) =>
           file.edits.some((edit) => edit.via === undefined && edit.step > start.step)));
-    if (reviewedTurn.get(id) === turn || !changed) return;
-    if (!rootHasChildSlot(id)) return;
+    if (reviewedTurn.get(id) === turn || !changed) return false;
+    if (!rootHasChildSlot(id)) return false;
     // Marked before starting, so a failed review never repeats within the turn.
     reviewedTurn.set(id, turn);
     const custom = config.reviewerModel !== undefined && config.reviewerModel !== "same";
-    const reviewer = custom ? await chooseModel("reviewer", agent, "independent review", signal) : undefined;
+    const chosen = custom ? await chooseModel("reviewer", agent, "independent review", signal) : undefined;
+    const executor = modelInfo(agent.options?.model)?.id ?? agent.options?.model;
+    // The executor's own model reviews through a fork whatever setting picked it.
+    const cross = !!chosen && chosen.id !== executor;
+    const provider = !cross && ctx.subagents.getProvider("fork") !== undefined ? "fork" : "spawn";
+    // The host fork seeds only completed turns (host gap: no mid-turn seed), so inside the first turn a
+    // fork starts without the parent's history and the brief must carry the ledger like a spawn.
+    const seeded = provider === "fork" && agent.session.snapshotEvents().some((event) => event.type === "turn/end");
+    const model = chosen?.id ?? executor;
     let run;
     record({
       kind: "review_start",
       session: id,
       turn,
-      model: reviewer?.id ?? "same",
+      model: cross ? model : "same",
+      provider,
+      historySeeded: seeded,
     });
     try {
       signal.throwIfAborted();
-      const cross = !!reviewer;
-      const provider = cross
-        ? "spawn"
-        : ctx.subagents.getProvider("fork") !== undefined
-          ? "fork"
-          : "spawn";
-      // A spawn child does not share the parent's cache, so the brief carries the ledger.
-      const prompt = cross
-        ? REVIEW_PROMPT +
+      const prompt = seeded
+        ? REVIEW_PROMPT + "\n\nOriginal issue:\n" + tasks.get(id)
+        : REVIEW_PROMPT +
           "\n\nOriginal issue:\n" + tasks.get(id) +
-          "\n\nParent evidence ledger:\n" + digest(rootGraph(agent), 3000)
-        : REVIEW_PROMPT + "\n\nOriginal issue:\n" + tasks.get(id);
+          "\n\nParent evidence ledger:\n" + digest(rootGraph(agent), 3000);
       reviewPending.add(id);
       run = await ctx.subagents.start(provider, {
         label: "Independent review",
         parent: agent,
         prompt: [{ type: "text", text: prompt }],
-        ...(cross ? { agentOptions: { provider: providerOf(agent, reviewer.id), model: reviewer.id } } : {}),
-        toolFilter: { deny: ["subagent", "subagent_fork"] },
+        // A fork keeps the parent's tool block; the guard enforces the reviewer's limits instead.
+        ...(provider === "fork"
+          ? {}
+          : {
+              ...(cross ? { agentOptions: { provider: providerOf(agent, model), model } } : {}),
+              toolFilter: { deny: ["subagent", "subagent_fork"] },
+            }),
         maxDepth: 1,
         signal,
       });
       reviewPending.delete(id);
       reviewChildren.add(run.id);
+      roleUse(id, "reviewer", model).children++;
       childLabels.set(run.id, "Independent review");
       let outcome;
       try {
@@ -1017,24 +1323,29 @@ export function apply(ctx, options) {
         .join("\n")
         .trim();
       if (!report) throw new Error("Review child returned no report.");
+      const lgtm = /^[\W_]*LGTM\b/i.test(report);
       record({
         kind: "review_end",
         session: id,
         turn,
         childId: run.id,
-        model: reviewer?.id ?? "same",
+        model: cross ? model : "same",
         stopReason: outcome.stopReason,
-        lgtm: /^[\W_]*LGTM\b/i.test(report),
+        lgtm,
       });
+      const use = roleUse(id, "reviewer", model);
+      use.completed++;
+      use.reports.push({ verdict: lgtm ? "LGTM" : "DEFECTS", at: graphFor(id).sequence, text: report.slice(0, 300) });
       // LGTM ends the turn as is: steering the report back reopened it, and flash executors chased
       // the reviewer's caveats until the request cap.
-      if (!/^[\W_]*LGTM\b/i.test(report)) {
+      if (!lgtm) {
         agent.steer(note(reviewMessage(report)));
-        wantEffort(agent, "review_report");
+        return true;
       }
     } catch (error) {
       signal.throwIfAborted();
       record({ kind: "review_failed", session: id, turn, childId: run?.id, error: String(error) });
+      return false;
     } finally {
       if (!run) reviewPending.delete(id);
       if (run) reviewChildren.delete(run.id);
@@ -1044,11 +1355,17 @@ export function apply(ctx, options) {
   ctx.on("agent/turn-stopping", async ({ agent, turn, signal }) => {
     const saved = persistGraph(agent.session.id);
     try {
-      // Auto and native share the reviewer; single mode and keyless runs stay native-only.
-      if (!config.reviewBeforeFinish || !config.apiKey) return;
       if (agent.session.header.parentSession !== undefined) return;
-      if (modeOf(agent) === "single") return;
-      await independentReview(agent, turn, signal);
+      // Auto and native share the reviewer; single mode and keyless runs stay native-only.
+      const steered =
+        config.reviewBeforeFinish && config.apiKey && modeOf(agent) !== "single"
+          ? await independentReview(agent, turn, signal)
+          : false;
+      // A turn that is really ending settles its learning here, awaited and bounded, so a headless run
+      // does not exit before the ledger is written; `turn/end` remains the fallback.
+      if (!steered && modeOf(agent) === "auto")
+        await settleTurn(agent.session, turn).catch((error) =>
+          record({ kind: "learning_failed", session: agent.session.id, error: String(error) }));
     } finally {
       await saved;
     }
@@ -1452,6 +1769,7 @@ export function apply(ctx, options) {
       advisorPending.delete(id);
       advisorChildren.add(run.id);
       childLabels.set(run.id, "Advisor");
+      roleUse(id, "advisor", model.id).children++;
       let outcome;
       try {
         outcome = await run.result;
@@ -1468,6 +1786,9 @@ export function apply(ctx, options) {
         .trim();
       if (!reply) throw new Error("Advisor returned no text.");
       record({ kind: "advisor_end", session: id, model: model.id, chars: reply.length });
+      const use = roleUse(id, "advisor", model.id);
+      use.completed++;
+      use.reports.push({ trigger, at: graphFor(id).sequence, text: reply.slice(0, 300) });
       return advisorMessage(model.id, trigger, reply);
     } catch (error) {
       signal.throwIfAborted();
@@ -1480,9 +1801,9 @@ export function apply(ctx, options) {
   }
 
   // Every injection is appended after next(), so the cached prompt prefix is untouched.
-  function appendNotes(agent, admitted, { advisor, finalRequest }) {
+  function appendNotes(agent, admitted, { advisor, finalRequest, staleNotes = [] }) {
     const id = agent.session.id;
-    const extra = [];
+    const extra = staleNotes.map(note);
     if (finalRequest)
       extra.push(
         note(
@@ -1496,10 +1817,7 @@ export function apply(ctx, options) {
     }
     const reminder = takeSync(agent);
     if (reminder) extra.push(note(reminder));
-    if (advisor) {
-      extra.push(note(advisor));
-      wantEffort(agent, "advisor_report");
-    }
+    if (advisor) extra.push(note(advisor));
     if (extra.length) admitted = { ...admitted, messages: [...(admitted.messages ?? []), ...extra] };
     if (agent.session.header.parentSession !== undefined) return admitted;
     const guidance = agent.session
@@ -1526,33 +1844,35 @@ export function apply(ctx, options) {
     currentTurn.set(id, payload.turn);
     await restoreGraph(id);
     graphFor(id);
-    if (!isChild && turnStartSteps.get(id)?.turn !== payload.turn) {
+    const newTurn = !isChild && turnStartSteps.get(id)?.turn !== payload.turn;
+    if (newTurn) {
       turnStartSteps.set(id, { turn: payload.turn, step: graphStep(id) });
-      wantEffort(agent, "turn_start");
+      if (turnUses.get(id)?.turn !== payload.turn) turnUses.set(id, newUse(payload.turn));
     }
-    if (!isChild) installEffort(agent);
-    if (!isChild) {
-      const key = progressKey(graphFor(id)),
-        stall = effortStall.get(id);
-      if (!stall || stall.key !== key) effortStall.set(id, { key, step: graphStep(id), done: false });
-      else if (!stall.done && graphStep(id) - stall.step >= 4) {
-        stall.done = true;
-        wantEffort(agent, "stall");
-      }
-    }
+    installEffort(agent);
     if (messages.some((m) => ["user", "agent-message", "subagent-settled"].includes(m.source.kind)))
       declinedDelegation.delete(id);
     if (isChild && turnIds.get(id) !== payload.turn) {
       turnIds.set(id, payload.turn);
       turnRequests.set(id, 0);
     }
+    const staleNotes = [];
     for (const message of messages)
       if (message.source.kind === "subagent-settled") {
         const child = message.source.senderSessionId;
         recordCollection(id, child, settled.get(child));
-        // The child's evidence stays attributed to its label in the parent graph.
+        // The child's evidence stays attributed to its label in the parent graph. Its reads of files the
+        // parent edited after the child started are stale and are not merged.
         await restoreGraph(child);
-        merge(graphFor(id), graphFor(child), childLabels.get(child) ?? child);
+        const started = childStarts.get(child);
+        const editedSince = new Set(
+          editLog(id).slice(started?.edits ?? 0).filter((edit) => edit.session === id).map((edit) => edit.path));
+        merge(graphFor(id), graphFor(child), childLabels.get(child) ?? child, { skipReadsOf: editedSince });
+        const users = agent.session.snapshotEvents().filter((event) => event.type === "user/message").length;
+        if (started && (editedSince.size || users > started.users)) {
+          staleNotes.push(staleMessage(childLabels.get(child) ?? child, [...editedSince], users > started.users));
+          record({ kind: "stale_child_result", session: id, child, paths: [...editedSince], newUserMessage: users > started.users });
+        }
       }
     if (!tasks.has(id)) {
       const assignment =
@@ -1600,6 +1920,7 @@ export function apply(ctx, options) {
       if (state.mode === "auto") installRouting(agent);
     }
     if (!isChild && modeOf(agent) === "auto") installRouting(agent);
+    if (newTurn && modeOf(agent) === "auto") await planTurn(agent, signal);
     if (isChild) {
       // The advisor has no tools at all, so it cannot (and need not) report through send_message.
       if (!advisorChildren.has(id)) installChildReporting(agent);
@@ -1660,7 +1981,7 @@ export function apply(ctx, options) {
     const admitted = await next();
     if (admitted.kind === "reject") return admitted;
     graphSteps.set(id, graphStep(id) + 1);
-    return appendNotes(agent, admitted, { advisor, finalRequest });
+    return appendNotes(agent, admitted, { advisor, finalRequest, staleNotes });
   });
   ctx.on("llm/stream", async function* (options, next) {
     const agent = options.sessionId ? ctx.agents.get(options.sessionId) : undefined;
@@ -1685,6 +2006,9 @@ export function apply(ctx, options) {
         yield chunk;
       }
     } finally {
+      const wallMs = performance.now() - started;
+      const spent = agent ? account(agent, options, usage, wallMs) : undefined;
+      if (agent && options.purpose === undefined && usage) lastCached.set(agent.session.id, usage.cacheReadTokens ?? 0);
       if (agent && options.purpose === undefined) {
         if (Number.isFinite(usage?.totalTokens) && Number.isFinite(usage?.outputTokens))
           pressureAnchors.set(agent.session.id, {
@@ -1699,7 +2023,8 @@ export function apply(ctx, options) {
         model: options.model,
         effort: options.reasoningEffort,
         purpose: options.purpose ?? "execution",
-        wallMs: performance.now() - started,
+        wallMs,
+        ...(spent ?? {}),
         ...(usage === undefined ? {} : { usage }),
       });
     }
@@ -1709,7 +2034,150 @@ export function apply(ctx, options) {
       pressureAnchors.delete(session.id);
       pendingLedgers.add(session.id);
     }
+    if (session.header.parentSession !== undefined) return;
+    // Learning settles once per completed root turn, outside the turn: it never delays the user.
+    if (event.type === "turn/end" && event.data?.reason?.kind === "completed")
+      settleTurn(session, event.data.turn).catch((error) =>
+        record({ kind: "learning_failed", session: session.id, error: String(error) }));
+    if (event.type === "feedback/message-put")
+      settleFeedback(session, event.data.item).catch((error) =>
+        record({ kind: "learning_failed", session: session.id, error: String(error) }));
   });
+
+  // Observed facts only: the latest outcome per test, edits after a report, cost, time and cache.
+  const testState = (graph) => {
+    const latest = Object.values(graph.tests).map((test) => test.runs.at(-1)?.outcome);
+    return { passing: latest.filter((x) => x === "pass").length, failing: latest.filter((x) => x === "fail" || x === "error").length };
+  };
+  const editsAfterEvent = (graph, event) =>
+    Object.values(graph.files).flatMap((file) => file.edits).filter((edit) => edit.via === undefined && edit.event > event).length;
+  const basisOf = (fact, context) =>
+    [
+      fact.children + " " + fact.role + " run(s)",
+      ...fact.reports.slice(0, 2).map((report) =>
+        (report.verdict ?? "advice") + (report.executorEditsAfter ? ", executor edited after" : ", no edits after")),
+      "tests " + context.tests.passing + " pass/" + context.tests.failing + " fail",
+      "$" + fact.usd,
+      fact.seconds + "s",
+      ...(fact.cacheHit === null ? [] : ["cache " + Math.round(fact.cacheHit * 100) + "%"]),
+      ...(context.feedback ? ["user " + context.feedback.rating + (context.feedback.category ? " (" + context.feedback.category + ")" : "")] : []),
+    ].join("; ").slice(0, 160);
+
+  async function settleTurn(session, turn) {
+    const id = session.id,
+      use = turnUses.get(id);
+    if (!use || use.turn !== turn || use.settled) return;
+    use.settled = true;
+    const plan = turnPlans.get(id),
+      graph = graphFor(id);
+    const tag = plan?.tag,
+      need = needOf(roots.get(id)?.policy?.weights),
+      tests = testState(graph);
+    const facts = Object.values(use.roles)
+      .filter((entry) => LEARNED_ROLES.has(entry.role) && entry.children > 0)
+      .map((entry) => ({
+        role: entry.role,
+        model: entry.model,
+        children: entry.children,
+        completed: entry.completed,
+        calls: entry.calls,
+        usd: round(entry.usd),
+        seconds: round(entry.ms / 1000, 1),
+        cacheHit: entry.input ? round(entry.cacheRead / entry.input, 3) : null,
+        reports: entry.reports.map(({ at, ...report }) => ({ ...report, executorEditsAfter: editsAfterEvent(graph, at) })),
+      }));
+    const executor = Object.values(use.roles).find((entry) => entry.role === "executor");
+    const summary = {
+      turn,
+      tag: tag ?? null,
+      need,
+      effort: plan?.effort ?? null,
+      tests,
+      seconds: round((Date.now() - use.startedAt) / 1000, 1),
+      cost: Object.fromEntries(Object.entries(use.cost).map(([key, value]) => [key, round(value)])),
+      totalUSD: round(Object.values(use.cost).reduce((sum, value) => sum + value, 0)),
+      unpriced: use.unpriced,
+      ...(executor
+        ? { executor: { model: executor.model, calls: executor.calls, cacheHit: executor.input ? round(executor.cacheRead / executor.input, 3) : null } }
+        : {}),
+      roles: facts,
+    };
+    await (await storage()).table("uses").put(useKey(id, turn), summary);
+    record({ kind: "turn_use", session: id, ...summary });
+    if (facts.length) await learn(session, facts, { tag, need, tests, totalUSD: summary.totalUSD }, "turn:" + id + ":" + turn);
+  }
+
+  // Native message feedback on a root answer becomes evidence for the roles that turn used.
+  async function settleFeedback(session, item) {
+    if (!item?.messageId) return;
+    const event = session
+      .snapshotEvents()
+      .find((x) => x.type === "assistant/message" && x.data?.message?.id === item.messageId);
+    if (!event) return;
+    const saved = (await storage()).table("uses").get(useKey(session.id, event.data.turn));
+    const feedback = { rating: item.rating, ...(item.category ? { category: item.category } : {}), ...(item.note ? { note: String(item.note).slice(0, 300) } : {}) };
+    record({ kind: "feedback_evidence", session: session.id, turn: event.data.turn, ...feedback, roles: saved?.roles?.length ?? 0 });
+    if (!saved?.roles?.length) return;
+    await learn(session, saved.roles, { tag: saved.tag ?? undefined, need: saved.need, tests: saved.tests, totalUSD: saved.totalUSD, feedback },
+      "feedback:" + item.messageId + ":" + item.version);
+  }
+
+  // Jev proposes one weight per (tag, model, role) the turn actually used; the ledger applies, queues or
+  // records it by mode. Unused candidates get no proposal, so not being chosen never lowers a weight.
+  async function learn(session, facts, context, evidenceId) {
+    const id = session.id,
+      cwd = session.header.cwd ?? "",
+      agent = ctx.agents.get(id);
+    const ledger = await readLedger(cwd);
+    if (ledger.mode === "frozen" || !agent || !config.apiKey || jevDown.has(id)) {
+      record({ kind: "learning", session: id, mode: ledger.mode, tag: context.tag ?? null,
+        evidence: facts.map((fact) => fact.role + "|" + fact.model), proposed: false,
+        reason: ledger.mode === "frozen" ? "frozen" : "jev unavailable" });
+      return;
+    }
+    const tagged = context.tag !== undefined;
+    const questions = Object.fromEntries(facts.map((fact, i) => ["fit_" + i, {
+      type: "score",
+      instructions:
+        "How well does " + fact.model + " fit the " + fact.role + " role for " + (tagged ? context.tag : "this kind of") + " tasks in this workspace, given facts[" + i + "] from this task and its current weight? Use observed facts only: a defects report the executor acted on before tests passed was useful; one contradicted by passing tests without edits, or by user feedback, was wrong advice; cost and time count under the user's need (" + context.need + "). One task is weak evidence.",
+      criteria: FIT_LEVELS,
+    }]));
+    // Without a tag yet, the current weights of every tag are shown and the tag is asked in the same call.
+    const current = (fact) =>
+      tagged
+        ? effective(ledger, weightKey(context.tag, fact.model, fact.role))
+        : Object.fromEntries(Object.keys(TASK_TAGS).map((tag) => [tag, effective(ledger, weightKey(tag, fact.model, fact.role)).weight]));
+    const request = {
+      trigger: "learning",
+      task: (tasks.get(id) ?? "").slice(0, 2000),
+      context,
+      facts: facts.map((fact) => ({ ...fact, current: current(fact) })),
+      questions: tagged ? questions : { task_tag: TAG_QUESTION, ...questions },
+    };
+    const answers = (await decide(agent, request, AbortSignal.timeout(20000), { unbudgeted: true })).answers;
+    const tag = tagged ? context.tag : answers.task_tag.choice;
+    context = { ...context, tag };
+    const proposals = facts.map((fact, i) => ({
+      key: weightKey(tag, fact.model, fact.role),
+      evidence: [evidenceId + ":" + fact.role + "|" + fact.model],
+      target: answers["fit_" + i].score / (FIT_LEVELS.length - 1),
+      basis: basisOf(fact, context),
+      // Jev's confidence is not calibrated; it is shown as is, labeled so.
+      uncertainty: round(1 - answers["fit_" + i].confidence, 2),
+    }));
+    const result = await updateLedger(cwd, (latest) => propose(latest, proposals, Date.now()));
+    record({
+      kind: "learning",
+      session: id,
+      tag,
+      mode: result.ledger.mode,
+      version: result.ledger.version,
+      proposed: true,
+      applied: result.applied.map((item) => ({ key: item.key, from: item.current, to: item.proposed })),
+      pending: result.pending ? result.ledger.pending.version : null,
+      skipped: result.skipped,
+    });
+  }
 
   const region = (nodes, start, end, agent) =>
     nodes
@@ -1731,6 +2199,10 @@ export function apply(ctx, options) {
       : measured.totalTokens;
     const ceiling = Math.ceil(config.pressureTokens * config.ceilingRatio);
     if (pressure < config.pressureTokens) return;
+    // Jev deferred the last replacement; ask again after 25% growth or at the ceiling.
+    const deferredUntil = deferredSelection.get(id);
+    if (deferredUntil !== undefined && pressure < deferredUntil && pressure < ceiling) return;
+    deferredSelection.delete(id);
     record({
       kind: "context_pressure",
       session: id,
@@ -1898,6 +2370,53 @@ export function apply(ctx, options) {
       await compactRegion("decision_budget");
       return;
     }
+    // Cost of replacing now versus later, from observed usage and catalog prices (estimates labeled).
+    const regionTokensEstimate = measured.nodes.slice(start, end + 1).reduce((sum, node) => sum + node.tokens, 0);
+    const price = modelInfo(agent.options?.model)?.price;
+    const afterTokens = Math.round(pressure - regionTokensEstimate * (1 - config.keepRatio));
+    const economics = price
+      ? (() => {
+          const read = price.cacheRead ?? price.input,
+            delta = 2000;
+          const perNow = ((pressure - delta) * read + delta * price.input) / 1e6,
+            perAfter = ((afterTokens - delta) * read + delta * price.input) / 1e6,
+            rebuild = ((afterTokens - headTokens) * (price.input - read)) / 1e6;
+          return {
+            basis: "estimate from catalog prices; assumes the head stays cached and everything after it is re-read uncached once",
+            contextTokens: pressure,
+            ...(lastCached.has(id) ? { lastCachedTokens: lastCached.get(id) } : {}),
+            estimatedAfterTokens: afterTokens,
+            ceilingTokens: ceiling,
+            perRequestInputUSDNow: round(perNow, 5),
+            perRequestInputUSDAfter: round(perAfter, 5),
+            rebuildOnceUSD: round(rebuild, 5),
+            breakEvenRequests: perNow > perAfter ? Math.ceil(rebuild / (perNow - perAfter)) : null,
+            requestsSoFarThisTurn: Object.values(useOf(rootOf(agent)).roles).find((entry) => entry.role === "executor")?.calls ?? 0,
+          };
+        })()
+      : { basis: "no catalog price for this model", contextTokens: pressure, estimatedAfterTokens: afterTokens, ceilingTokens: ceiling };
+    const isRoot = agent.session.header.parentSession === undefined;
+    const effortOn = isRoot && config.adaptiveEffort && config.adaptiveEffort !== "off" && effortSupported.get(id) === true;
+    const extra = {
+      ...(pressure < ceiling
+        ? {
+            replace_now: {
+              type: "noul",
+              instructions:
+                "Should this context be replaced now rather than later? Replacing re-reads the kept context uncached once (economics.rebuildOnceUSD) and lowers the input cost of every later request (economics.perRequestInputUSDNow vs After; break-even after economics.breakEvenRequests requests). Deferring keeps the cache, but the context keeps growing until the ceiling forces a replacement. Weigh the expected remaining work and the quality effect of a long context against losing verbatim evidence, under the user's preference.",
+            },
+          }
+        : {}),
+      ...(effortOn
+        ? {
+            high_reasoning: {
+              type: "noul",
+              instructions:
+                "After this checkpoint, should the executor keep extended reasoning (thinking) on for the rest of the turn? The replacement re-reads the context anyway, so switching now costs no extra cache rebuild. Answer the probability that thinking on gives the better outcome under the user's preference.",
+            },
+          }
+        : {}),
+    };
     let selection;
     try {
       const children = await ctx.subagents.listChildren(rootOf(agent), signal);
@@ -1908,8 +2427,9 @@ export function apply(ctx, options) {
       );
       selection = await scoreContext(
         (request) => decide(agent, request, signal),
-        batch,
+        { ...batch, economics, preference: roots.get(rootOf(agent))?.policy?.weights, executorThinking: turnPlans.get(id)?.effort ?? "off" },
         owners,
+        extra,
       );
     } catch (error) {
       if (signal.aborted) throw error;
@@ -1918,9 +2438,19 @@ export function apply(ctx, options) {
       return;
     }
     signal.throwIfAborted();
-    const regionTokens = measured.nodes
-      .slice(start, end + 1)
-      .reduce((sum, node) => sum + node.tokens, 0);
+    if (selection.answers.replace_now && selection.answers.replace_now.noul < 0.5) {
+      deferredSelection.set(id, Math.ceil(pressure * 1.25));
+      record({ kind: "context_deferred", session: id, pressure, ceiling, replaceNow: selection.answers.replace_now.noul,
+        recheckAt: deferredSelection.get(id), economics });
+      return;
+    }
+    if (selection.answers.high_reasoning) {
+      const plan = turnPlans.get(id) ?? { tag: "general", via: "checkpoint" };
+      const effort = selection.answers.high_reasoning.noul >= 0.5 ? config.adaptiveEffort : undefined;
+      if (effort !== plan.effort) record({ kind: "effort_checkpoint", session: id, from: plan.effort ?? null, to: effort ?? null, highReasoning: selection.answers.high_reasoning.noul });
+      turnPlans.set(id, { ...plan, effort, highReasoning: selection.answers.high_reasoning.noul, via: "checkpoint" });
+    }
+    const regionTokens = regionTokensEstimate;
     // Unjudged units are kept first (required ones always); when they alone exceed the keep budget,
     // the oldest non-required ones are archived to one line each.
     const keepBudget = config.keepRatio * regionTokens;
