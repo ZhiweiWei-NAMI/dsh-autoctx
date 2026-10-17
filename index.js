@@ -90,6 +90,20 @@ export const Config = z.object({
     .description("Maximum children running at once"),
   maxChildRequests: z.number().step(1).min(1).default(16),
   maxChildTurnRequests: z.number().step(1).min(2).default(8),
+  reviewBeforeFinish: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description(
+      "Start one independent review child before a root turn that changed files finishes",
+    ),
+  reviewMaxRequests: z
+    .number()
+    .step(1)
+    .min(1)
+    .default(10)
+    .volatile()
+    .description("Model requests allowed for one review child"),
   maxDecisions: z
     .number()
     .step(1)
@@ -119,7 +133,7 @@ export const Config = z.object({
     .description("Recent tokens always kept during compaction"),
   economyGuidance: z
     .boolean()
-    .default(true)
+    .default(false)
     .volatile()
     .description("Append one execution-economy note before the root task's first model request"),
   keepRatio: z
@@ -133,6 +147,14 @@ export const Config = z.object({
   recordFile: z.string(),
 });
 const delegation = new Set(["subagent", "subagent_fork"]);
+// Tools whose successful result means the turn changed files on disk.
+const fileChanging = new Set(["edit", "write", "apply_patch", "multi_edit"]);
+const REVIEW_PROMPT =
+  "Independently check the change the parent just made against the original issue. Inspect `git diff`, re-read the issue, run a minimal reproduction and the most relevant existing tests. Do NOT edit files. Start the first line with exactly `LGTM` (then the evidence) or `DEFECTS` (then each concrete defect with evidence).";
+const reviewMessage = (report) =>
+  "Independent review of your change:\n" +
+  report +
+  "\nIf it reports a defect, fix it and verify; otherwise finish.";
 const text = (m) =>
   m.content
     .filter((b) => b.type === "text")
@@ -216,6 +238,10 @@ export function apply(ctx, options) {
     collected = new Set(),
     reports = new Map(),
     reportingChildren = new Set();
+  const currentTurn = new Map(),
+    changedTurn = new Map(),
+    reviewedTurn = new Map(),
+    reviewChildren = new Set();
   const rootOf = (agent) => agent.session.header.parentSession ?? agent.session.id;
   const budget = (id) => {
     if (!budgets.has(id))
@@ -260,6 +286,9 @@ export function apply(ctx, options) {
         "context_scores",
         "context_kept",
         "context_replaced",
+        "review_start",
+        "review_end",
+        "review_failed",
       ].includes(value.kind)
     )
       return;
@@ -483,6 +512,14 @@ export function apply(ctx, options) {
   ctx.on("tools/result", (exec, result) => {
     if (exec.agent && !delegation.has(exec.name) && !result.isError)
       declinedDelegation.delete(exec.agent.session.id);
+    const changesFiles =
+      fileChanging.has(exec.name) ||
+      (exec.name === "str_replace_editor" &&
+        ["create", "str_replace", "insert"].includes(exec.arguments?.command));
+    if (exec.agent && changesFiles && !result.isError) {
+      const session = exec.agent.session.id;
+      changedTurn.set(session, currentTurn.get(session));
+    }
     if (!delegation.has(exec.name) || !exec.agent) return;
     budget(rootOf(exec.agent)).pending.delete(exec.callId);
     record({
@@ -543,6 +580,80 @@ export function apply(ctx, options) {
       if (signal.aborted) abort();
     });
   }
+
+  // Reviews share the task's child slots and request budget.
+  function rootHasChildSlot(id) {
+    const state = budget(id);
+    const running = [...active.values()].filter((x) => x.parent === id).length;
+    return (
+      state.pending.size + running < config.maxConcurrent &&
+      state.children.size + state.pending.size < config.maxChildren &&
+      state.childRequests < config.maxChildRequests
+    );
+  }
+
+  async function independentReview(agent, turn, signal) {
+    const id = agent.session.id;
+    if (reviewedTurn.get(id) === turn || changedTurn.get(id) !== turn) return;
+    if (!rootHasChildSlot(id)) return;
+    // Marked before starting, so a failed review never repeats within the turn.
+    reviewedTurn.set(id, turn);
+    let run;
+    record({ kind: "review_start", session: id, turn });
+    try {
+      signal.throwIfAborted();
+      const provider = ctx.subagents.getProvider("fork") !== undefined ? "fork" : "spawn";
+      run = await ctx.subagents.start(provider, {
+        label: "Independent review",
+        parent: agent,
+        prompt: [{ type: "text", text: REVIEW_PROMPT + "\n\nOriginal issue:\n" + tasks.get(id) }],
+        toolFilter: { deny: ["subagent", "subagent_fork"] },
+        maxDepth: 1,
+        signal,
+      });
+      reviewChildren.add(run.id);
+      let outcome;
+      try {
+        outcome = await run.result;
+      } finally {
+        await run.dispose();
+      }
+      signal.throwIfAborted();
+      if (outcome.stopReason !== "completed")
+        throw new Error(
+          "Review child ended with " + outcome.stopReason +
+          (outcome.diagnostic ? ": " + outcome.diagnostic : "."),
+        );
+      const report = outcome.output
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("\n")
+        .trim();
+      if (!report) throw new Error("Review child returned no report.");
+      record({
+        kind: "review_end",
+        session: id,
+        turn,
+        childId: run.id,
+        stopReason: outcome.stopReason,
+        lgtm: /^[\W_]*LGTM\b/i.test(report),
+      });
+      agent.steer(note(reviewMessage(report)));
+    } catch (error) {
+      signal.throwIfAborted();
+      record({ kind: "review_failed", session: id, turn, childId: run?.id, error: String(error) });
+    } finally {
+      if (run) reviewChildren.delete(run.id);
+    }
+  }
+
+  ctx.on("agent/turn-stopping", async ({ agent, turn, signal }) => {
+    // Auto and native share the reviewer; single mode and keyless runs stay native-only.
+    if (!config.reviewBeforeFinish || !config.apiKey) return;
+    if (agent.session.header.parentSession !== undefined) return;
+    if (modeOf(agent) === "single") return;
+    await independentReview(agent, turn, signal);
+  });
 
   async function routeDelegation(args, exec, provider) {
     const parent = exec.agent,
@@ -856,6 +967,7 @@ export function apply(ctx, options) {
     const { agent, messages, signal } = payload,
       id = agent.session.id,
       isChild = agent.session.header.parentSession !== undefined;
+    currentTurn.set(id, payload.turn);
     if (messages.some((m) => ["user", "agent-message", "subagent-settled"].includes(m.source.kind)))
       declinedDelegation.delete(id);
     if (isChild && turnIds.get(id) !== payload.turn) {
@@ -911,8 +1023,9 @@ export function apply(ctx, options) {
     if (isChild) {
       installChildReporting(agent);
       const state = budget(rootOf(agent)),
-        used = turnRequests.get(id) ?? 0;
-      if (state.childRequests >= config.maxChildRequests || used >= config.maxChildTurnRequests) {
+        used = turnRequests.get(id) ?? 0,
+        turnCap = reviewChildren.has(id) ? config.reviewMaxRequests : config.maxChildTurnRequests;
+      if (state.childRequests >= config.maxChildRequests || used >= turnCap) {
         record({
           kind: "child_budget_exhausted",
           session: id,
@@ -921,10 +1034,7 @@ export function apply(ctx, options) {
         });
         throw new Error("Child request budget exhausted; parent budget remains available.");
       }
-      if (
-        used === config.maxChildTurnRequests - 1 ||
-        state.childRequests === config.maxChildRequests - 1
-      ) {
+      if (used === turnCap - 1 || state.childRequests === config.maxChildRequests - 1) {
         const admitted = await next();
         if (admitted.kind === "reject") return admitted;
         return {
@@ -968,12 +1078,14 @@ export function apply(ctx, options) {
   ctx.on("llm/stream", async function* (options, next) {
     const agent = options.sessionId ? ctx.agents.get(options.sessionId) : undefined;
     if (agent && agent.session.header.parentSession !== undefined) {
-      const state = budget(rootOf(agent)),
-        used = turnRequests.get(agent.session.id) ?? 0;
-      if (state.childRequests >= config.maxChildRequests || used >= config.maxChildTurnRequests)
+      const id = agent.session.id,
+        state = budget(rootOf(agent)),
+        used = turnRequests.get(id) ?? 0,
+        cap = reviewChildren.has(id) ? config.reviewMaxRequests : config.maxChildTurnRequests;
+      if (state.childRequests >= config.maxChildRequests || used >= cap)
         throw new Error("Child model-call budget exhausted, including compaction calls.");
+      turnRequests.set(id, used + 1);
       state.childRequests++;
-      turnRequests.set(agent.session.id, used + 1);
     }
     const started = performance.now();
     let usage;

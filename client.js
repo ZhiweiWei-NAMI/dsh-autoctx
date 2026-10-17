@@ -25,6 +25,10 @@ window.__ModuleLoader__.load({
 			retainTokensHint: "Recent tokens always kept during compaction.",
 			economyGuidance: "Execution economy note",
 			economyGuidanceHint: "Append one note before the root task's first request asking for batched, narrow tool use.",
+			reviewBeforeFinish: "Review before finish",
+			reviewBeforeFinishHint: "Start one independent review child before a root turn that changed files finishes. Requires an API key and a non-single mode.",
+			reviewMaxRequests: "Review request cap",
+			reviewMaxRequestsHint: "Model requests allowed for one review child.",
 			keepRatio: "Keep ratio",
 			keepRatioHint: "Share of a compacted region's tokens kept by budgeted selection (0.1–0.8).",
 			yamlNote: "Routes, strategy and weights stay in the profile's cordis.patch.yml.",
@@ -49,6 +53,8 @@ window.__ModuleLoader__.load({
 			statsContext: "Context",
 			statsCompactions: "Compactions",
 			statsSaved: "saved {n} tokens",
+			statsReviews: "Reviews",
+			statsReviewsLgtm: "LGTM",
 			statsLastRoute: "Last route"
 		};
 		const zh = {
@@ -72,6 +78,10 @@ window.__ModuleLoader__.load({
 			retainTokensHint: "压缩时始终保留的近期 tokens。",
 			economyGuidance: "执行经济提示",
 			economyGuidanceHint: "在根任务首次请求前追加一条提示，要求批量、精准地使用工具。",
+			reviewBeforeFinish: "完成前复核",
+			reviewBeforeFinishHint: "根任务修改文件后、结束本轮前，启动一个独立复核子代理。需配置 API key，且不处于单代理模式。",
+			reviewMaxRequests: "复核请求上限",
+			reviewMaxRequestsHint: "单个复核子代理可用的模型请求次数。",
 			keepRatio: "保留比例",
 			keepRatioHint: "预算选择保留被压缩区域 tokens 的比例（0.1–0.8）。",
 			yamlNote: "路由、策略与权重仍在 profile 的 cordis.patch.yml 里维护。",
@@ -96,13 +106,15 @@ window.__ModuleLoader__.load({
 			statsContext: "上下文",
 			statsCompactions: "压缩次数",
 			statsSaved: "已节省 {n} tokens",
+			statsReviews: "复核",
+			statsReviewsLgtm: "通过",
 			statsLastRoute: "最近路由"
 		};
 		const NS = "plugins.dshAutoctx";
 		const CONFIG_KEY = "dsh-autoctx#dsh-autoctx";
 		const inject = ["slots", "locale"];
-		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "retainTokens", "keepRatio"];
-		const BOOLEAN_FIELDS = ["economyGuidance"];
+		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "retainTokens", "keepRatio", "reviewMaxRequests"];
+		const BOOLEAN_FIELDS = ["economyGuidance", "reviewBeforeFinish"];
 		const booleanField = (field) => ({
 			field,
 			format: (value) => value === true ? "true" : value === false ? "false" : "",
@@ -217,6 +229,7 @@ window.__ModuleLoader__.load({
 					}),
 					field("jevModel"), field("maxDecisions"),
 					section("sectionSubagents"), field("maxChildren"), field("maxConcurrent"),
+					field("reviewBeforeFinish"), field("reviewMaxRequests"),
 					section("sectionContext"), field("pressureTokens"), field("retainTokens"),
 					field("keepRatio"), field("economyGuidance"),
 					jsx("div", { className: "dac-hint", children: t("yamlNote") })
@@ -333,6 +346,10 @@ window.__ModuleLoader__.load({
 								stats.compactions,
 								stats.tokensSaved > 0 ? " · " + t("statsSaved", { n: "~" + compact(stats.tokensSaved) }) : null
 							] }),
+							stats.reviews > 0 ? jsxs(react.Fragment, { children: [
+								jsx("span", { className: "dac-key", children: t("statsReviews") }),
+								jsx("span", { children: stats.reviews + " · " + stats.reviewsLgtm + " " + t("statsReviewsLgtm") })
+							] }) : null,
 							stats.lastDecision ? jsxs(react.Fragment, { children: [
 								jsx("span", { className: "dac-key", children: t("statsLastRoute") }),
 								jsx("span", { children: stats.lastDecision })
