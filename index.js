@@ -300,6 +300,7 @@ export function apply(ctx, options) {
     reports = new Map(),
     reportingChildren = new Set();
   const currentTurn = new Map(),
+    turnStartSteps = new Map(),
     changedTurn = new Map(),
     reviewedTurn = new Map(),
     reviewChildren = new Set();
@@ -838,8 +839,13 @@ export function apply(ctx, options) {
   }
 
   async function independentReview(agent, turn, signal) {
-    const id = agent.session.id;
-    if (reviewedTurn.get(id) === turn || changedTurn.get(id) !== turn) return;
+    const id = agent.session.id,
+      start = turnStartSteps.get(id),
+      changed =
+        changedTurn.get(id) === turn ||
+        (start?.turn === turn && Object.values(graphFor(id).files).some((file) =>
+          file.edits.some((edit) => edit.via === undefined && edit.step > start.step)));
+    if (reviewedTurn.get(id) === turn || !changed) return;
     if (!rootHasChildSlot(id)) return;
     // Marked before starting, so a failed review never repeats within the turn.
     reviewedTurn.set(id, turn);
@@ -1388,6 +1394,8 @@ export function apply(ctx, options) {
     currentTurn.set(id, payload.turn);
     await restoreGraph(id);
     graphFor(id);
+    if (!isChild && turnStartSteps.get(id)?.turn !== payload.turn)
+      turnStartSteps.set(id, { turn: payload.turn, step: graphStep(id) });
     if (messages.some((m) => ["user", "agent-message", "subagent-settled"].includes(m.source.kind)))
       declinedDelegation.delete(id);
     if (isChild && turnIds.get(id) !== payload.turn) {

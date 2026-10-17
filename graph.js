@@ -159,27 +159,42 @@ export function observe(graph, step, call, result) {
 }
 
 function withoutHeredocs(command) {
-  const lines = [], pending = [];
+  const lines = [], pending = [], heredocs = [];
+  let offset = 0;
   for (const line of command.split("\n")) {
     if (pending.length) {
-      const { delimiter, tabs } = pending[0];
+      const { delimiter, tabs, body } = pending[0];
       if ((tabs ? line.replace(/^\t+/, "") : line) === delimiter) pending.shift();
+      else body.push(line);
       continue;
     }
     lines.push(line.replace(/'[^']*'|"(?:\\.|[^"\\])*"|\\.|<<(-?)[ \t]*(?:'([^']+)'|"([^"]+)"|([^\s;&|<>]+))/g,
-      (match, tabs, single, double, bare) => {
+      (match, tabs, single, double, bare, index) => {
         if (tabs === undefined) return match;
-        pending.push({ delimiter: single ?? double ?? bare, tabs: !!tabs });
-        return "";
+        const entry = { at: offset + index, delimiter: single ?? double ?? bare, tabs: !!tabs, body: [] };
+        pending.push(entry);
+        heredocs.push(entry);
+        return " ".repeat(match.length);
       }));
+    offset += line.length + 1;
   }
-  return lines.join("\n");
+  return { command: lines.join("\n"), heredocs };
 }
 
 function segments(command) {
-  command = withoutHeredocs(command);
+  const parsed = withoutHeredocs(command);
+  command = parsed.command;
   const out = [];
   let start = 0, quote = null, piped = false;
+  function append(end) {
+    const segment = command.slice(start, end).trim();
+    if (!piped && segment) out.push({
+      command: segment,
+      // Only the last input heredoc on this command supplies its script.
+      heredoc: parsed.heredocs.filter((entry) => entry.at >= start && entry.at < end)
+        .at(-1)?.body.join("\n") ?? "",
+    });
+  }
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     if (ch === "\\" && quote !== "'") { i++; continue; }
@@ -187,14 +202,14 @@ function segments(command) {
       if (ch === quote) quote = null;
     } else if (ch === "'" || ch === '"') quote = ch;
     else if (ch === "\n" || ch === ";" || ch === "|" || (ch === "&" && command[i + 1] === "&")) {
-      if (!piped) out.push(command.slice(start, i).trim());
+      append(i);
       piped = ch === "|" && command[i + 1] !== "|";
       if (command[i + 1] === ch) i++;
       start = i + 1;
     }
   }
-  if (!piped) out.push(command.slice(start).trim());
-  return out.filter(Boolean);
+  append(command.length);
+  return out;
 }
 
 function tokenize(segment) {
@@ -235,14 +250,18 @@ function redirects(segment) {
 function writePaths(tokens) {
   const head = base(tokens[0]);
   if (head === "tee") return tokens.slice(1).filter((token) => token && !token.startsWith("-"));
-  if (head !== "sed" || !tokens.some((token) => /^-i|^--in-place/.test(token))) return [];
+  const perl = head === "perl";
+  if (perl ? !tokens.some((token) => /^-[a-zA-Z]*i/.test(token)) :
+    head !== "sed" || !tokens.some((token) => /^-i|^--in-place/.test(token))) return [];
+  const scriptFlags = perl ? ["-e", "-E"] : ["-e", "-f", "--expression", "--file"];
+  const inlineScript = perl ? /^-[eE]./ : /^(?:-[ef].|--(?:expression|file)=)/;
   const paths = [];
   let script = false, options = true;
   for (let i = 1; i < tokens.length; i++) {
     const token = tokens[i];
     if (options && token === "--") { options = false; continue; }
-    if (options && ["-e", "-f", "--expression", "--file"].includes(token)) { script = true; i++; continue; }
-    if (options && /^(?:-[ef].|--(?:expression|file)=)/.test(token)) { script = true; continue; }
+    if (options && scriptFlags.includes(token)) { script = true; i++; continue; }
+    if (options && inlineScript.test(token)) { script = true; continue; }
     if (options && token.startsWith("-")) continue;
     if (!script) script = true;
     else if (token) paths.push(token);
@@ -250,17 +269,59 @@ function writePaths(tokens) {
   return paths;
 }
 
+const PYTHON_WRITE = /\.write_(?:text|bytes)\s*\(|shutil\.(?:copy|copy2|copyfile|move)\s*\(|os\.replace\s*\(/;
+// A python script that writes files names its targets as path-like string literals.
+function pythonWrites(script) {
+  if (typeof script !== "string") return [];
+  let writes = PYTHON_WRITE.test(script);
+  for (const open of script.matchAll(/\bopen\s*\(/g)) {
+    if (writes) break;
+    const args = script.slice(open.index + open[0].length);
+    let depth = 1, argument = 0;
+    for (const token of args.matchAll(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|[(),]/g)) {
+      const value = token[0];
+      if (value === "(") depth++;
+      else if (value === ")") { if (--depth === 0) break; }
+      else if (value === "," && depth === 1) argument++;
+      else if (depth === 1 && /^(['"])[wa][btx+]*\1$/.test(value) &&
+        (argument === 1 || /\bmode\s*=\s*$/.test(args.slice(0, token.index)))) {
+        writes = true;
+        break;
+      }
+    }
+  }
+  if (!writes) return [];
+  return [...script.matchAll(/'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"/g)]
+    .map((match) => match[0].slice(1, -1))
+    .filter((literal) => literal.includes("/") || /\.[A-Za-z0-9]+$/.test(literal));
+}
+
+function pythonScript(tokens, heredoc) {
+  if (!/^python[0-9.]*$/.test(base(tokens[0]))) return undefined;
+  // -c keeps its program inline; otherwise stdin is the heredoc body.
+  const inline = tokens.indexOf("-c");
+  return inline >= 0 ? tokens[inline + 1] : heredoc;
+}
+
+function patchWritePaths(tokens) {
+  const head = base(tokens[0]);
+  if (head === "patch" && tokens.some((token) => /^-p\d*$/.test(token))) return ["(patch)"];
+  if (head === "git" && tokens[1] === "apply") return ["(patch)"];
+  return [];
+}
+
 function classifyBash(graph, observation, command, text, failed) {
-  const parsed = segments(command).map(redirects);
+  const parsed = segments(command).map((entry) => ({ ...entry, ...redirects(entry.command) }));
   const testCount = parsed.filter((entry) => isTestCommand(tokenize(entry.command))).length;
   const summaries = (typeof text === "string" ? text : "").split(/[\r\n]+/)
     .filter((line) => /\b(?:\d+[ \t]+(?:passed|failed|errors?|failures?)|no tests ran|Interrupted)\b/i.test(line));
   let testIndex = 0;
-  for (const { command: segment, paths } of parsed) {
+  for (const { command: segment, paths, heredoc } of parsed) {
     const tokens = tokenize(segment);
     const head = base(tokens[0]);
     if (head === "cd") continue;
-    const writes = [...paths, ...writePaths(tokens)];
+    const script = pythonScript(tokens, heredoc);
+    const writes = [...paths, ...writePaths(tokens), ...patchWritePaths(tokens), ...pythonWrites(script)];
     if (!failed) for (const path of writes) {
       if (!/^\/(?:tmp|dev)(?:\/|$)/.test(path)) addEdit(graph, path, { ...observation });
     }

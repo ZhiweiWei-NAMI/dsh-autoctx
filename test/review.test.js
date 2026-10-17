@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { apply } from "../index.js";
+import { createGraph, observe, editsAfter } from "../graph.js";
 import { newStats, applyStatsRecord } from "../stats.js";
 
 function childSession(id) {
@@ -201,6 +202,65 @@ test("a root turn that changed a file gets one review, and the report is steered
   await app.preStep(2);
   await app.stop(2);
   assert.equal(app.started, 1);
+});
+
+test("bash records python, perl and patch writes", () => {
+  const graph = createGraph();
+  const command = `cd /testbed && python - <<'EOF'
+p='src/_pytest/setuponly.py'
+s=open(p).read()
+s=s.replace("old", "new")
+open(p,'w').write(s)
+EOF
+cat >> testing/test_setuponly.py <<'EOF'
+def test_missing():
+    assert True
+EOF
+python -c "open('src/c.py','a').write('x')"
+perl -pi -e 's/a/b/' src/d.py
+git apply fix.patch
+patch -p1 < fix.patch`;
+  observe(graph, 1, { name: "bash", arguments: { command } }, { isError: false });
+  assert.deepEqual(editsAfter(graph, 0).map(({ path }) => path), [
+    "src/_pytest/setuponly.py", "testing/test_setuponly.py", "src/c.py", "src/d.py", "(patch)",
+  ]);
+  assert.deepEqual(graph.tests, {});
+  assert.deepEqual(graph.commands, []);
+});
+
+test("read-only python scripts do not count as edits", () => {
+  const graph = createGraph();
+  const command = `python - <<'EOF'
+p='src/_pytest/setuponly.py'
+print(open(p).read())
+EOF`;
+  observe(graph, 1, { name: "bash", arguments: { command } }, { isError: false });
+  observe(graph, 2, { name: "bash", arguments: { command: "python -c \"print(open('/tmp/x.py').read())\"" } }, { isError: false });
+  assert.deepEqual(editsAfter(graph, 0), []);
+  assert.deepEqual(graph.files, {});
+});
+
+test("a turn changed only by a bash write still gets one review", async (t) => {
+  const records = recordAll(t);
+  const app = reviewComposition({ recordFile: "review.jsonl" });
+  await app.preStep(1);
+  app.edit(app.root, "bash", {
+    command: "cat > src/widget.js <<'EOF'\nexport const widget = 1;\nEOF",
+  });
+  const pending = app.stop(1);
+  assert.equal(app.started, 1);
+  assert.deepEqual(records.filter((r) => r.kind === "review_start").length, 1);
+  app.settle();
+  await pending;
+});
+
+test("a read-only bash turn does not start a review", async (t) => {
+  recordAll(t);
+  const app = reviewComposition({ recordFile: "review.jsonl" });
+  await app.preStep(1);
+  app.edit(app.root, "bash", { command: "cat src/widget.js" });
+  await app.stop(1);
+  assert.equal(app.started, 0);
 });
 
 test("read-only turns, children and disabled reviews never start a review", async (t) => {
