@@ -196,6 +196,8 @@ export const Config = z.object({
   recordFile: z.string(),
 });
 const delegation = new Set(["subagent", "subagent_fork"]);
+// The plugin's own one-shot helpers count toward concurrency and requests, not child slots.
+const HELPER_LABELS = new Set(["Independent review", "Advisor"]);
 // Tools whose successful result means the turn changed files on disk.
 const fileChanging = new Set(["edit", "write", "apply_patch", "multi_edit"]);
 const REVIEW_PROMPT =
@@ -303,7 +305,8 @@ export function apply(ctx, options) {
     turnStartSteps = new Map(),
     changedTurn = new Map(),
     reviewedTurn = new Map(),
-    reviewChildren = new Set();
+    reviewChildren = new Set(),
+    reviewPending = new Set();
   // One evidence graph per live session, restored from storage on the first request.
   const graphs = new Map(),
     graphSteps = new Map(),
@@ -363,7 +366,13 @@ export function apply(ctx, options) {
   const rootOf = (agent) => agent.session.header.parentSession ?? agent.session.id;
   const budget = (id) => {
     if (!budgets.has(id))
-      budgets.set(id, { children: new Set(), pending: new Set(), childRequests: 0, decisions: 0 });
+      budgets.set(id, {
+        children: new Set(),
+        helpers: new Set(),
+        pending: new Set(),
+        childRequests: 0,
+        decisions: 0,
+      });
     return budgets.get(id);
   };
   const record = (value) => {
@@ -718,10 +727,12 @@ export function apply(ctx, options) {
     const child = ctx.agents.get(info.id);
     if (!child) throw new Error("Auto requires native in-process children.");
     const parent = rootOf(child),
-      state = budget(parent);
-    state.children.add(info.id);
+      state = budget(parent),
+      advisor = advisorPending.has(parent);
+    if (advisor || reviewPending.has(parent)) state.helpers.add(info.id);
+    else state.children.add(info.id);
     active.set(info.id, { parent, runId: info.runId });
-    if (advisorPending.has(parent)) advisorChildren.add(info.id);
+    if (advisor) advisorChildren.add(info.id);
     const assignment = assignments.get(info.id);
     if (assignment?.callId) state.pending.delete(assignment.callId);
     record({
@@ -766,7 +777,7 @@ export function apply(ctx, options) {
     });
   }
 
-  // Reviews share the task's child slots and request budget.
+  // Helpers share the task's concurrency and request budgets.
   function rootHasChildSlot(id) {
     const state = budget(id);
     const running = [...active.values()].filter((x) => x.parent === id).length;
@@ -872,6 +883,7 @@ export function apply(ctx, options) {
           "\n\nOriginal issue:\n" + tasks.get(id) +
           "\n\nParent evidence ledger:\n" + digest(rootGraph(agent), 3000)
         : REVIEW_PROMPT + "\n\nOriginal issue:\n" + tasks.get(id);
+      reviewPending.add(id);
       run = await ctx.subagents.start(provider, {
         label: "Independent review",
         parent: agent,
@@ -881,6 +893,7 @@ export function apply(ctx, options) {
         maxDepth: 1,
         signal,
       });
+      reviewPending.delete(id);
       reviewChildren.add(run.id);
       childLabels.set(run.id, "Independent review");
       let outcome;
@@ -915,6 +928,7 @@ export function apply(ctx, options) {
       signal.throwIfAborted();
       record({ kind: "review_failed", session: id, turn, childId: run?.id, error: String(error) });
     } finally {
+      if (!run) reviewPending.delete(id);
       if (run) reviewChildren.delete(run.id);
     }
   }
@@ -953,7 +967,12 @@ export function apply(ctx, options) {
             : {}),
         };
       });
-    for (const child of knownChildren) resources.children.add(child.id);
+    for (const child of knownChildren) {
+      if (HELPER_LABELS.has(child.label)) {
+        resources.children.delete(child.id);
+        resources.helpers.add(child.id);
+      } else resources.children.add(child.id);
+    }
     const usedChildren =
       resources.children.size +
       resources.pending.size -
@@ -1321,6 +1340,7 @@ export function apply(ctx, options) {
         maxDepth: 1,
         signal,
       });
+      advisorPending.delete(id);
       advisorChildren.add(run.id);
       childLabels.set(run.id, "Advisor");
       let outcome;
@@ -1345,7 +1365,7 @@ export function apply(ctx, options) {
       record({ kind: "advisor_failed", session: id, trigger, model: model.id, error: String(error) });
       return undefined;
     } finally {
-      advisorPending.delete(id);
+      if (!run) advisorPending.delete(id);
       if (run) advisorChildren.delete(run.id);
     }
   }
@@ -1445,7 +1465,10 @@ export function apply(ctx, options) {
           resources = budget(id);
         for (const child of children)
           if (child.kind === "child") {
-            resources.children.add(child.id);
+            if (HELPER_LABELS.has(child.label)) {
+              resources.children.delete(child.id);
+              resources.helpers.add(child.id);
+            } else resources.children.add(child.id);
             if (typeof child.label === "string" && child.label) childLabels.set(child.id, child.label);
           }
       }

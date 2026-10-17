@@ -110,7 +110,10 @@ function collab(options = {}) {
     return { id: child.id, result, dispose: async () => (child.disposed = true) };
   }
   const ctx = {
-    tools: { guard() {}, get: () => ({ parameters: { type: "object" } }) },
+    tools: {
+      guard: (fn) => handlers.set("tools/guard", fn),
+      get: () => ({ parameters: { type: "object" } }),
+    },
     on(name, fn) {
       handlers.set(name, fn);
     },
@@ -140,7 +143,15 @@ function collab(options = {}) {
       listChildren: async () => children,
       getProvider: () => ({}),
       start: startChild,
-      startContinuable: async () => {},
+      startContinuable: async ({ childId, provider, label, request }) => {
+        started++;
+        children.push({
+          id: childId, kind: "child", mode: "continuable", provider, label,
+          prompt: request.prompt[0].text,
+        });
+        agents.set(childId, { session: childSession(childId, request.parent.session.id), steer() {} });
+        handlers.get("subagent/start")({ id: childId, runId: childId + "-run" });
+      },
     },
   };
   apply(ctx, config);
@@ -389,6 +400,118 @@ test("advisor respects the consult cap and failure records advice_failed", async
   assert.equal(admitted.kind, "continue");
   assert.equal(records.filter((record) => record.kind === "advisor_failed").length, 1);
   assert.match(records.find((record) => record.kind === "advisor_failed").error, /provider refused/);
+});
+
+test("advisor consults do not use up the review child slot", async (t) => {
+  recordAll(t);
+  const app = collab({
+    advisorModel: "deepseek-v4.1-flash",
+    advisorStallSteps: 3,
+    reviewBeforeFinish: true,
+    maxChildren: 2,
+  });
+  await app.preStep(app.root, [userMessage("Fix the widget.")]);
+  const fail = (command) => app.handlers.get("tools/result")(
+    { name: "bash", agent: app.root, arguments: { command } },
+    { isError: true, content: [{ type: "text", text: "1 failed" }] },
+  );
+  fail("npm test");
+  app.edit(app.root, "src/a.js");
+  fail("npm test");
+  fail("pytest");
+  app.edit(app.root, "src/a.js");
+  fail("pytest");
+  await app.preStep(app.root, []);
+  await app.preStep(app.root, []);
+  assert.equal(app.children.filter((child) => child.label === "Advisor").length, 2);
+  app.edit(app.root, "src/a.js");
+  const pending = app.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(app.children.some((child) => child.label === "Independent review"));
+  app.settle();
+  await pending;
+  assert.equal(app.steered.length, 1);
+});
+
+test("helpers from a resumed listing do not consume delegation slots", async (t) => {
+  const records = recordAll(t);
+  const states = [];
+  t.mock.method(globalThis, "fetch", async (url, { body }) => {
+    const request = JSON.parse(body);
+    states.push(JSON.parse(request.state));
+    return {
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          model: "jev",
+          answers: {
+            independent: { type: "noul", noul: 0.95 },
+            useful: { type: "score", score: 2, confidence: 0.9 },
+            fit_0: { type: "score", score: 1.8, confidence: 0.8 },
+          },
+        }),
+    };
+  });
+  const app = collab({ maxChildren: 2 });
+  app.children.push(
+    { id: "old-advisor", kind: "child", mode: "one-shot", label: "Advisor" },
+    { id: "old-review", kind: "child", mode: "one-shot", label: "Independent review" },
+  );
+  await app.preStep(app.root, [userMessage("Fix the widget.")]);
+  const exec = {
+    name: "subagent",
+    arguments: { prompt: "Inspect A", description: "Inspect A" },
+    callId: "call-1",
+    agent: app.root,
+    signal: new AbortController().signal,
+  };
+  assert.equal(app.handlers.get("tools/guard")(exec), undefined);
+  const result = await app.handlers.get("tools/execute")(
+    exec,
+    () => {
+      throw new Error("unexpected native dispatch");
+    },
+  );
+  assert.equal(result.isError, false);
+  assert.equal(result.value.kind, "continuable");
+  assert.equal(app.started, 1);
+  const child = app.children.find((child) => child.id === result.value.subagentId);
+  assert.equal(child.mode, "continuable");
+  assert.equal(child.label, "Inspect A");
+  assert.match(child.prompt, /Your assigned subtask:\nInspect A/);
+  assert.ok(records.some((record) => record.kind === "child_start" && record.id === child.id));
+  assert.equal(states.length, 1);
+  assert.equal(states[0].observation.childrenRemaining, 2);
+});
+
+test("maxConcurrent still counts a running helper", async (t) => {
+  recordAll(t);
+  const app = collab({
+    advisorModel: "deepseek-v4.1-flash",
+    advisorStallSteps: 3,
+    reviewBeforeFinish: true,
+    maxConcurrent: 1,
+    maxChildren: 2,
+  });
+  await app.preStep(app.root, [userMessage("Fix the widget.")]);
+  app.edit(app.root, "src/a.js");
+  const pending = app.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(app.children.some((child) => child.label === "Independent review"));
+  const fail = () => app.handlers.get("tools/result")(
+    { name: "bash", agent: app.root, arguments: { command: "npm test" } },
+    { isError: true, content: [{ type: "text", text: "1 failed" }] },
+  );
+  fail();
+  app.edit(app.root, "src/a.js");
+  fail();
+  for (let i = 0; i < 2; i++) await app.preStep(app.root, []);
+  assert.equal(app.children.filter((child) => child.label === "Advisor").length, 0);
+  app.settle();
+  await pending;
+  await app.preStep(app.root, []);
+  assert.equal(app.children.filter((child) => child.label === "Advisor").length, 1);
 });
 
 test("a configured cross-model reviewer uses spawn, agentOptions and the ledger", async (t) => {
