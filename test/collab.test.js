@@ -345,6 +345,8 @@ test("repeated failure uses own event order and resets the stall baseline", asyn
   app.edit();
   fail();
   fail();
+  app.edit();
+  fail();
   const child = { session: childSession("other") };
   app.agents.set("other", child);
   app.handlers.get("subagent/start")({ id: "other", runId: "other-1" });
@@ -437,6 +439,7 @@ test("advisor consults do not use up the review child slot", async (t) => {
     advisorStallSteps: 3,
     reviewBeforeFinish: true,
     maxChildren: 2,
+    advisorMaxConsults: 2,
   });
   await app.preStep(app.root, [userMessage("Fix the widget.")]);
   const fail = (command) => app.handlers.get("tools/result")(
@@ -446,6 +449,10 @@ test("advisor consults do not use up the review child slot", async (t) => {
   fail("npm test");
   app.edit(app.root, "src/a.js");
   fail("npm test");
+  app.edit(app.root, "src/a.js");
+  fail("npm test");
+  fail("pytest");
+  app.edit(app.root, "src/a.js");
   fail("pytest");
   app.edit(app.root, "src/a.js");
   fail("pytest");
@@ -531,6 +538,8 @@ test("maxConcurrent still counts a running helper", async (t) => {
     { name: "bash", agent: app.root, arguments: { command: "npm test" } },
     { isError: true, content: [{ type: "text", text: "1 failed" }] },
   );
+  fail();
+  app.edit(app.root, "src/a.js");
   fail();
   app.edit(app.root, "src/a.js");
   fail();
@@ -659,4 +668,19 @@ test("stats count advisor, sync, ledger and model-choice records", () => {
   assert.equal(stats.syncNotes, 1);
   assert.equal(stats.ledgerNotes, 1);
   assert.equal(stats.modelChoices, 1);
+});
+
+test("one failed fix attempt does not consult the advisor", async (t) => {
+  const records = recordAll(t);
+  const app = collab({ advisorModel: "deepseek-v4.1-flash", advisorStallSteps: 50 });
+  await app.preStep(app.root, [userMessage("Fix the widget.")]);
+  const fail = () => app.handlers.get("tools/result")(
+    { name: "bash", agent: app.root, arguments: { command: "npm test" } },
+    { isError: true, content: [{ type: "text", text: "1 failed" }] },
+  );
+  fail();
+  app.edit(app.root, "src/a.js");
+  fail();
+  await app.preStep(app.root, []);
+  assert.equal(records.filter((record) => record.kind === "advisor_start").length, 0);
 });

@@ -101,7 +101,7 @@ export const Config = z.object({
     .number()
     .step(1)
     .min(0)
-    .default(2)
+    .default(1)
     .volatile()
     .description("Advisor consultations per root task"),
   advisorStallSteps: z
@@ -317,6 +317,7 @@ export function apply(ctx, options) {
     advisorState = new Map(),
     advisorChildren = new Set(),
     advisorPending = new Set(),
+    chosenModels = new Map(),
     modelKnowledge = new Map(),
     availableByRoot = new Map(),
     providersByRoot = new Map();
@@ -796,6 +797,7 @@ export function apply(ctx, options) {
     const available = await ensureAvailable(agent, signal);
     const found = (id) => available.find((entry) => entry.id === id);
     const finish = (model, via) => {
+      if (model && setting === "auto") chosenModels.set(root + "\u0000" + role, model.id);
       record({
         kind: "model_choice",
         session: root,
@@ -813,6 +815,9 @@ export function apply(ctx, options) {
       }
       return finish(entry, "config");
     }
+    // One Jev choice per role per root task: the catalog and the task do not change between consults.
+    const memo = chosenModels.get(root + "\u0000" + role);
+    if (setting === "auto" && memo && found(memo)) return found(memo);
     if (setting === "auto" && budget(root).decisions < config.maxDecisions) {
       const candidates = available
         .filter((entry) => entry.roles.includes(role))
@@ -1277,14 +1282,15 @@ export function apply(ctx, options) {
       const failing = runs.slice(0, -1).filter(
         (run) => run.outcome === "fail" || run.outcome === "error",
       );
-      if (!failing.length) continue;
-      if (
-        Object.values(graph.files).some((file) =>
-          file.edits.some((edit) => edit.via === undefined && edit.event < latest.event &&
-            failing.some((run) => run.event < edit.event)),
-        )
-      )
-        return key;
+      // Advice is worth a call only after the agent's own fix attempts keep failing:
+      // at least two earlier failures, each followed by an edit before the next run.
+      const edits = Object.values(graph.files).flatMap((file) =>
+        file.edits.filter((edit) => edit.via === undefined).map((edit) => edit.event));
+      const attempts = failing.filter((run, i) => {
+        const next = (failing[i + 1] ?? latest).event;
+        return edits.some((event) => event > run.event && event < next);
+      });
+      if (attempts.length >= 2) return key;
     }
     return undefined;
   };
