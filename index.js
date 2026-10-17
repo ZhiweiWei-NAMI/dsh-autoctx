@@ -150,7 +150,7 @@ export const Config = z.object({
     .number()
     .step(1)
     .min(1)
-    .default(10)
+    .default(6)
     .volatile()
     .description("Model requests allowed for one review child"),
   maxDecisions: z
@@ -201,7 +201,7 @@ const HELPER_LABELS = new Set(["Independent review", "Advisor"]);
 // Tools whose successful result means the turn changed files on disk.
 const fileChanging = new Set(["edit", "write", "apply_patch", "multi_edit"]);
 const REVIEW_PROMPT =
-  "Independently check the change the parent just made against the original issue. Inspect `git diff`, re-read the issue, run a minimal reproduction and the most relevant existing tests. Do NOT edit files. Start the first line with exactly `LGTM` (then the evidence) or `DEFECTS` (then each concrete defect with evidence).";
+  "Independently check the change the parent just made against the original issue. Inspect `git diff`, re-read the issue, run a minimal reproduction and the single most relevant existing test file. Never run the whole test suite; keep every command under 60 seconds; batch independent checks into one step. Do NOT edit files. Start the first line with exactly `LGTM` (then the evidence) or `DEFECTS` (then each concrete defect with evidence).";
 const reviewMessage = (report) =>
   "Independent review of your change:\n" +
   report +
