@@ -8,6 +8,7 @@ import BasicCompactionEngine from "@deepseek-ai/dsh-compaction-basic";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { validateJsonSchemaValue, ToolArgsError } from "@deepseek-ai/dsh-tools";
 import { toolPairingBalancedBefore, toolPairingBalancedAfter } from "@deepseek-ai/dsh-compaction";
+import { scopeOf } from "@deepseek-ai/dsh-scope";
 import {
   scoreContext,
   budgetedSelection,
@@ -329,6 +330,8 @@ export function apply(ctx, options) {
     effortDue = new Map(),
     effortSupported = new Map(),
     effortStall = new Map(),
+    // agent/request runs with the agent's scoped context as `this`; map it (and its scope key) to the root session.
+    rootByScope = new Map(),
     modelKnowledge = new Map(),
     availableByRoot = new Map(),
     providersByRoot = new Map();
@@ -814,7 +817,9 @@ export function apply(ctx, options) {
   // Effort is a request parameter, not prompt text, so raising it for one step keeps the cached prefix.
   function wantEffort(agent, reason) {
     if (!config.adaptiveEffort || config.adaptiveEffort === "off") return;
-    if (agent.session.header.parentSession !== undefined || modeOf(agent) !== "auto") return;
+    if (agent.session.header.parentSession !== undefined) return;
+    // The first turn's trigger fires before the root is initialized; use the configured mode then.
+    if ((roots.has(agent.session.id) ? modeOf(agent) : config.apiKey ? config.mode : "native") !== "auto") return;
     if (!effortDue.has(agent.session.id)) effortDue.set(agent.session.id, reason);
   }
 
@@ -1468,6 +1473,11 @@ export function apply(ctx, options) {
       turnStartSteps.set(id, { turn: payload.turn, step: graphStep(id) });
       wantEffort(agent, "turn_start");
     }
+    if (!isChild && agent.ctx) {
+      rootByScope.set(agent.ctx, id);
+      const scope = scopeOf(agent.ctx);
+      if (scope !== undefined) rootByScope.set(scope, id);
+    }
     if (!isChild) {
       const key = progressKey(graphFor(id)),
         stall = effortStall.get(id);
@@ -1604,9 +1614,13 @@ export function apply(ctx, options) {
   // configured an effort for this agent.
   ctx.on("agent/request", async function (payload, next) {
     const resolved = await next();
-    const agent = this,
-      id = agent?.session?.id;
-    if (!id || agent.session.header.parentSession !== undefined || effortSupported.get(id) !== true) return resolved;
+    let id = rootByScope.get(this);
+    if (id === undefined && this) {
+      const scope = scopeOf(this);
+      if (scope !== undefined) id = rootByScope.get(scope);
+    }
+    const agent = id === undefined ? undefined : ctx.agents.get(id);
+    if (!agent || effortSupported.get(id) !== true) return resolved;
     if (agent.options?.reasoningEffort !== undefined) return resolved;
     if (effortDue.has(id)) {
       const reason = effortDue.get(id);
