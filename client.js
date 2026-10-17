@@ -6,6 +6,7 @@ window.__ModuleLoader__.load({
 		const ui = require("@deepseek-ai/dsh-client-ui-primitives");
 		const en = {
 			summary: "Auto routing, subagents and context compaction decided by Jev.",
+			pageIntro: "Jev decides who works on a task (reviewer, advisor, workers), when to think and when to compact context; it learns from finished tasks in this workspace. The composer card shows each session's choices, costs and pending weight changes.",
 			title: "Auto context",
 			mode: "Mode",
 			modeHint: "auto asks Jev for every decision; single keeps one agent; native keeps native compaction.",
@@ -145,6 +146,7 @@ window.__ModuleLoader__.load({
 		};
 		const zh = {
 			summary: "自动路由、子代理与上下文压缩均由 Jev 决策。",
+			pageIntro: "由 Jev 决定任务由谁参与（复核、顾问、子任务）、何时思考、何时压缩上下文，并从本工作区已完成的任务中学习。输入框统计卡片会显示每个会话的选择、成本与待确认的权重调整。",
 			title: "Auto 上下文",
 			mode: "模式",
 			modeHint: "auto 每次决策都询问 Jev；single 只用单代理；native 保持原生压缩。",
@@ -284,7 +286,7 @@ window.__ModuleLoader__.load({
 		};
 		const NS = "plugins.dshAutoctx";
 		const CONFIG_KEY = "dsh-autoctx#dsh-autoctx";
-		const inject = ["slots", "locale"];
+		const inject = ["slots", "locale", "configForms"];
 		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "ceilingRatio", "retainTokens", "keepRatio", "reviewMaxRequests", "advisorMaxConsults", "advisorStallSteps"];
 		// Enumerated fields render as segmented controls.
 		const SEGMENTED = { mode: ["auto", "single", "native"], learning: ["auto", "manual", "frozen"], contextSelection: ["jev", "summary"] };
@@ -323,6 +325,15 @@ window.__ModuleLoader__.load({
 			...NUMERIC_FIELDS.map((name) => ui.settingsNumberField(name)),
 			...BOOLEAN_FIELDS.map(booleanField)
 		].map((spec) => [spec.field, spec]));
+		// Its own entry in the settings navigation: the same form, bound to the plugin's config entry.
+		function AutoSettingsSection({ t, form }) {
+			const snapshot = react.useSyncExternalStore((listener) => form.subscribe(listener), () => form.getSnapshot());
+			return jsxs("div", { className: "dac-page", children: [
+				jsx("h2", { className: "dac-pageTitle", children: "DSH AutoCTX" }),
+				jsx("p", { className: "dac-pageIntro", children: t("pageIntro") }),
+				jsx(AutoConfigForm, { t, form: { state: snapshot, mutate: (ops, revision) => form.mutate(ops, revision) } })
+			] });
+		}
 		function AutoConfigCard({ t, view, form }) {
 			if (view === "summary") return t("summary");
 			return jsx(AutoConfigForm, { t, form });
@@ -478,6 +489,10 @@ window.__ModuleLoader__.load({
 .dac-segItem[aria-checked=true]{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);box-shadow:0 1px 2px rgba(0,0,0,.08),0 0 0 .5px var(--dsw-alias-border-l3);font-weight:500}
 .dac-segItem:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-alias-state-business-primary);outline-offset:1px}
 .dac-hint{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.dac-page{box-sizing:border-box;height:100%;overflow:auto;padding:28px clamp(24px,4vw,48px) 48px;color:var(--dsw-alias-label-primary)}
+.dac-page>*{max-width:720px}
+.dac-pageTitle{margin:0;font-size:20px;font-weight:500;line-height:28px}
+.dac-pageIntro{margin:4px 0 20px;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}
 .dac-dot{position:absolute;top:-3px;right:-3px;width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-state-warn-primary);box-shadow:0 0 0 1.5px var(--dsw-alias-bg-layer-1)}
 .dac-dotInline{position:static;display:inline-block;box-shadow:none}
 .dac-val{min-width:0;overflow-wrap:anywhere}
@@ -785,6 +800,17 @@ window.__ModuleLoader__.load({
 				document.head.append(style);
 				return () => style.remove();
 			}, "dsh-autoctx: styles");
+			// The Host serves the plugin's config under its entry key; the bare entry id is accepted too.
+			ctx.effect(() => ctx.configForms.whileServed([CONFIG_KEY, "dsh-autoctx"], (served) => {
+				const form = ctx.configForms.get(served.has(CONFIG_KEY) ? CONFIG_KEY : "dsh-autoctx");
+				return ctx.slots.inject("settings.section", () => ctx.slots.register({
+					name: "settings.section",
+					id: "dsh-autoctx",
+					order: 60,
+					label: () => "DSH AutoCTX",
+					locale: NS
+				}, (props) => jsx(AutoSettingsSection, { ...props, form })));
+			}), "dsh-autoctx: settings section");
 			ctx.effect(() => ctx.slots.inject("plugins.row.config", () => ctx.slots.register({
 				name: "plugins.row.config",
 				key: CONFIG_KEY,
