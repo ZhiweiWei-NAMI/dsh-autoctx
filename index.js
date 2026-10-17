@@ -1599,21 +1599,27 @@ export function apply(ctx, options) {
     graphSteps.set(id, graphStep(id) + 1);
     return appendNotes(agent, admitted, { advisor, finalRequest });
   });
+  // Per-step executor effort through dsh's own request-config waterfall (as native model selection does).
+  // A raised effort persists in the request header, so a non-due step strips it again unless the user
+  // configured an effort for this agent.
+  ctx.on("agent/request", async function (payload, next) {
+    const resolved = await next();
+    const agent = this,
+      id = agent?.session?.id;
+    if (!id || agent.session.header.parentSession !== undefined || effortSupported.get(id) !== true) return resolved;
+    if (agent.options?.reasoningEffort !== undefined) return resolved;
+    if (effortDue.has(id)) {
+      const reason = effortDue.get(id);
+      effortDue.delete(id);
+      record({ kind: "effort_raised", session: id, effort: config.adaptiveEffort, reason, step: payload.step });
+      return { ...resolved, reasoningEffort: config.adaptiveEffort };
+    }
+    if (resolved.reasoningEffort === undefined) return resolved;
+    const { reasoningEffort: _raised, ...withoutEffort } = resolved;
+    return withoutEffort;
+  });
   ctx.on("llm/stream", async function* (options, next) {
     const agent = options.sessionId ? ctx.agents.get(options.sessionId) : undefined;
-    // dsh hands the adapter this same options object, so the root's due effort applies to this request.
-    if (agent && options.purpose === undefined && effortDue.has(agent.session.id) &&
-        options.reasoningEffort === undefined && effortSupported.get(rootOf(agent)) === true) {
-      const reason = effortDue.get(agent.session.id);
-      effortDue.delete(agent.session.id);
-      try {
-        options.reasoningEffort = config.adaptiveEffort;
-        record({ kind: "effort_raised", session: agent.session.id, effort: config.adaptiveEffort, reason });
-      } catch (error) {
-        effortSupported.set(rootOf(agent), false);
-        record({ kind: "effort_unavailable", session: agent.session.id, error: String(error) });
-      }
-    }
     if (agent && agent.session.header.parentSession !== undefined) {
       const id = agent.session.id,
         state = budget(rootOf(agent)),
