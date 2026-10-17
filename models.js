@@ -28,9 +28,10 @@ export function costUSD(id, usage) {
   if (!entry || !entry.price) return undefined;
   const price = entry.price;
   const used = usage ?? {};
+  if (!Number.isFinite(used.input) || !Number.isFinite(used.output)) return undefined;
   return (
-    (used.input ?? 0) * price.input
-    + (used.output ?? 0) * price.output
+    used.input * price.input
+    + used.output * price.output
     + (used.cacheRead ?? 0) * price.cacheRead
     + (used.cacheWrite ?? 0) * (price.cacheWrite ?? 0)
   ) / 1e6;

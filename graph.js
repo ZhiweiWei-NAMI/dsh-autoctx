@@ -326,7 +326,11 @@ function classifyBash(graph, observation, command, text, failed) {
       if (!/^\/(?:tmp|dev)(?:\/|$)/.test(path)) addEdit(graph, path, { ...observation });
     }
     if (isTestCommand(tokens)) {
-      const summary = summaries.length === testCount ? summaries[testIndex] : summaries.at(-1) ?? text;
+      let summary = summaries[testIndex];
+      // On a count mismatch, only the last test segment gets the last summary.
+      if (summaries.length !== testCount) {
+        summary = testIndex === testCount - 1 ? summaries.at(-1) ?? text : undefined;
+      }
       testIndex++;
       addTest(graph, segment, { ...observation, ...testOutcome(summary) });
       continue;

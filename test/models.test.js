@@ -13,7 +13,7 @@ import {
 test('costUSD prices uncached and cached tokens per 1M',()=>{
   assert.equal(costUSD('deepseek-v4.1-flash',{input:1e6,output:1e6,cacheRead:1e6}),0.753);
   assert.equal(costUSD('claude-haiku-5-5',{input:200000,output:1000,cacheRead:5000,cacheWrite:10000}),0.0218);
-  assert.equal(costUSD('deepseek-v4.1-flash',{}),0);
+  assert.equal(costUSD('deepseek-v4.1-flash',{}),undefined);
   assert.equal(costUSD('no-such-model',{input:1e6}),undefined);
 });
 

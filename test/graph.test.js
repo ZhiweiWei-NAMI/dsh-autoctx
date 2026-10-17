@@ -59,14 +59,14 @@ test("bash assigns ordered summaries to piped test runs", () => {
   assert.deepEqual(graph.commands, []);
 });
 
-test("bash uses the last summary when summary and test counts differ", () => {
+test("bash assigns the last summary only to the last test when counts differ", () => {
   const graph = createGraph();
   const command = "pytest first.py && pytest second.py";
   observe(graph, 1, call("bash", { command }), ok("2 passed in 1s"));
-  assert.deepEqual(Object.values(graph.tests).map(({ runs }) => runs.at(-1).outcome), ["pass", "pass"]);
+  assert.deepEqual(Object.values(graph.tests).map(({ runs }) => runs.at(-1).outcome), ["unknown", "pass"]);
   observe(graph, 2, call("bash", { command }), ok("2 passed in 1s\n1 error in 1s\nInterrupted: 1 error during collection"));
   assert.deepEqual(Object.values(graph.tests).map(({ runs }) => [runs.at(-1).outcome, runs.at(-1).summary]), [
-    ["error", "Interrupted: 1 error during collection"],
+    ["unknown", ""],
     ["error", "Interrupted: 1 error during collection"],
   ]);
 });

@@ -1336,7 +1336,7 @@ export function apply(ctx, options) {
         parent: agent,
         prompt: [{ type: "text", text: prompt }],
         agentOptions: { provider: providerOf(agent, model.id), model: model.id },
-        toolFilter: { deny: ["subagent", "subagent_fork"] },
+        toolFilter: { allow: [] },
         maxDepth: 1,
         signal,
       });

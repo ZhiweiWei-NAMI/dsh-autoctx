@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import BasicCompactionEngine from "@deepseek-ai/dsh-compaction-basic";
 import { apply } from "../index.js";
-import { digest } from "../graph.js";
+import { createGraph, observe, digest } from "../graph.js";
+import { costUSD } from "../models.js";
 import { STATE_BYTES } from "../decisions.js";
 import { newStats, applyStatsRecord } from "../stats.js";
 
@@ -372,13 +373,40 @@ test("the advisor fires once on a stall and passes the chosen model", async (t) 
   const advisor = app.children.find((child) => child.label === "Advisor");
   assert.equal(advisor.provider, "spawn");
   assert.deepEqual(advisor.agentOptions, { provider: "native", model: "deepseek-v4.1-flash" });
-  assert.deepEqual(advisor.toolFilter, { deny: ["subagent", "subagent_fork"] });
+  assert.deepEqual(advisor.toolFilter, { allow: [] });
   assert.equal(advisor.maxDepth, 1);
   assert.equal(records.filter((record) => record.kind === "advisor_start").length, 1);
   assert.equal(
     records.find((record) => record.kind === "advisor_end").chars,
     "Try the import path.".length,
   );
+});
+
+test("mismatched test summaries leave earlier segments unknown", () => {
+  const graph = createGraph();
+  observe(graph, 1, {
+    name: "bash",
+    arguments: { command: "pytest a.py -q && pytest --bad-flag b.py" },
+  }, {
+    isError: true,
+    text: "5 passed\nERROR: usage: pytest [options] unrecognized arguments: --bad-flag",
+  });
+  assert.deepEqual(Object.values(graph.tests).map(({ runs }) => [runs.at(-1).outcome, runs.at(-1).summary]), [
+    ["unknown", ""],
+    ["pass", "5 passed"],
+  ]);
+});
+
+test("cost requires finite input and output counts but defaults absent cache to zero", () => {
+  const model = "deepseek-v4.1-flash";
+  assert.equal(costUSD(model), undefined);
+  assert.equal(costUSD(model, { output: 1e6 }), undefined);
+  assert.equal(costUSD(model, { input: 1e6 }), undefined);
+  assert.equal(costUSD(model, { input: "1e6", output: 1e6 }), undefined);
+  assert.equal(costUSD(model, { input: NaN, output: 1e6 }), undefined);
+  assert.equal(costUSD(model, { input: 1e6, output: Infinity }), undefined);
+  assert.equal(costUSD(model, { input: 1e6, output: 1e6 }), 0.75);
+  assert.equal(costUSD(model, { input: 1e6, output: 1e6, cacheRead: 0, cacheWrite: 0 }), 0.75);
 });
 
 test("advisor respects the consult cap and failure records advice_failed", async (t) => {
