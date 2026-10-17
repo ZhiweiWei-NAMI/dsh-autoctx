@@ -192,6 +192,13 @@ export const Config = z.object({
     .default(false)
     .volatile()
     .description("Append one execution-economy note before the root task's first model request"),
+  contextSelection: z
+    .union(["jev", "summary"])
+    .default("jev")
+    .volatile()
+    .description(
+      "Under pressure, Jev keeps the most relevant units verbatim (jev) or the executor summarizes the region (summary)",
+    ),
   keepRatio: z
     .number()
     .min(0.1)
@@ -1774,6 +1781,10 @@ export function apply(ctx, options) {
     };
     if (retainTokens < baseRetain) {
       await compactRegion("ceiling_reduced_retention");
+      return;
+    }
+    if (config.contextSelection === "summary") {
+      await compactRegion("summary");
       return;
     }
     const units = (items) => {
