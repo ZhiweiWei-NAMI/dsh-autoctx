@@ -115,20 +115,25 @@ def configure_home(home, model, arm, plugin, relay, extra_models, routes, review
         patch.append({'id': 'compaction-basic', 'disabled': False, 'config': {
             'thresholdRatio': COMPACTION_THRESHOLD_RATIO, 'retainTokens': RETAIN_TOKENS,
             'maxTokens': MAX_OUTPUT_TOKENS, 'compactionRetries': 0, 'maxOverflowRetries': 0}})
-    # Arms H and A expose dsh's native per-call model selection over the same pool.
-    heterogeneous = arm in ('A', 'H')
-    if heterogeneous:
-        patch.append({'insert': [{'id': 'subagent-model-selection-settings',
-                                  'name': '@deepseek-ai/dsh-tool-subagent/model-selection-settings',
-                                  'config': {'enabled': True, 'allowedModels': [
-                                      {'provider': routes[m], 'model': m} for m in pool]}}]})
     for pid, provider, tool in [('tool-subagent', 'spawn', 'subagent'),
                                 ('tool-subagent-fork', 'fork', 'subagent_fork')]:
-        config = {'provider': provider, 'toolName': tool, 'backgroundMode': 'one-shot', 'maxDepth': 1,
-                  'agentOptions': {'provider': 'workbuddy', 'model': model, 'maxTokens': MAX_OUTPUT_TOKENS}}
-        if heterogeneous and provider == 'spawn':
-            config['modelSelectionSettings'] = True
-        patch.append({'id': pid, 'disabled': arm == 'B', 'config': config})
+        patch.append({'id': pid, 'disabled': arm == 'B', 'config': {
+            'provider': provider, 'toolName': tool, 'backgroundMode': 'one-shot', 'maxDepth': 1,
+            'agentOptions': {'provider': 'workbuddy', 'model': model, 'maxTokens': MAX_OUTPUT_TOKENS}}})
+    if arm == 'H':
+        # Native heterogeneous scheduling: one dsh subagent tool per (model, effort) of the pool
+        # arm A gives Auto, so the main model chooses the route by tool name.
+        tools = []
+        for m in pool:
+            for effort in (list(EFFORTS) if routes[m] == 'workbuddy' else [None]):
+                name = 'subagent_' + m.replace('-', '_').replace('.', '_') + ('_' + effort if effort else '')
+                options = {'provider': routes[m], 'model': m, 'maxTokens': MAX_OUTPUT_TOKENS}
+                if effort:
+                    options['reasoningEffort'] = effort
+                tools.append({'id': 'tool-' + name.replace('_', '-'), 'name': '@deepseek-ai/dsh-tool-subagent',
+                              'config': {'provider': 'spawn', 'toolName': name, 'backgroundMode': 'one-shot',
+                                         'maxDepth': 1, 'agentOptions': options}})
+        patch.append({'insert': tools})
     (home / 'cordis.patch.yml').write_text(yaml.safe_dump(patch, sort_keys=False))
 
 
