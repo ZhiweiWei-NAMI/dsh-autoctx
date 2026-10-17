@@ -30,9 +30,9 @@ window.__ModuleLoader__.load({
 			reviewMaxRequests: "Review request cap",
 			reviewMaxRequestsHint: "Model requests allowed for one review child.",
 			reviewerModel: "Reviewer model",
-			reviewerModelHint: "same keeps the fork review; auto asks Jev; or a catalog id such as glm-5.3-flash.",
+			reviewerModelHint: "same reviews with the executor's model (fork); auto lets Jev pick among the candidate models from priors, measurements and this workspace's experience; or a catalog id such as glm-5.3-flash.",
 			advisorModel: "Advisor model",
-			advisorModelHint: "off disables advice; auto asks Jev; or a catalog id. One short consultation per trigger.",
+			advisorModelHint: "off disables advice; auto lets Jev pick among the candidate models; or a catalog id. One short consultation per trigger.",
 			allowPaidModels: "Allow paid models",
 			allowPaidModelsHint: "Let roles use models whose dsh provider is a paid route.",
 			advisorMaxConsults: "Advisor consultations",
@@ -52,6 +52,18 @@ window.__ModuleLoader__.load({
 			save: "Save",
 			saving: "Saving…",
 			saveFailed: "The deployment did not accept these values; they were left for you to correct.",
+			learning: "Learning",
+			learningHint: "Default for workspaces without a ledger yet: auto applies Jev's weight proposals and logs them; manual collects them into one card for approval; frozen only records evidence. Switch an existing workspace in the composer card.",
+			adaptiveEffort: "Thinking effort",
+			adaptiveEffortHint: "Effort used when Jev decides a turn needs thinking (low, high or xhigh); it stays for the turn and changes only at a context checkpoint. off never raises it.",
+			contextSelection: "Context compaction",
+			contextSelectionHint: "jev keeps the most relevant evidence verbatim and weighs replacing now against the cache cost; summary lets the executor summarize the region.",
+			jevEndpoint: "Jev endpoint",
+			jevEndpointHint: "Decision API URL; change only for a compatible gateway.",
+			modelRoutes: "Candidate models",
+			modelRoutesHint: "Models Jev may pick for reviewer, advisor and workers, as model=provider separated by commas (e.g. deepseek-v4.1-flash=workbuddy, glm-5.3-flash=workbuddy). The executor's own model is always a candidate.",
+			ceilingRatio: "Pressure ceiling",
+			ceilingRatioHint: "Multiple of the context pressure at which the session must shrink, even if Jev would defer.",
 			sectionJev: "Jev",
 			sectionSubagents: "Subagents",
 			sectionContext: "Context",
@@ -157,9 +169,9 @@ window.__ModuleLoader__.load({
 			reviewMaxRequests: "复核请求上限",
 			reviewMaxRequestsHint: "单个复核子代理可用的模型请求次数。",
 			reviewerModel: "复核模型",
-			reviewerModelHint: "same 使用 fork 复核；auto 询问 Jev；也可填模型目录里的 id（如 glm-5.3-flash）。",
+			reviewerModelHint: "same 用执行模型（fork）复核；auto 由 Jev 结合先验、实测与本工作区经验在候选模型中选择；也可填模型目录里的 id（如 glm-5.3-flash）。",
 			advisorModel: "顾问模型",
-			advisorModelHint: "off 关闭顾问；auto 询问 Jev；也可填模型目录里的 id。每次触发只咨询一次。",
+			advisorModelHint: "off 关闭顾问；auto 由 Jev 在候选模型中选择；也可填模型目录里的 id。每次触发只咨询一次。",
 			allowPaidModels: "允许付费模型",
 			allowPaidModelsHint: "允许角色使用 dsh provider 属于付费线路的模型。",
 			advisorMaxConsults: "顾问咨询次数",
@@ -179,6 +191,18 @@ window.__ModuleLoader__.load({
 			save: "保存",
 			saving: "保存中…",
 			saveFailed: "本部署没有接受这些值，已保留供你修改。",
+			learning: "学习模式",
+			learningHint: "尚无台账的工作区的默认值：auto 自动应用 Jev 的权重建议并记录变更；manual 把建议汇总成一张待确认卡片；frozen 只记录证据、不调整。已有工作区请在输入框统计卡片中切换。",
+			adaptiveEffort: "思考强度",
+			adaptiveEffortHint: "Jev 判断本轮需要思考时使用的强度（low、high 或 xhigh）；整轮保持，只在上下文检查点改变。off 表示从不开启。",
+			contextSelection: "上下文压缩",
+			contextSelectionHint: "jev：原样保留最相关的证据，并权衡现在替换与缓存损失；summary：由执行模型总结该区域。",
+			jevEndpoint: "Jev 接口地址",
+			jevEndpointHint: "决策 API 地址；仅在使用兼容网关时修改。",
+			modelRoutes: "候选模型",
+			modelRoutesHint: "Jev 可为复核、顾问和子任务选择的模型，格式为 模型=provider，用逗号分隔（如 deepseek-v4.1-flash=workbuddy, glm-5.3-flash=workbuddy）。执行模型本身始终是候选。",
+			ceilingRatio: "压力上限",
+			ceilingRatioHint: "上下文压力的倍数；达到后即使 Jev 想推迟也必须压缩。",
 			sectionJev: "Jev",
 			sectionSubagents: "子代理",
 			sectionContext: "上下文",
@@ -261,7 +285,25 @@ window.__ModuleLoader__.load({
 		const NS = "plugins.dshAutoctx";
 		const CONFIG_KEY = "dsh-autoctx#dsh-autoctx";
 		const inject = ["slots", "locale"];
-		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "retainTokens", "keepRatio", "reviewMaxRequests", "advisorMaxConsults", "advisorStallSteps"];
+		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "ceilingRatio", "retainTokens", "keepRatio", "reviewMaxRequests", "advisorMaxConsults", "advisorStallSteps"];
+		// Enumerated fields render as segmented controls.
+		const SEGMENTED = { mode: ["auto", "single", "native"], learning: ["auto", "manual", "frozen"], contextSelection: ["jev", "summary"] };
+		// modelRoutes is a model -> provider map, edited as "model=provider, model=provider".
+		const routesField = {
+			field: "modelRoutes",
+			format: (value) => value && typeof value === "object" ? Object.entries(value).map(([model, provider]) => model + "=" + provider).join(", ") : "",
+			parse: (text) => {
+				const parts = text.split(/[,\n]/).map((part) => part.trim()).filter(Boolean);
+				if (!parts.length) return { kind: "clear" };
+				const routes = {};
+				for (const part of parts) {
+					const [model, provider, extra] = part.split("=").map((x) => x.trim());
+					if (!model || !provider || extra !== undefined) return undefined;
+					routes[model] = provider;
+				}
+				return { kind: "set", value: routes };
+			}
+		};
 		const BOOLEAN_FIELDS = ["economyGuidance", "reviewBeforeFinish", "allowPaidModels"];
 		const booleanField = (field) => ({
 			field,
@@ -275,8 +317,9 @@ window.__ModuleLoader__.load({
 			}
 		});
 		const specs = Object.fromEntries([
-			ui.settingsTextField("mode"), ui.settingsTextField("jevModel"),
-			ui.settingsTextField("reviewerModel"), ui.settingsTextField("advisorModel"),
+			...Object.keys(SEGMENTED).map((name) => ui.settingsTextField(name)),
+			ui.settingsTextField("jevModel"), ui.settingsTextField("jevEndpoint"), ui.settingsTextField("adaptiveEffort"),
+			ui.settingsTextField("reviewerModel"), ui.settingsTextField("advisorModel"), routesField,
 			...NUMERIC_FIELDS.map((name) => ui.settingsNumberField(name)),
 			...BOOLEAN_FIELDS.map(booleanField)
 		].map((spec) => [spec.field, spec]));
@@ -338,12 +381,12 @@ window.__ModuleLoader__.load({
 					onEdit: (text) => stage(name, text),
 					onReset: () => stage(name, spec.format(baseline?.base?.[name]), true)
 				};
-				if (name === "mode") return jsxs("div", { className: "dac-mode", children: [
+				if (SEGMENTED[name]) return jsxs("div", { className: "dac-mode", children: [
 					jsxs("div", { className: "dac-modeHead", children: [
 						jsx("span", { className: "dac-label", children: props.label }),
 						props.overridden ? jsx("button", { type: "button", className: "dac-link", disabled, onClick: props.onReset, children: props.resetLabel }) : null
 					] }),
-					jsx("div", { className: "dac-seg", role: "radiogroup", "aria-label": props.label, children: ["auto", "single", "native"].map((value) => jsx("button", {
+					jsx("div", { className: "dac-seg", role: "radiogroup", "aria-label": props.label, children: SEGMENTED[name].map((value) => jsx("button", {
 						type: "button", role: "radio", "aria-checked": props.text === value, disabled,
 						className: "dac-segItem", onClick: () => props.onEdit(value), children: value
 					}, value)) }),
@@ -376,13 +419,13 @@ window.__ModuleLoader__.load({
 						stateLabel: t(keySet ? "keySet" : "keyUnset"),
 						onEdit: (text) => stage("apiKey", text)
 					}),
-					field("jevModel"), field("maxDecisions"),
-					section("sectionSubagents"), field("maxChildren"), field("maxConcurrent"),
+					field("jevModel"), field("learning"), field("adaptiveEffort"), field("maxDecisions"), field("jevEndpoint"),
+					section("sectionSubagents"), field("modelRoutes"), field("reviewerModel"), field("advisorModel"),
+					field("allowPaidModels"), field("maxChildren"), field("maxConcurrent"),
 					field("reviewBeforeFinish"), field("reviewMaxRequests"),
-					field("reviewerModel"), field("advisorModel"), field("allowPaidModels"),
 					field("advisorMaxConsults"), field("advisorStallSteps"),
-					section("sectionContext"), field("pressureTokens"), field("retainTokens"),
-					field("keepRatio"), field("economyGuidance"),
+					section("sectionContext"), field("contextSelection"), field("pressureTokens"), field("ceilingRatio"),
+					field("retainTokens"), field("keepRatio"), field("economyGuidance"),
 					jsx("div", { className: "dac-hint", children: t("yamlNote") })
 				] })
 			});
