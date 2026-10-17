@@ -97,6 +97,13 @@ export const Config = z.object({
     .default("off")
     .volatile()
     .description('Advisor model: "off", "auto", or a catalog id'),
+  adaptiveEffort: z
+    .string()
+    .default("high")
+    .volatile()
+    .description(
+      "Reasoning effort the root executor gets at decision points (turn start, test failure, review/advisor reports, stalls); off keeps its default",
+    ),
   advisorMaxConsults: z
     .number()
     .step(1)
@@ -318,6 +325,10 @@ export function apply(ctx, options) {
     advisorChildren = new Set(),
     advisorPending = new Set(),
     chosenModels = new Map(),
+    // Adaptive executor effort: why the root's next execution request should think (session -> reason).
+    effortDue = new Map(),
+    effortSupported = new Map(),
+    effortStall = new Map(),
     modelKnowledge = new Map(),
     availableByRoot = new Map(),
     providersByRoot = new Map();
@@ -567,6 +578,19 @@ export function apply(ctx, options) {
     const id = agent.session.id;
     const configuredMode = config.apiKey ? config.mode : "native";
     await ensureAvailable(agent, signal);
+    if (config.adaptiveEffort && config.adaptiveEffort !== "off" && agent.options?.model) {
+      try {
+        await ctx.llm.prepareCall(
+          { provider: agent.options.provider, model: agent.options.model, reasoningEffort: config.adaptiveEffort },
+          signal,
+        );
+        effortSupported.set(id, true);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        effortSupported.set(id, false);
+        record({ kind: "effort_unavailable", session: id, effort: config.adaptiveEffort, error: String(error) });
+      }
+    }
     if (!config.apiKey || config.mode !== "auto") {
       const state = { configuredMode, mode: configuredMode, profiles: [] };
       roots.set(id, state);
@@ -711,6 +735,15 @@ export function apply(ctx, options) {
         },
       );
       noteEdits(root, id, id === root ? "parent" : childLabels.get(id) ?? id, since);
+      if (id === root) {
+        // A failing test run is where a flash executor most often misdiagnoses; think on the next step.
+        const latest = Object.values(graphFor(id).tests)
+          .flatMap((test) => test.runs)
+          .filter((run) => run.via === undefined && run.event > since)
+          .at(-1);
+        if (latest && (latest.outcome === "fail" || latest.outcome === "error"))
+          wantEffort(exec.agent, "test_failure");
+      }
     }
     if (!delegation.has(exec.name) || !exec.agent) return;
     budget(rootOf(exec.agent)).pending.delete(exec.callId);
@@ -776,6 +809,13 @@ export function apply(ctx, options) {
       signal.addEventListener("abort", abort, { once: true });
       if (signal.aborted) abort();
     });
+  }
+
+  // Effort is a request parameter, not prompt text, so raising it for one step keeps the cached prefix.
+  function wantEffort(agent, reason) {
+    if (!config.adaptiveEffort || config.adaptiveEffort === "off") return;
+    if (agent.session.header.parentSession !== undefined || modeOf(agent) !== "auto") return;
+    if (!effortDue.has(agent.session.id)) effortDue.set(agent.session.id, reason);
   }
 
   // Helpers share the task's concurrency and request budgets.
@@ -929,6 +969,7 @@ export function apply(ctx, options) {
         lgtm: /^[\W_]*LGTM\b/i.test(report),
       });
       agent.steer(note(reviewMessage(report)));
+      wantEffort(agent, "review_report");
     } catch (error) {
       signal.throwIfAborted();
       record({ kind: "review_failed", session: id, turn, childId: run?.id, error: String(error) });
@@ -1393,7 +1434,10 @@ export function apply(ctx, options) {
     }
     const reminder = takeSync(agent);
     if (reminder) extra.push(note(reminder));
-    if (advisor) extra.push(note(advisor));
+    if (advisor) {
+      extra.push(note(advisor));
+      wantEffort(agent, "advisor_report");
+    }
     if (extra.length) admitted = { ...admitted, messages: [...(admitted.messages ?? []), ...extra] };
     if (agent.session.header.parentSession !== undefined) return admitted;
     const guidance = agent.session
@@ -1420,8 +1464,19 @@ export function apply(ctx, options) {
     currentTurn.set(id, payload.turn);
     await restoreGraph(id);
     graphFor(id);
-    if (!isChild && turnStartSteps.get(id)?.turn !== payload.turn)
+    if (!isChild && turnStartSteps.get(id)?.turn !== payload.turn) {
       turnStartSteps.set(id, { turn: payload.turn, step: graphStep(id) });
+      wantEffort(agent, "turn_start");
+    }
+    if (!isChild) {
+      const key = progressKey(graphFor(id)),
+        stall = effortStall.get(id);
+      if (!stall || stall.key !== key) effortStall.set(id, { key, step: graphStep(id), done: false });
+      else if (!stall.done && graphStep(id) - stall.step >= 4) {
+        stall.done = true;
+        wantEffort(agent, "stall");
+      }
+    }
     if (messages.some((m) => ["user", "agent-message", "subagent-settled"].includes(m.source.kind)))
       declinedDelegation.delete(id);
     if (isChild && turnIds.get(id) !== payload.turn) {
@@ -1546,6 +1601,19 @@ export function apply(ctx, options) {
   });
   ctx.on("llm/stream", async function* (options, next) {
     const agent = options.sessionId ? ctx.agents.get(options.sessionId) : undefined;
+    // dsh hands the adapter this same options object, so the root's due effort applies to this request.
+    if (agent && options.purpose === undefined && effortDue.has(agent.session.id) &&
+        options.reasoningEffort === undefined && effortSupported.get(rootOf(agent)) === true) {
+      const reason = effortDue.get(agent.session.id);
+      effortDue.delete(agent.session.id);
+      try {
+        options.reasoningEffort = config.adaptiveEffort;
+        record({ kind: "effort_raised", session: agent.session.id, effort: config.adaptiveEffort, reason });
+      } catch (error) {
+        effortSupported.set(rootOf(agent), false);
+        record({ kind: "effort_unavailable", session: agent.session.id, error: String(error) });
+      }
+    }
     if (agent && agent.session.header.parentSession !== undefined) {
       const id = agent.session.id,
         state = budget(rootOf(agent)),
