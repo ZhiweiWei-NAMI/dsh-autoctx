@@ -4,12 +4,27 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from common import case_paths, child_counts, events, numeric, read_json, records, usage_of, write_json
+from common import (case_paths, child_counts, cost_usd, events, model_price, numeric, read_json, records, usage_of,
+                    write_json)
 
 
 def total(rows, key):
     values = [row[key] for row in rows if row.get(key) is not None]
     return sum(values) if values else None
+
+
+def upstream_of(call):
+    upstream = call.get('upstream')
+    if upstream in ('workbuddy', 'opencode-go', 'jev'):
+        return upstream
+    return 'jev' if call.get('kind') == 'jev' else 'workbuddy'
+
+
+def priced(call):
+    upstream = upstream_of(call)
+    model = call.get('actualModel') or call.get('model')
+    cost = 0.0 if upstream == 'jev' or call.get('refused') else cost_usd(model, usage_of(call))
+    return upstream, model, cost
 
 
 def case_row(case):
@@ -33,13 +48,39 @@ def case_row(case):
     if isinstance(captured, list):
         counts = {'executionCalls': sum(c['kind'] == 'execution' for c in calls),
                   'jevCalls': sum(c['kind'] == 'jev' for c in calls), 'upstreamCalls': len(calls)}
+    model_calls = defaultdict(int)
+    costs, paid_costs = [], []
+    unpriced, unmeasured, paid_calls = 0, 0, 0
+    for call in calls:
+        upstream, model, cost = priced(call)
+        model_calls[str(model or 'unknown')] += 1
+        paid_calls += upstream == 'opencode-go'
+        if cost is None:
+            if model_price(model) is None:
+                unpriced += 1
+            else:
+                unmeasured += 1
+        else:
+            costs.append(cost)
+            if upstream == 'opencode-go':
+                paid_costs.append(cost)
+    available = isinstance(captured, list)
+    cost = sum(costs) if available and (costs or not calls) else None
+    paid = sum(paid_costs) if available and (paid_costs or not paid_calls) else None
+    complete = available and not (unpriced or unmeasured)
     return {'instance_id': result['instance_id'], 'arm': result['arm'],
             'resolved': resolved if type(resolved) is bool else None,
             'evaluationStatus': evaluation.get('status'), 'executionStatus': result['executionStatus'],
             'wallSeconds': numeric(result.get('solveAndExportSeconds')),
             'usage': [usage_of(call) for call in calls],
             'jevUsage': [usage_of(call) for call in calls if call['kind'] == 'jev'],
-            **counts, **children}
+            'costUSD': cost, 'paidCostUSD': paid,
+            'costPerResolvedUSD': cost if resolved is True and complete else None,
+            'paidCostPerResolvedUSD': paid if resolved is True and complete else None,
+            'unpricedCalls': unpriced if available else None,
+            'unmeasuredCalls': unmeasured if available else None,
+            'costedCalls': len(costs) if available else None, 'costCoverageComplete': complete,
+            'callsByModel': dict(model_calls) if available else None, **counts, **children}
 
 
 def aggregate(rows, expected):
@@ -47,37 +88,65 @@ def aggregate(rows, expected):
     jev = [entry for row in rows for entry in row['jevUsage']]
     totals = {key: total(rows, key) for key in
               ('wallSeconds', 'executionCalls', 'jevCalls', 'upstreamCalls', 'childrenStarted', 'childrenCompleted')}
+    resolved = sum(row['resolved'] is True for row in rows)
+    cost, paid = total(rows, 'costUSD'), total(rows, 'paidCostUSD')
+    complete = len(rows) == expected and all(row['costCoverageComplete'] for row in rows)
+    model_calls = defaultdict(int)
+    for row in rows:
+        for model, count in (row['callsByModel'] or {}).items():
+            model_calls[model] += count
     return {'expectedCases': expected, 'completedCases': len(rows), 'missingCases': expected - len(rows),
-            'resolved': sum(row['resolved'] is True for row in rows),
+            'resolved': resolved,
             'ungraded': sum(row['resolved'] is None for row in rows), **totals,
-            **{key + 'Tokens': total(usage, key) for key in ('input', 'cached', 'uncached', 'output')},
+            'costUSD': cost, 'paidCostUSD': paid,
+            'costPerResolvedUSD': cost / resolved if cost is not None and resolved and complete else None,
+            'paidCostPerResolvedUSD': paid / resolved if paid is not None and resolved and complete else None,
+            'unpricedCalls': total(rows, 'unpricedCalls'), 'callsByModel': dict(model_calls),
+            'unmeasuredCalls': total(rows, 'unmeasuredCalls'), 'costedCalls': total(rows, 'costedCalls'),
+            'costCoverageComplete': complete,
+            **{key + 'Tokens': total(usage, key)
+               for key in ('input', 'cached', 'uncached', 'cacheWrite', 'output')},
             'jevInputTokens': total(jev, 'input'), 'jevOutputTokens': total(jev, 'output'),
             'measuredRequests': {key: sum(entry[key] is not None for entry in usage)
-                                 for key in ('input', 'cached', 'uncached', 'output')}}
+                                 for key in ('input', 'cached', 'uncached', 'cacheWrite', 'output')}}
 
 
 def fmt(value):
     return str(value) if value is not None else 'n/a'
 
 
+def money(value):
+    return f'{value:.4f}' if value is not None else 'n/a'
+
+
 def markdown(model, root, arms, groups, matrix):
     lines = [f'# {model} — {root}', '',
-             '| arm | resolved | missing / ungraded | wall s | upstream calls | input | cached | uncached | output | Jev calls |',
-             '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
+             '| arm | resolved | missing / ungraded | wall s | upstream calls | input | cached | uncached | '
+             'cache write | output | Jev calls | cost USD | paid USD | USD / resolved | unpriced | unmeasured | cost complete |',
+             '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |']
     for arm in arms:
         group = groups[arm]
         lines.append(f"| {arm} | {group['resolved']}/{group['expectedCases']} | "
                      f"{group['missingCases']} / {group['ungraded']} | " + ' | '.join(fmt(group[key]) for key in
                      ('wallSeconds', 'upstreamCalls', 'inputTokens', 'cachedTokens', 'uncachedTokens',
-                      'outputTokens', 'jevCalls')) + ' |')
-    lines += ['', 'Token sums include only reported usage (execution + Jev); coverage is measured / upstream requests.', '',
-              '| arm | input coverage | cached coverage | uncached coverage | output coverage |',
-              '| --- | --- | --- | --- | --- |']
+                      'cacheWriteTokens', 'outputTokens', 'jevCalls')) + ' | ' + ' | '.join(
+                     money(group[key]) for key in ('costUSD', 'paidCostUSD', 'costPerResolvedUSD')) + ' | ' +
+                     ' | '.join(fmt(group[key]) for key in
+                                ('unpricedCalls', 'unmeasuredCalls', 'costCoverageComplete')) + ' |')
+    lines += ['', 'Token sums include only reported usage (execution + Jev); coverage is measured / upstream requests.',
+              'Costs sum fully measured, priced calls only; incomplete coverage is flagged. '
+              'Cost per resolved task requires complete coverage.', '',
+              '| arm | input coverage | cached coverage | uncached coverage | cache write coverage | output coverage |',
+              '| --- | --- | --- | --- | --- | --- |']
     for arm in arms:
         group = groups[arm]
         lines.append('| ' + arm + ' | ' + ' | '.join(
             f"{group['measuredRequests'][key]}/{fmt(group['upstreamCalls'])}"
-            for key in ('input', 'cached', 'uncached', 'output')) + ' |')
+            for key in ('input', 'cached', 'uncached', 'cacheWrite', 'output')) + ' |')
+    lines += ['', '## Calls per model', '', '| arm | model | calls |', '| --- | --- | --- |']
+    for arm in arms:
+        for name, count in sorted(groups[arm]['callsByModel'].items()):
+            lines.append(f'| {arm} | {name} | {count} |')
     lines += ['', '## Per-task matrix', '', '| instance | repeat | ' + ' | '.join(arms) + ' |',
               '| --- | --- | ' + ' | '.join('---' for _ in arms) + ' |']
     for entry in matrix:

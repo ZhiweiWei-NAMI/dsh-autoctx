@@ -23,6 +23,8 @@ B/C never load the plugin under test.
   Set `HTTPS_PROXY` if required to reach OpenCode. Neither value is copied into
   configuration or solver containers. The observer substitutes the real Jev key
   for the plugin's non-secret local placeholder and never logs Authorization headers.
+- Set `OPENCODE_API_KEY` the same way when extra models use a native opencode
+  route; the observer substitutes it for the relay placeholder and never persists it.
 
 The specified old harness and original task manifest were unavailable during this
 revision. The checked-in public 12-task manifest is retained; old-run parity has
@@ -82,6 +84,32 @@ in the first run's parent directory. The denominator is the fixed task count
 execution and Jev usage; the table shows coverage so partial sums are explicit.
 Wall time covers solving, stopping residual solver processes and exporting the
 patch; environment preparation and official grading are reported separately.
+
+## Extra models, native routes and cost
+
+`--extra-models` accepts comma-separated ids routed through `models.json`: the
+WorkBuddy set uses `workbuddy`, other models inherit pi-ai's native `opencode-go`
+catalog protocols, and `claude-haiku-5-5` uses `opencode-go-anthropic`.
+`--reviewer` defaults to `same`, `--advisor` to `off`, and `--max-usd` to 0.50
+per case. These settings are saved in `run-config.json`.
+
+The transparent `/go/` relay preserves paths, bodies and end-to-end headers,
+replacing only credentials and capping existing output-token limits at 16384.
+Paid routes require `OPENCODE_API_KEY` in the observer environment; the key never
+enters the profile, records or container. All routes share the call budget.
+Once measured paid spend reaches the cap, further `/go/` calls receive 429;
+WorkBuddy remains available. In-flight calls can exceed the cap.
+
+Per-case and per-arm summaries include calls by model, API-price `costUSD`,
+OpenCode-only `paidCostUSD`, and cost per resolved task. Costs use `models.json`
+USD-per-million rates for uncached input, cache reads, cache writes (input rate
+when no write rate is listed), and output. WorkBuddy uses the same rates; Jev
+costs zero. Unknown models appear in `unpricedCalls`, incomplete usage in
+`unmeasuredCalls`. Missing measurements remain null, and partial cost sums are
+flagged by `costCoverageComplete`; cost per resolved task requires complete
+coverage. JSON and SSE usage include completions, Responses and Anthropic.
+Gzip/deflate are decoded for measurement; other response encodings pass through
+with a recorded measurement error. Unmeasured calls cannot enforce the spend cap.
 
 ## Fairness
 

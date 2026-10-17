@@ -2,6 +2,7 @@
 import argparse
 import concurrent.futures
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -12,13 +13,16 @@ from pathlib import Path
 
 import yaml
 
-from common import case_paths, child_counts, events, write_json
+from common import case_paths, catalog, child_counts, events, write_json
 from local_relay import LocalRelay
 from observer import CaseObserver
 
 NODE = Path(os.environ.get('DSH_BENCH_NODE', '/opt/node'))
 DSH = NODE / 'lib/node_modules/@deepseek-ai/dsh/lib/bin.js'
+# WorkBuddy serves these ids directly; every other catalog model goes through OpenCode Go.
+WORKBUDDY_MODELS = ('deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v4.1-flash', 'glm-5.3-flash', 'glm-5.3')
 MODEL_IDS = ('deepseek-v4.1-flash', 'deepseek-v4-flash', 'glm-5.3-flash')
+ROUTE_ORDER = ('workbuddy', 'opencode-go', 'opencode-go-anthropic')
 TASK_SECONDS = 600
 REQUEST_LIMIT = 64
 MAX_OUTPUT_TOKENS = 16384
@@ -34,19 +38,43 @@ def docker(*args):
     return subprocess.run(['docker', *map(str, args)], check=True, stdout=subprocess.PIPE).stdout
 
 
-def configure_home(home, model, arm, plugin, relay):
+def route_for(model):
+    entry = next((item for item in catalog() if item.get('id') == model), None)
+    routes = entry.get('routes') if isinstance(entry, dict) else None
+    routes = routes if isinstance(routes, list) else []
+    for route in ROUTE_ORDER:
+        if route in routes and (route != 'workbuddy' or model in WORKBUDDY_MODELS):
+            return route
+    return None
+
+
+def configure_home(home, model, arm, plugin, relay, extra_models, routes, reviewer='same',
+                   advisor='off'):
     home.mkdir(parents=True)
     shutil.copyfile(Path(__file__).with_name('runtime.mjs'), home / 'runtime.mjs')
     patch = [{'id': item, 'disabled': True} for item in
              ('session-title-llm', 'tool-workflow', 'tool-ralph', 'tool-web', 'web-search-deepseek',
               'repeat-tool-reminder', 'llm-retry')]
+    workbuddy = [{'id': model, 'contextWindow': 128000, 'maxTokens': MAX_OUTPUT_TOKENS,
+                  'reasoningEfforts': False}]
+    workbuddy += [{'id': extra, 'contextWindow': 128000, 'maxTokens': MAX_OUTPUT_TOKENS,
+                   'reasoningEfforts': False} for extra in extra_models if routes.get(extra) == 'workbuddy']
+    providers = {'workbuddy': {
+        'api': 'openai-completions', 'baseURL': relay + '/v1', 'apiKeyEnv': 'BENCH_RELAY_KEY',
+        'compat': {'maxTokensField': 'max_tokens', 'supportsUsageInStreaming': True},
+        'models': workbuddy}}
+    if any(extra not in WORKBUDDY_MODELS for extra in extra_models):
+        # Native pi-ai catalog route: only the endpoint is redirected to the relay.
+        providers['opencode-go'] = {'apiKeyEnv': 'BENCH_RELAY_KEY', 'baseURL': relay + '/go/v1'}
+    anthropic = [extra for extra in extra_models if routes.get(extra) == 'opencode-go-anthropic']
+    if anthropic:
+        providers['opencode-go-anthropic'] = {
+            'api': 'anthropic-messages', 'baseURL': relay + '/go', 'apiKeyEnv': 'BENCH_RELAY_KEY',
+            'models': [{'id': extra, 'contextWindow': 128000, 'maxTokens': MAX_OUTPUT_TOKENS}
+                       for extra in anthropic]}
     patch += [
         {'id': 'agent-default-model', 'config': {'provider': 'workbuddy', 'model': model}},
-        {'id': 'llm-pi-ai', 'config': {'providers': {'workbuddy': {
-            'api': 'openai-completions', 'baseURL': relay + '/v1', 'apiKeyEnv': 'BENCH_RELAY_KEY',
-            'compat': {'maxTokensField': 'max_tokens', 'supportsUsageInStreaming': True},
-            'models': [{'id': model, 'contextWindow': 128000, 'maxTokens': MAX_OUTPUT_TOKENS,
-                        'reasoningEfforts': False}]}}}},
+        {'id': 'llm-pi-ai', 'config': {'providers': providers}},
         {'id': 'subagent', 'config': {'maxDepth': 1, 'maxActiveSubagents': MAX_CONCURRENT}},
         {'insert': [{'id': 'bench-observation', 'name': str(home / 'runtime.mjs'), 'config': {
             'arm': arm, 'relay': relay, 'recordFile': str(home / 'native-events.jsonl'),
@@ -61,6 +89,10 @@ def configure_home(home, model, arm, plugin, relay):
                 'maxChildRequests': REQUEST_LIMIT, 'maxChildTurnRequests': REQUEST_LIMIT,
                 'pressureTokens': PRESSURE_TOKENS, 'retainTokens': RETAIN_TOKENS,
                 'nativeThresholdRatio': COMPACTION_THRESHOLD_RATIO,
+                'modelRoutes': routes,
+                'reviewerModel': reviewer,
+                'advisorModel': advisor,
+                'allowPaidModels': any(route.startswith('opencode') for route in routes.values()),
                 'recordFile': str(home / 'auto-events.jsonl')}}]},
         ]
     else:
@@ -107,7 +139,8 @@ def prompt_for(task, arm):
                      'Complete the code fix and report what was tested.\n\n' + task['problem_statement'])
 
 
-def run_case(task, arm, repeat, case, model, plugin):
+def run_case(task, arm, repeat, case, model, plugin, extra_models, routes, reviewer='same',
+             advisor='off', max_usd=0.50):
     case.mkdir(parents=True, exist_ok=True)
     home = case / 'trial'
     if home.exists():
@@ -124,12 +157,13 @@ def run_case(task, arm, repeat, case, model, plugin):
         docker('network', 'create', '--driver', 'bridge', '--internal', network)
         stack.callback(docker, 'network', 'rm', network)
         gateway = json.loads(docker('network', 'inspect', network))[0]['IPAM']['Config'][0]['Gateway']
-        observer = CaseObserver(case / 'requests.json', REQUEST_LIMIT)
+        observer = CaseObserver(case / 'requests.json', REQUEST_LIMIT, max_usd=max_usd)
         port = observer.start()
         stack.callback(observer.close)
         relay = LocalRelay(gateway, port)
         stack.callback(relay.close)
-        configure_home(home, model, arm, plugin, f'http://{gateway}:{port}')
+        configure_home(home, model, arm, plugin, f'http://{gateway}:{port}', extra_models, routes,
+                       reviewer, advisor)
         volumes = ['--volume', f'{NODE}:{NODE}:ro', '--volume', f'{home}:{home}:rw']
         if arm == 'A':
             volumes += ['--volume', f'{plugin}:{plugin}:ro']
@@ -201,6 +235,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', required=True, choices=MODEL_IDS)
     parser.add_argument('--arms', default='A,B,C')
+    parser.add_argument('--extra-models', default='')
+    parser.add_argument('--reviewer', default='same')
+    parser.add_argument('--advisor', default='off')
+    parser.add_argument('--max-usd', type=float, default=0.50)
     parser.add_argument('--tasks', type=Path, default=Path(__file__).with_name('tasks.json'))
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--plugin', type=Path, required=True)
@@ -212,6 +250,14 @@ def main():
         parser.error('--arms must be a comma-separated subset of A,B,C')
     if args.parallel < 1 or args.repeat < 1:
         parser.error('--parallel and --repeat must be positive')
+    if not math.isfinite(args.max_usd) or args.max_usd <= 0:
+        parser.error('--max-usd must be finite and positive')
+    extra_models = list(dict.fromkeys(extra.strip() for extra in args.extra_models.split(',') if extra.strip()))
+    extra_models = [extra for extra in extra_models if extra != args.model]
+    routes = {model: route_for(model) for model in (args.model, *extra_models)}
+    for name, route in routes.items():
+        if route is None:
+            parser.error(f'model {name!r} has no usable route in models.json')
     root, plugin = args.out.resolve(), args.plugin.resolve()
     task_file = args.tasks.resolve()
     manifest = json.loads(task_file.read_text())
@@ -224,7 +270,9 @@ def main():
               'requestLimitIncludingJev': REQUEST_LIMIT, 'maxOutputTokens': MAX_OUTPUT_TOKENS,
               'pressureTokens': PRESSURE_TOKENS, 'retainTokens': RETAIN_TOKENS,
               'compactionThresholdRatio': COMPACTION_THRESHOLD_RATIO,
-              'maxChildren': MAX_CHILDREN, 'maxConcurrentChildren': MAX_CONCURRENT}
+              'maxChildren': MAX_CHILDREN, 'maxConcurrentChildren': MAX_CONCURRENT,
+              'extraModels': extra_models, 'modelRoutes': routes,
+              'reviewer': args.reviewer, 'advisor': args.advisor, 'maxUsd': args.max_usd}
     config_file = root / 'run-config.json'
     write_json(root / 'tasks.json', manifest)
     write_json(config_file, config)
@@ -233,11 +281,14 @@ def main():
         return
     if 'A' in arms and not os.environ.get('JEV_API_KEY'):
         parser.error('Set JEV_API_KEY in the observer environment')
+    if any(route.startswith('opencode') for route in routes.values()) and not os.environ.get('OPENCODE_API_KEY'):
+        parser.error('Set OPENCODE_API_KEY in the observer environment')
     staged = root / 'plugin'
     if 'A' in arms and not staged.exists():
         stage_plugin(plugin, staged)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
-        futures = [pool.submit(run_case, *item, args.model, staged) for item in pending]
+        futures = [pool.submit(run_case, *item, args.model, staged, extra_models, routes,
+                               args.reviewer, args.advisor, args.max_usd) for item in pending]
         for future in concurrent.futures.as_completed(futures):
             future.result()
 
