@@ -728,15 +728,22 @@ export function apply(ctx, options) {
   // Circuit breaker: an unusable Jev (rate limit, auth, billing, server or network failure) is recorded once
   // and the task stops calling it, so the local fallbacks take over without spending the request budget.
   const JEV_UNAVAILABLE = new Set([401, 402, 403, 429]);
+  // A gateway or network failure is usually a brief upstream outage: it pauses Jev for a minute instead of
+  // ending it for the task. Auth, billing and rate limits stay off.
+  const JEV_TRANSIENT = new Set([502, 503, 504]),
+    JEV_PAUSE_MS = 60000;
   function tripJev(root, session, status, detail) {
     if (jevDown.has(root)) return;
-    jevDown.set(root, { status, detail });
-    record({ kind: "jev_unavailable", session, model: config.jevModel, httpStatus: status, error: detail });
+    const transient = status === undefined || JEV_TRANSIENT.has(status);
+    jevDown.set(root, { status, detail, ...(transient ? { until: Date.now() + JEV_PAUSE_MS } : {}) });
+    record({ kind: "jev_unavailable", session, model: config.jevModel, httpStatus: status, error: detail,
+      ...(transient ? { pausedMs: JEV_PAUSE_MS } : {}) });
   }
   // `unbudgeted` is for the turn-end learning call, which must not compete with the task's decisions.
   async function decide(agent, request, signal, { unbudgeted = false } = {}) {
     const root = rootOf(agent),
       state = budget(root);
+    if (jevDown.get(root)?.until < Date.now()) jevDown.delete(root);
     const down = jevDown.get(root);
     if (down)
       throw new Error(`Jev unavailable for this task (${down.status ?? "network"}); using local fallbacks.`);
@@ -754,17 +761,32 @@ export function apply(ctx, options) {
       updateStats(root);
       const started = performance.now();
       let response;
-      try {
-        response = await fetch(config.jevEndpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer " + config.apiKey },
-          body,
-          signal,
-        });
-      } catch (error) {
-        if (signal?.aborted) throw error;
-        tripJev(root, agent.session.id, undefined, redact(String(error), config.apiKey).slice(0, 300));
-        throw error;
+      // One retry absorbs a momentary gateway or network failure before the breaker trips.
+      for (let attempt = 0; ; attempt++) {
+        let failure;
+        try {
+          response = await fetch(config.jevEndpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: "Bearer " + config.apiKey },
+            body,
+            signal,
+          });
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          failure = error;
+        }
+        if (attempt === 0 && (failure || JEV_TRANSIENT.has(response.status))) {
+          record({ kind: "jev_retry", session: agent.session.id, httpStatus: failure ? null : response.status });
+          if (!failure) await response.text().catch(() => {});
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          signal?.throwIfAborted();
+          continue;
+        }
+        if (failure) {
+          tripJev(root, agent.session.id, undefined, redact(String(failure), config.apiKey).slice(0, 300));
+          throw failure;
+        }
+        break;
       }
       const bodyText = redact(await response.text(), config.apiKey);
       if (!response.ok) {

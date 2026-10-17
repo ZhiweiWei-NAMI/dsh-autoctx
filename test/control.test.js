@@ -766,7 +766,8 @@ test("a Jev HTTP failure below the ceiling uses the native summarizer", async (t
   );
   assert.equal(native.compact.mock.callCount(), 1);
   assert.equal(native.summarize.mock.callCount(), 1);
-  assert.equal(fetch.mock.callCount(), 1);
+  // One retry for a transient gateway failure, then the breaker trips.
+  assert.equal(fetch.mock.callCount(), 2);
 });
 
 test("a cancelled ceiling decision does not compact", async (t) => {
@@ -867,7 +868,8 @@ test("a network AbortError without a cancelled signal falls back to native compa
   await autoComposition({ pressure: true, pressureTokens: 3000 }).step();
   assert.equal(native.compact.mock.callCount(), 1);
   assert.equal(native.summarize.mock.callCount(), 1);
-  assert.equal(fetch.mock.callCount(), 1);
+  // One retry for a network failure, then the breaker trips.
+  assert.equal(fetch.mock.callCount(), 2);
 });
 
 test("an invalid Jev answer below the ceiling falls back to native compaction", async (t) => {
@@ -1325,4 +1327,25 @@ test("a selection under twenty percent reduction falls back to native compaction
       (record) => record.kind === "context_replaced" && record.reason === "selection_shortfall",
     ),
   );
+});
+
+test("a gateway failure pauses Jev for a minute; a rate limit stops it for the task", async (t) => {
+  nativeCompaction(t);
+  const records = [];
+  t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
+  let status = 502;
+  const fetch = t.mock.method(globalThis, "fetch", async () => ({ ok: false, status, text: async () => "Unavailable" }));
+  const app = autoComposition({ pressure: true, pressureTokens: 3000, recordFile: "context-decisions.jsonl" });
+  await app.step();
+  const paused = records.find((record) => record.kind === "jev_unavailable");
+  assert.equal(paused.pausedMs, 60000);
+  assert.equal(fetch.mock.callCount(), 2);
+  const now = Date.now();
+  t.mock.method(Date, "now", () => now + 61000);
+  status = 429;
+  await app.step();
+  assert.ok(fetch.mock.callCount() > 2);
+  const stopped = records.filter((record) => record.kind === "jev_unavailable").at(-1);
+  assert.equal(stopped.httpStatus, 429);
+  assert.equal(stopped.pausedMs, undefined);
 });

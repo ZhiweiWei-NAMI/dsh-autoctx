@@ -344,11 +344,15 @@ def jev_preflight(model):
 
 
 def jev_failures(case):
+    """(HTTP failures, transport failures, Jev calls) of one case."""
     try:
         calls = json.loads((case / 'requests.json').read_text())
     except (FileNotFoundError, json.JSONDecodeError):
-        return 0
-    return sum(1 for call in calls if call.get('kind') == 'jev' and call.get('httpStatus') != 200)
+        return 0, 0, 0
+    jev = [call for call in calls if call.get('kind') == 'jev']
+    failed = [call for call in jev if call.get('httpStatus') != 200]
+    transport = sum(1 for call in failed if call.get('transportError'))
+    return len(failed) - transport, transport, len(jev)
 
 
 def main():
@@ -417,7 +421,7 @@ def main():
         stage_plugin(plugin, staged)
     if any(item[1] == 'A' for item in pending):
         jev_preflight(JEV_MODEL)
-    failed = 0
+    failed = transport_failed = jev_calls = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
         futures = {pool.submit(run_case, *item, args.model, staged, extra_models, routes,
                                args.reviewer, args.advisor, args.max_usd): item for item in pending}
@@ -425,8 +429,14 @@ def main():
             future.result()
             item = futures[future]
             if item[1] == 'A':
-                failed += jev_failures(item[3])
-            if failed >= JEV_FAILURE_LIMIT:
+                http, transport, total = jev_failures(item[3])
+                failed += http
+                transport_failed += transport
+                jev_calls += total
+            # A Jev error answer means a broken configuration; a dropped connection only counts when it
+            # persists (an outage that would leave the arm running on local fallbacks).
+            if failed >= JEV_FAILURE_LIMIT or (transport_failed >= 4 and transport_failed > 0.1 * jev_calls):
+                failed += transport_failed
                 pool.shutdown(wait=True, cancel_futures=True)
                 raise SystemExit(f'Jev failed {failed} times in arm A; stopped. Check {root} before rerunning.')
 
