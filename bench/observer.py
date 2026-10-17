@@ -133,6 +133,10 @@ class CaseObserver:
                 headers['Authorization'] = 'Bearer ' + key
             if 'x-api-key' in client.headers:
                 headers['x-api-key'] = key
+            # pi-ai adds x-opencode-session only on its catalog opencode routes; a declared route
+            # (a model the installed catalog lacks) gets the same per-conversation id from dsh's session.
+            if session and not any(name.lower() == 'x-opencode-session' for name in headers):
+                headers['x-opencode-session'] = session
             target = OPENCODE_UPSTREAM + path[len('/go'):]
         else:
             headers = {'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'}
