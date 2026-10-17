@@ -55,6 +55,7 @@ import {
   setMode,
   revert,
   setUser,
+  withdraw,
   FIT_LEVELS,
   MODES,
 } from "./ledger.js";
@@ -403,9 +404,13 @@ export function apply(ctx, options) {
     turnPlans = new Map(),
     effortSupported = new Map(),
     effortInstalled = new Set(),
+    effortSet = new Map(),
+    userEffort = new Set(),
+    childEffort = new Map(),
     // Per-root accounting of the current turn: role use, cost and cache by category.
     turnUses = new Map(),
     childRoles = new Map(),
+    childModels = new Map(),
     childStarts = new Map(),
     deferredSelection = new Map(),
     filteredByRoot = new Map(),
@@ -457,6 +462,12 @@ export function apply(ctx, options) {
     }
   };
   const rootOf = (agent) => agent.session.header.parentSession ?? agent.session.id;
+  // Real user requests only: compaction checkpoints and plugin notes are also user/message events.
+  const userMessages = (agent) =>
+    agent.session.snapshotEvents().filter((event) =>
+      event.type === "user/message" && agent.session.deriveEventMessage(event)?.source.kind === "user").length;
+  // The model the session currently requests with (a live model switch updates the request header).
+  const currentModel = (agent) => agent?.session.requestHeader?.()?.config?.model ?? agent?.options?.model;
   const budget = (id) => {
     if (!budgets.has(id))
       budgets.set(id, {
@@ -1000,12 +1011,15 @@ export function apply(ctx, options) {
     if (advisor || reviewPending.has(parent)) state.helpers.add(info.id);
     else state.children.add(info.id);
     childRoles.set(info.id, advisor ? "advisor" : reviewPending.has(parent) ? "reviewer" : "worker");
+    // Delegated workers are learning evidence too (reviewer and advisor are counted where they start).
+    if (childRoles.get(info.id) === "worker") {
+      const model = modelInfo(currentModel(child))?.id ?? currentModel(child);
+      childModels.set(info.id, model);
+      roleUse(parent, "worker", model).children++;
+    }
     // What the child's result is based on: later parent edits or user messages make parts of it stale.
     const root = ctx.agents.get(parent);
-    childStarts.set(info.id, {
-      edits: editLog(parent).length,
-      users: root ? root.session.snapshotEvents().filter((event) => event.type === "user/message").length : 0,
-    });
+    childStarts.set(info.id, { edits: editLog(parent).length, users: root ? userMessages(root) : 0 });
     active.set(info.id, { parent, runId: info.runId });
     if (advisor) advisorChildren.add(info.id);
     const assignment = assignments.get(info.id);
@@ -1023,6 +1037,11 @@ export function apply(ctx, options) {
     active.delete(info.id);
     advisorChildren.delete(info.id);
     settled.set(info.id, info);
+    if (childRoles.get(info.id) === "worker" && childModels.has(info.id)) {
+      const use = roleUse(running.parent, "worker", childModels.get(info.id));
+      if (info.stopReason === "completed") use.completed++;
+      use.reports.push({ outcome: info.stopReason, at: graphFor(running.parent).sequence });
+    }
     record({
       kind: "child_end",
       ...info,
@@ -1126,12 +1145,25 @@ export function apply(ctx, options) {
     agent.ctx.on("agent/request", async (payload, next) => {
       const resolved = await next();
       if (agent.options?.reasoningEffort !== undefined) return resolved;
-      const root = rootOf(agent),
-        rootModel = ctx.agents.get(root)?.options?.model;
-      const effort =
-        effortSupported.get(root) === true && (id === root || resolved.model === rootModel)
-          ? turnPlans.get(root)?.effort
-          : undefined;
+      // An effort that is not the one this listener last set is the user's model selection (dsh passes
+      // it through next()); it is kept as is.
+      if (resolved.reasoningEffort !== undefined && resolved.reasoningEffort !== effortSet.get(id)) {
+        if (!userEffort.has(id)) record({ kind: "effort_user", session: id, effort: resolved.reasoningEffort });
+        userEffort.add(id);
+        return resolved;
+      }
+      const root = rootOf(agent);
+      let effort;
+      if (id === root) effort = effortSupported.get(root) === true ? turnPlans.get(root)?.effort : undefined;
+      else {
+        // A same-model child keeps the effort its branch started with: a later parent checkpoint does
+        // not rewrite the cache identity of a running child.
+        if (!childEffort.has(id))
+          childEffort.set(id, effortSupported.get(root) === true && resolved.model === currentModel(ctx.agents.get(root))
+            ? turnPlans.get(root)?.effort : undefined);
+        effort = childEffort.get(id);
+      }
+      effortSet.set(id, effort);
       if (effort === resolved.reasoningEffort) return resolved;
       if (effort !== undefined) return { ...resolved, reasoningEffort: effort };
       const { reasoningEffort: _dropped, ...withoutEffort } = resolved;
@@ -1162,7 +1194,7 @@ export function apply(ctx, options) {
     const ledger = await readLedger(workspaceOf(agent));
     const weight = (model) => effective(ledger, weightKey(tag ?? "general", model, role));
     const finish = (model, via, detail = {}) => {
-      if (model && setting === "auto") chosenModels.set(root + "\u0000" + role, model.id);
+      if (model && setting === "auto") chosenModels.set(root + "\u0000" + role, { id: model.id, tag, version: ledger.version });
       record({
         kind: "model_choice",
         session: root,
@@ -1183,8 +1215,10 @@ export function apply(ctx, options) {
       return finish(entry, "config");
     }
     // One Jev choice per role per root task: the catalog and the task do not change between consults.
+    // Reused only while the task tag and the workspace ledger are unchanged.
     const memo = chosenModels.get(root + "\u0000" + role);
-    if (setting === "auto" && memo && found(memo)) return found(memo);
+    if (setting === "auto" && memo && memo.tag === tag && memo.version === ledger.version && found(memo.id))
+      return found(memo.id);
     // Hard capability only: the brief must fit the context window. Route availability was checked natively.
     const briefTokens = ctx.tokenMeter.estimateMessage(note(tasks.get(root) ?? "")) + 4000;
     const filtered = [...(filteredByRoot.get(root) ?? [])],
@@ -1262,7 +1296,7 @@ export function apply(ctx, options) {
     reviewedTurn.set(id, turn);
     const custom = config.reviewerModel !== undefined && config.reviewerModel !== "same";
     const chosen = custom ? await chooseModel("reviewer", agent, "independent review", signal) : undefined;
-    const executor = modelInfo(agent.options?.model)?.id ?? agent.options?.model;
+    const executor = modelInfo(currentModel(agent))?.id ?? currentModel(agent);
     // The executor's own model reviews through a fork whatever setting picked it.
     const cross = !!chosen && chosen.id !== executor;
     const provider = !cross && ctx.subagents.getProvider("fork") !== undefined ? "fork" : "spawn";
@@ -1281,11 +1315,12 @@ export function apply(ctx, options) {
     });
     try {
       signal.throwIfAborted();
-      const prompt = seeded
-        ? REVIEW_PROMPT + "\n\nOriginal issue:\n" + tasks.get(id)
-        : REVIEW_PROMPT +
-          "\n\nOriginal issue:\n" + tasks.get(id) +
-          "\n\nParent evidence ledger:\n" + digest(rootGraph(agent), 3000);
+      // Even a seeded fork lacks the current turn (the host seeds completed turns only), so the brief
+      // always carries the evidence ledger; it is appended after the inherited prefix.
+      const prompt =
+        REVIEW_PROMPT +
+        "\n\nOriginal issue:\n" + tasks.get(id) +
+        "\n\nParent evidence ledger:\n" + digest(rootGraph(agent), 3000);
       reviewPending.add(id);
       run = await ctx.subagents.start(provider, {
         label: "Independent review",
@@ -1442,8 +1477,18 @@ export function apply(ctx, options) {
       .slice(-3);
     // Model knowledge leads every Jev state and stays identical for the whole root task.
     const models = modelKnowledge.get(rootOf(parent)) ?? "";
+    // Workspace experience of delegated workers by model (rows exist only where evidence exists).
+    const workspace = await readLedger(workspaceOf(parent));
+    const workerRows = Object.keys(workspace.weights)
+      .map(parseKey)
+      .filter((key) => key.role === "worker" && state.profiles.some((profile) => profile.options.model === key.model))
+      .map((key) => {
+        const { weight, source, n, summary } = effective(workspace, weightKey(key.tag, key.model, "worker"));
+        return { tag: key.tag, model: key.model, weight, source, n, ...(summary ? { summary } : {}) };
+      });
     const request = {
       ...(models ? { models } : {}),
+      ...(workerRows.length ? { experience: { note: "Workspace weights of delegated workers by task tag and model (learned from finished tasks).", rows: workerRows } } : {}),
       instructions: DELEGATION_GUIDANCE,
       routes: state.profiles,
       task: tasks.get(parent.session.id),
@@ -1849,6 +1894,12 @@ export function apply(ctx, options) {
       turnStartSteps.set(id, { turn: payload.turn, step: graphStep(id) });
       if (turnUses.get(id)?.turn !== payload.turn) turnUses.set(id, newUse(payload.turn));
     }
+    const reopened = !isChild && turnUses.get(id);
+    if (reopened?.settled && reopened.turn === payload.turn) {
+      reopened.settled = false;
+      reopened.generation = (reopened.generation ?? 0) + 1;
+      record({ kind: "turn_reopened", session: id, turn: payload.turn });
+    }
     installEffort(agent);
     if (messages.some((m) => ["user", "agent-message", "subagent-settled"].includes(m.source.kind)))
       declinedDelegation.delete(id);
@@ -1867,8 +1918,10 @@ export function apply(ctx, options) {
         const started = childStarts.get(child);
         const editedSince = new Set(
           editLog(id).slice(started?.edits ?? 0).filter((edit) => edit.session === id).map((edit) => edit.path));
-        merge(graphFor(id), graphFor(child), childLabels.get(child) ?? child, { skipReadsOf: editedSince });
-        const users = agent.session.snapshotEvents().filter((event) => event.type === "user/message").length;
+        // Test runs the child made before those edits ran against older code; they are not merged either.
+        merge(graphFor(id), graphFor(child), childLabels.get(child) ?? child,
+          { skipReadsOf: editedSince, skipTests: editedSince.size > 0 });
+        const users = userMessages(agent) + messages.filter((message) => message.source.kind === "user").length;
         if (started && (editedSince.size || users > started.users)) {
           staleNotes.push(staleMessage(childLabels.get(child) ?? child, [...editedSince], users > started.users));
           record({ kind: "stale_child_result", session: id, child, paths: [...editedSince], newUserMessage: users > started.users });
@@ -2039,10 +2092,24 @@ export function apply(ctx, options) {
     if (event.type === "turn/end" && event.data?.reason?.kind === "completed")
       settleTurn(session, event.data.turn).catch((error) =>
         record({ kind: "learning_failed", session: session.id, error: String(error) }));
-    if (event.type === "feedback/message-put")
-      settleFeedback(session, event.data.item).catch((error) =>
-        record({ kind: "learning_failed", session: session.id, error: String(error) }));
+    feedbackEvent(session, event);
   });
+  // Feedback on a session that is not loaded is committed to its log and announced here instead.
+  ctx.on("feedback/committed", (inspection) => {
+    const event = inspection?.events?.at(-1);
+    if (!event || inspection.meta?.parentSession !== undefined) return;
+    const events = inspection.events;
+    feedbackEvent({ id: inspection.meta.id, header: inspection.meta, snapshotEvents: () => events }, event);
+  });
+  function feedbackEvent(session, event) {
+    const failed = (error) => record({ kind: "learning_failed", session: session.id, error: String(error) });
+    if (event.type === "feedback/message-put") settleFeedback(session, event.data.item).catch(failed);
+    // Deleted feedback leaves the pending card; values already applied stay (and remain revertible).
+    if (event.type === "feedback/message-delete")
+      updateLedger(session.header.cwd ?? "", (ledger) => withdraw(ledger, "feedback:" + event.data.messageId + ":", Date.now()))
+        .then(() => record({ kind: "feedback_withdrawn", session: session.id, messageId: event.data.messageId }))
+        .catch(failed);
+  }
 
   // Observed facts only: the latest outcome per test, edits after a report, cost, time and cache.
   const testState = (graph) => {
@@ -2055,7 +2122,7 @@ export function apply(ctx, options) {
     [
       fact.children + " " + fact.role + " run(s)",
       ...fact.reports.slice(0, 2).map((report) =>
-        (report.verdict ?? "advice") + (report.executorEditsAfter ? ", executor edited after" : ", no edits after")),
+        (report.verdict ?? report.outcome ?? "advice") + (report.executorEditsAfter ? ", executor edited after" : ", no edits after")),
       "tests " + context.tests.passing + " pass/" + context.tests.failing + " fail",
       "$" + fact.usd,
       fact.seconds + "s",
@@ -2068,24 +2135,35 @@ export function apply(ctx, options) {
       use = turnUses.get(id);
     if (!use || use.turn !== turn || use.settled) return;
     use.settled = true;
+    // A turn reopened after an earlier settlement (a late child result or user steer) settles only what
+    // happened since, as a new piece of evidence.
+    const base = use.baseline ?? {},
+      part = use.generation ?? 0;
+    use.baseline = structuredClone(Object.fromEntries(Object.entries(use.roles).map(([key, entry]) =>
+      [key, { ...entry, reports: entry.reports.length }])));
     const plan = turnPlans.get(id),
       graph = graphFor(id);
     const tag = plan?.tag,
       need = needOf(roots.get(id)?.policy?.weights),
       tests = testState(graph);
-    const facts = Object.values(use.roles)
-      .filter((entry) => LEARNED_ROLES.has(entry.role) && entry.children > 0)
-      .map((entry) => ({
-        role: entry.role,
-        model: entry.model,
-        children: entry.children,
-        completed: entry.completed,
-        calls: entry.calls,
-        usd: round(entry.usd),
-        seconds: round(entry.ms / 1000, 1),
-        cacheHit: entry.input ? round(entry.cacheRead / entry.input, 3) : null,
-        reports: entry.reports.map(({ at, ...report }) => ({ ...report, executorEditsAfter: editsAfterEvent(graph, at) })),
-      }));
+    const since = (key, entry, field) => entry[field] - (base[key]?.[field] ?? 0);
+    const facts = Object.entries(use.roles)
+      .filter(([key, entry]) => LEARNED_ROLES.has(entry.role) && since(key, entry, "children") > 0)
+      .map(([key, entry]) => {
+        const input = since(key, entry, "input");
+        return {
+          role: entry.role,
+          model: entry.model,
+          children: since(key, entry, "children"),
+          completed: since(key, entry, "completed"),
+          calls: since(key, entry, "calls"),
+          usd: round(since(key, entry, "usd")),
+          seconds: round(since(key, entry, "ms") / 1000, 1),
+          cacheHit: input ? round(since(key, entry, "cacheRead") / input, 3) : null,
+          reports: entry.reports.slice(base[key]?.reports ?? 0)
+            .map(({ at, ...report }) => ({ ...report, executorEditsAfter: editsAfterEvent(graph, at) })),
+        };
+      });
     const executor = Object.values(use.roles).find((entry) => entry.role === "executor");
     const summary = {
       turn,
@@ -2102,9 +2180,13 @@ export function apply(ctx, options) {
         : {}),
       roles: facts,
     };
-    await (await storage()).table("uses").put(useKey(id, turn), summary);
-    record({ kind: "turn_use", session: id, ...summary });
-    if (facts.length) await learn(session, facts, { tag, need, tests, totalUSD: summary.totalUSD }, "turn:" + id + ":" + turn);
+    // Feedback on any answer of this turn reaches every part, so a reopened turn accumulates its roles.
+    const previous = part ? (await storage()).table("uses").get(useKey(id, turn)) : undefined;
+    await (await storage()).table("uses").put(useKey(id, turn),
+      previous ? { ...summary, roles: [...(previous.roles ?? []), ...facts], parts: part + 1 } : summary);
+    record({ kind: "turn_use", session: id, part, ...summary });
+    if (facts.length)
+      await learn(session, facts, { tag, need, tests, totalUSD: summary.totalUSD }, "turn:" + id + ":" + turn + (part ? ":" + part : ""));
   }
 
   // Native message feedback on a root answer becomes evidence for the roles that turn used.
@@ -2125,9 +2207,10 @@ export function apply(ctx, options) {
   // Jev proposes one weight per (tag, model, role) the turn actually used; the ledger applies, queues or
   // records it by mode. Unused candidates get no proposal, so not being chosen never lowers a weight.
   async function learn(session, facts, context, evidenceId) {
+    // A cold session (feedback after it was closed) has no live agent; Jev is asked on its behalf.
     const id = session.id,
       cwd = session.header.cwd ?? "",
-      agent = ctx.agents.get(id);
+      agent = ctx.agents.get(id) ?? { session };
     const ledger = await readLedger(cwd);
     if (ledger.mode === "frozen" || !agent || !config.apiKey || jevDown.has(id)) {
       record({ kind: "learning", session: id, mode: ledger.mode, tag: context.tag ?? null,
@@ -2245,6 +2328,8 @@ export function apply(ctx, options) {
     // The head (system + first user task) and the recent tail stay untouched, so
     // the cached prompt prefix survives the replacement.
     const fullEnd = end;
+    // A thinking change decided at this checkpoint applies only once the prefix was actually rebuilt.
+    let checkpointEffort;
     const compactRegion = async (reason, regionEnd = fullEnd) => {
       signal.throwIfAborted();
       try {
@@ -2262,6 +2347,13 @@ export function apply(ctx, options) {
           reason,
           sourceCount: result.shadowedSeqs.length,
         });
+        if (checkpointEffort) {
+          const plan = turnPlans.get(id) ?? { via: "checkpoint" };
+          if (checkpointEffort.effort !== plan.effort)
+            record({ kind: "effort_checkpoint", session: id, from: plan.effort ?? null, to: checkpointEffort.effort ?? null,
+              highReasoning: checkpointEffort.highReasoning });
+          turnPlans.set(id, { ...plan, ...checkpointEffort, via: "checkpoint" });
+        }
       } catch (error) {
         if (signal.aborted) throw error;
         record({
@@ -2444,12 +2536,11 @@ export function apply(ctx, options) {
         recheckAt: deferredSelection.get(id), economics });
       return;
     }
-    if (selection.answers.high_reasoning) {
-      const plan = turnPlans.get(id) ?? { tag: "general", via: "checkpoint" };
-      const effort = selection.answers.high_reasoning.noul >= 0.5 ? config.adaptiveEffort : undefined;
-      if (effort !== plan.effort) record({ kind: "effort_checkpoint", session: id, from: plan.effort ?? null, to: effort ?? null, highReasoning: selection.answers.high_reasoning.noul });
-      turnPlans.set(id, { ...plan, effort, highReasoning: selection.answers.high_reasoning.noul, via: "checkpoint" });
-    }
+    if (selection.answers.high_reasoning)
+      checkpointEffort = {
+        effort: selection.answers.high_reasoning.noul >= 0.5 ? config.adaptiveEffort : undefined,
+        highReasoning: selection.answers.high_reasoning.noul,
+      };
     const regionTokens = regionTokensEstimate;
     // Unjudged units are kept first (required ones always); when they alone exceed the keep budget,
     // the oldest non-required ones are archived to one line each.

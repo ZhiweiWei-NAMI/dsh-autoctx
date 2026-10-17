@@ -121,8 +121,25 @@ def cost_usd(model, usage):
     rates = {key: numeric(price.get(key)) for key in ('input', 'cacheRead', 'cacheWrite', 'output')}
     if rates['input'] is None or rates['output'] is None:
         return None
+    # A long-prompt tier (e.g. Haiku above 100K) scales every input-side rate by its input ratio, as the plugin does.
+    above = price.get('above') if isinstance(price.get('above'), dict) else None
+    scale, output_rate = 1, rates['output']
+    if above and uncached + cached + cache_write > (numeric(above.get('tokens')) or float('inf')):
+        scale, output_rate = above['input'] / rates['input'], above['output']
     return (uncached * rates['input'] + cached * (rates['cacheRead'] or rates['input'])
-            + cache_write * (rates['cacheWrite'] or rates['input']) + output * rates['output']) / 1e6
+            + cache_write * (rates['cacheWrite'] or rates['input'])) * scale / 1e6 + output * output_rate / 1e6
+
+
+def jev_cost_usd(model, usage):
+    """Jev's own price from models.json `jev` (jev-1.13: input billed, output free)."""
+    try:
+        price = json.loads((Path(__file__).resolve().parent.parent / 'models.json').read_text()).get('jev', {}).get(model)
+    except (OSError, ValueError):
+        return None
+    usage = usage if isinstance(usage, dict) else {}
+    if not price or numeric(usage.get('input')) is None:
+        return None
+    return (numeric(usage.get('input')) * price['input'] + (numeric(usage.get('output')) or 0) * price['output']) / 1e6
 
 
 def child_counts(lifecycle, calls):

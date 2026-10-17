@@ -763,6 +763,11 @@ test("auto learning: the turn's reviewer gets one bounded weight step; candidate
   const use = records.find((r) => r.kind === "turn_use");
   assert.equal(use.roles[0].model, "glm-5.3-flash");
   assert.ok(use.cost.jev > 0);
+  // A turn reopened after settling settles only what happened since: here nothing new.
+  await app.preStep(app.root, [], "turn");
+  await app.stop();
+  assert.ok(records.some((r) => r.kind === "turn_reopened"));
+  assert.equal([...app.tables.get("ledger").values()][0].version, 1);
   // The same turn ending again is not counted twice.
   app.handlers.get("session/event")(app.root.session, { type: "turn/end", data: { turn: "turn", reason: { kind: "completed" } } });
   for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));

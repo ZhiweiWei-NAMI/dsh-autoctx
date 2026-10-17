@@ -45,7 +45,8 @@ export function applyStatsRecord(stats,record,decisions=stats.decisions) {
       }
       break;
     }
-    case 'jev': if (Number.isFinite(record.usd)) next.cost={...stats.cost,jev:stats.cost.jev+record.usd}; break;
+    case 'jev': if (Number.isFinite(record.usd)) next.cost={...stats.cost,jev:stats.cost.jev+record.usd};
+      else next.unpriced=stats.unpriced+1; break;
     case 'review_start': if (record.provider==='fork') { next.forks=stats.forks+1; if (record.historySeeded) next.historySeeded=stats.historySeeded+1; } break;
     case 'turn_plan': next.plan={tag:record.tag,effort:record.effort,via:record.via,highReasoning:record.highReasoning??null}; break;
     case 'effort_checkpoint': next.plan={...(stats.plan??{}),effort:record.to,via:'checkpoint',highReasoning:record.highReasoning}; break;

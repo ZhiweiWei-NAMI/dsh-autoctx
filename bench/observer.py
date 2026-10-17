@@ -10,7 +10,7 @@ import urllib.request
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from common import cost_usd, numeric, usage_of, write_json
+from common import jev_cost_usd, cost_usd, numeric, usage_of, write_json
 
 JEV_UPSTREAM = 'https://opencode.ai/inference/v1/systemone'
 OPENCODE_UPSTREAM = 'https://opencode.ai/zen/go'
@@ -215,7 +215,7 @@ class CaseObserver:
                 self.capture_usage(record, content_body(response_raw, response_encoding))
             except (ValueError, zlib.error):
                 record['usageError'] = 'Unsupported or malformed content encoding'
-            record['costUSD'] = (0.0 if jev else
+            record['costUSD'] = (jev_cost_usd(record.get('actualModel') or record.get('model'), usage_of(record)) if jev else
                                  cost_usd(record.get('actualModel') or record.get('model'), usage_of(record)))
             if opencode and record['costUSD'] is not None:
                 with self.lock:

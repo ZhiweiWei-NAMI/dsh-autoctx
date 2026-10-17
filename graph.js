@@ -523,7 +523,7 @@ export function hasRead(graph, path) {
 }
 
 // skipReadsOf: paths the target edited after the source started; the source's reads of them are stale.
-export function merge(target, source, label, { skipReadsOf } = {}) {
+export function merge(target, source, label, { skipReadsOf, skipTests = false } = {}) {
   if (target === source) return target;
   // Watermarks survive eviction of bounded histories and prevent replay after restore.
   const seen = {};
@@ -545,7 +545,7 @@ export function merge(target, source, label, { skipReadsOf } = {}) {
       if (entry) addEdit(target, path, entry, i === file.edits.length - 1 ? file.editSnippets.at(-1) : undefined);
     }
   }
-  for (const [key, test] of Object.entries(source.tests)) for (const run of test.runs) {
+  if (!skipTests) for (const [key, test] of Object.entries(source.tests)) for (const run of test.runs) {
     const entry = contribution(run);
     if (entry) addTest(target, key, entry);
   }

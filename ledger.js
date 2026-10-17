@@ -15,7 +15,9 @@ export const FIT_LEVELS = [
 ];
 
 export const emptyLedger = (mode = 'auto') =>
-  ({ version: 0, mode, modeGeneration: 0, weights: {}, pending: null, consumed: [], history: [] });
+  ({ version: 0, mode, modeGeneration: 0, weights: {}, pending: null, pendingSeq: 0, consumed: [], history: [] });
+// Pending card versions never repeat, so an approval can never land on a later batch with a reused number.
+const nextPending = ledger => (ledger.pendingSeq ?? ledger.pending?.version ?? 0) + 1;
 export const weightKey = (tag, model, role) => tag + '|' + model + '|' + role;
 export const parseKey = key => { const [tag, model, role] = key.split('|'); return { tag, model, role }; };
 
@@ -57,7 +59,8 @@ function rebase(ledger) {
   if (!pending || pending.baseVersion === ledger.version) return ledger;
   const items = Object.fromEntries(Object.entries(pending.items).map(([key, item]) =>
     [key, { ...item, current: effective(ledger, key).weight, proposed: step(ledger.weights[key], item.target) }]));
-  return { ...ledger, pending: { version: pending.version + 1, baseVersion: ledger.version, items } };
+  const version = nextPending(ledger);
+  return { ...ledger, pendingSeq: version, pending: { ...pending, version, baseVersion: ledger.version, items } };
 }
 
 /**
@@ -83,8 +86,9 @@ export function propose(ledger, proposals, at) {
     items[item.key] = { current: item.current, proposed: item.proposed, target: item.target,
       basis: clip(item.basis, 240), uncertainty: item.uncertainty, evidence, updatedAt: at };
   }
-  const pending = { version: (ledger.pending?.version ?? 0) + 1, baseVersion: ledger.version, items, updatedAt: at };
-  return { ledger: { ...ledger, pending }, applied: [], pending: true, skipped };
+  const version = nextPending(ledger);
+  const pending = { version, baseVersion: ledger.version, items, updatedAt: at };
+  return { ledger: { ...ledger, pendingSeq: version, pending }, applied: [], pending: true, skipped };
 }
 
 /** Apply exactly the pending batch the user saw; a newer version is refused with the current batch. */
@@ -113,7 +117,8 @@ export function setMode(ledger, mode) {
 
 /** Undo one applied change set (learned weights only); finished calls and consumed evidence stay. */
 export function revert(ledger, version, at) {
-  const entry = ledger.history.find(item => item.version === version && item.via !== 'rejected' && item.via !== 'revert');
+  // Only learned changes revert; a user weight is changed or cleared through setUser.
+  const entry = ledger.history.find(item => item.version === version && (item.via === 'auto' || item.via === 'approved'));
   if (!entry) return { ledger, error: 'unknown' };
   const weights = { ...ledger.weights }, changes = [];
   for (const change of entry.changes) {
@@ -138,4 +143,19 @@ export function setUser(ledger, key, value, at) {
 /** Compact rows for Jev and the UI: weight, its source and evidence count, never a fabricated rate. */
 export function experienceRows(ledger, keys) {
   return keys.map(key => ({ key, ...parseKey(key), ...effective(ledger, key) }));
+}
+
+/** Withdrawn evidence (deleted user feedback) leaves the pending card; applied values are not rewritten. */
+export function withdraw(ledger, prefix, at) {
+  if (!ledger.pending) return { ledger };
+  const items = {};
+  for (const [key, item] of Object.entries(ledger.pending.items)) {
+    const evidence = item.evidence.filter(id => !id.startsWith(prefix));
+    if (evidence.length) items[key] = { ...item, evidence };
+  }
+  if (Object.values(items).reduce((n, item) => n + item.evidence.length, 0) ===
+    Object.values(ledger.pending.items).reduce((n, item) => n + item.evidence.length, 0)) return { ledger };
+  const version = nextPending(ledger);
+  const pending = Object.keys(items).length ? { ...ledger.pending, version, items, updatedAt: at } : null;
+  return { ledger: { ...ledger, pendingSeq: version, pending } };
 }
