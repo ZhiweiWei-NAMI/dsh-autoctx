@@ -9,7 +9,7 @@ could reuse given exactly what they sent. The same assumptions and prices apply 
   unless --ttl is given; message-level granularity; no account split or minimum cacheable length.
 - Prices from models.json: uncached input at `input` (or `cacheWrite` where listed), reused input at `cacheRead`,
   output at `output`. Jev requests are priced from the catalog's `jev` table by their model, no cache.
-- Executor (role main), child and Jev costs are reported separately and summed.
+- Executor (role main), native compaction (role compaction), child and Jev costs are reported separately and summed.
 
 Methods:
 - exact: the observer's cumulative per-message prefix hashes (messageHashes/configHash/toolsHash). Prefix token counts
@@ -100,7 +100,7 @@ def case_totals(case_dir, prices, jev_prices, ttl):
             continue
         c[name + '_cases'] = 1
         for r in priced:
-            role = 'main' if r.get('role') == 'main' else 'child'
+            role = r.get('role') if r.get('role') in ('main', 'compaction') else 'child'
             hit = reused[id(r)]
             c[f'{name}_in_{role}'] += r['inputTokens']
             c[f'{name}_hit_{role}'] += hit
@@ -117,9 +117,11 @@ def summary(c, method):
     def rate(roles):
         total = sum(c[f'{method}_in_{r}'] for r in roles)
         return sum(c[f'{method}_hit_{r}'] for r in roles) / total if total else 0.0
-    usd = {'executor': c[f'{method}_usd_main'], 'children': c[f'{method}_usd_child'], 'jev': c['usd_jev']}
+    usd = {'executor': c[f'{method}_usd_main'], 'compaction': c[f'{method}_usd_compaction'],
+           'children': c[f'{method}_usd_child'], 'jev': c['usd_jev']}
     return {'method': method, 'cases': c['cases'], 'resolved': c['resolved'], 'missingUsage': c['missingUsage'],
-            'unpricedRequests': c[method + '_unpriced'], 'cacheRateMain': rate(['main']), 'cacheRateAll': rate(['main', 'child']),
+            'unpricedRequests': c[method + '_unpriced'], 'cacheRateMain': rate(['main']), 'cacheRateChildren': rate(['child']),
+            'cacheRateAll': rate(['main', 'compaction', 'child']),
             'usd': {**usd, 'total': sum(usd.values())}, 'label': 'theoretical estimate, not billed cost'}
 
 
@@ -136,7 +138,7 @@ def main():
     out = {}
     print('Theoretical estimates, not billed costs. USD at catalog prices; same cache assumptions for every arm.')
     print(f"{'arm':28s}{'method':>7s}{'cases':>6s}{'res':>5s}{'cache main':>11s}{'cache all':>10s}"
-          f"{'exec $':>9s}{'child $':>9s}{'Jev $':>8s}{'total $':>9s}{'$/res':>8s}{'noUsage':>8s}")
+          f"{'exec $':>9s}{'compact $':>10s}{'child $':>9s}{'Jev $':>8s}{'total $':>9s}{'$/res':>8s}{'noUsage':>8s}")
     for spec in args.arms:
         name, pattern = spec.split('=', 1)
         dirs = sorted(d for d in glob.glob(pattern) if os.path.exists(os.path.join(d, 'result.json')))
@@ -148,7 +150,7 @@ def main():
             s = summary(total, method)
             out[name][method] = s
             print(f"{name:28s}{method:>7s}{s['cases']:>6d}{s['resolved']:>5d}{s['cacheRateMain']:>11.1%}{s['cacheRateAll']:>10.1%}"
-                  f"{s['usd']['executor']:>9.3f}{s['usd']['children']:>9.3f}{s['usd']['jev']:>8.3f}{s['usd']['total']:>9.3f}"
+                  f"{s['usd']['executor']:>9.3f}{s['usd']['compaction']:>10.3f}{s['usd']['children']:>9.3f}{s['usd']['jev']:>8.3f}{s['usd']['total']:>9.3f}"
                   f"{s['usd']['total'] / max(s['resolved'], 1):>8.4f}{s['missingUsage']:>8d}")
     if args.json:
         json.dump(out, open(args.json, 'w'), indent=2)
