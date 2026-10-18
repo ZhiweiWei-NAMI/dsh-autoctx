@@ -26,6 +26,16 @@ import report  # noqa: E402
 MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'models.json')
 
 
+def run_root_file(case, name):
+    """Nearest ancestor of a case directory holding NAME (run roots are <root>/<task>/<arm> or <root>/repeat-k/<task>/<arm>)."""
+    directory = os.path.dirname(os.path.abspath(case))
+    while directory != os.path.dirname(directory):
+        if os.path.exists(os.path.join(directory, name)):
+            return os.path.join(directory, name)
+        directory = os.path.dirname(directory)
+    raise FileNotFoundError(name + ' above ' + case)
+
+
 def prompt_hash(case):
     """sha256 of the exact harness prompt for this case (harness prompt_for, recorded task); the text is never written."""
     import importlib.util
@@ -34,7 +44,7 @@ def prompt_hash(case):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     result = json.load(open(os.path.join(case, 'result.json')))
-    tasks = json.load(open(os.path.join(os.path.dirname(os.path.dirname(case)), 'tasks.json')))
+    tasks = json.load(open(run_root_file(case, 'tasks.json')))
     task = next(t for t in (tasks['tasks'] if isinstance(tasks, dict) else tasks) if t['instance_id'] == result['instance_id'])
     return 'sha256:' + hashlib.sha256(module.prompt_for(task, result['arm']).encode()).hexdigest()
 
@@ -87,7 +97,10 @@ def export(case, commit):
     by_role = [{'role': role, 'model': model, **{k: (round(v, 6) if k == 'usd' else v) for k, v in c.items()}}
                for (role, model), c in sorted(rows.items())]
     total = sum(c['usd'] for c in rows.values())
-    run_config_path = os.path.join(os.path.dirname(os.path.dirname(case)), 'run-config.json')
+    try:
+        run_config_path = run_root_file(case, 'run-config.json')
+    except FileNotFoundError:
+        run_config_path = ''
     run_config = json.load(open(run_config_path)) if os.path.exists(run_config_path) else {}
     status, code = result.get('executionStatus'), result.get('agentExitCode')
     termination = ({'finished': 'agent exited normally (exit 0)',
