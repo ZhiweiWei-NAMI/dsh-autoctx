@@ -74,7 +74,7 @@ Removing the bundle layer restores native compaction.
 
 ## Settings and defaults
 
-In the web UI, open bottom-left **Settings → DSH AutoCTX**, or **Plugins → dsh-autoctx → Configure**. The form covers every current Config key, including plan budgets, provider comma lists, effort/cache budgets, child limits, native threshold and record path. `routes` and `strategy` use JSON editors that refuse malformed or schema-invalid input. Settings remain in the host configuration form, with its revision and writability checks. `apiKey` remains a secret field; the client reads only its configured status.
+In the web UI, open bottom-left **More → Settings → DSH AutoCTX**. The form covers every current Config key, including plan budgets, provider comma lists, effort/cache budgets, child limits, native threshold and record path. `routes` and `strategy` use JSON editors that refuse malformed or schema-invalid input. Settings remain in the host configuration form, with its revision and writability checks. `apiKey` remains a secret field; the client reads only its configured status.
 
 The Settings page also lists catalog models and configured routes with the catalog prior text and an editable user override (optional reason). Overrides and their full edit history are stored deployment-wide in the `dsh_auto_priors` storage domain, because they describe model capabilities; clearing an override restores the catalog prior. Workspace outcome weights stay in the per-workspace ledger. In the composer card's **Scheduling & learning** table every weight has **Edit**, **Save** and **Clear override** with an optional reason; learning never overwrites a user weight.
 

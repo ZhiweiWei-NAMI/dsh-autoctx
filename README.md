@@ -74,7 +74,7 @@ dsh plugin --profile autoctx remove dsh-autoctx
 
 ## 设置与默认值
 
-Web 界面：左下角 **Settings → DSH AutoCTX**，或 **Plugins → dsh-autoctx → Configure**。表单覆盖当前全部 Config 字段，含计划预算、provider 逗号列表、强度与缓存预算、子代理请求上限、原生阈值和记录路径。`routes` 与 `strategy` 使用 JSON 编辑器，拒绝格式或字段结构不符的输入。设置仍走宿主配置表单的版本与可写性检查；`apiKey` 保持 secret 控件，客户端只读取是否已配置。
+Web 界面：左下角 **更多 → 设置 → DSH AutoCTX**。表单覆盖当前全部 Config 字段，含计划预算、provider 逗号列表、强度与缓存预算、子代理请求上限、原生阈值和记录路径。`routes` 与 `strategy` 使用 JSON 编辑器，拒绝格式或字段结构不符的输入。设置仍走宿主配置表单的版本与可写性检查；`apiKey` 保持 secret 控件，客户端只读取是否已配置。
 
 设置页另列模型目录与配置路由，展示目录先验，并允许编辑或清除用户覆盖（可填原因）。先验描述模型能力，因此按部署共享，连同完整编辑历史保存在 `dsh_auto_priors` storage domain；清除覆盖后恢复目录先验。任务结果权重仍按工作区保存在账本中；输入框卡片的「调度与学习」权重表支持逐项编辑、保存、清除 [0,1] 的用户权重并填写原因，学习不会覆盖用户偏好。
 
