@@ -2,11 +2,14 @@
 """Full-evaluation comparison (metadata only; theoretical cost, not billed).
 
 Walks one evaluation root (e.g. results/full-<commit>) for case directories <task>/<arm> holding result.json, skipping
-_infra-archive. A case is valid when it has no infra-error.json and, for arm A, no Jev transport failure. For each
+_infra-archive. A case is valid when it has no infra-error.json and, for arm A, no `jev_unavailable` (Jev fell back
+after the plugin's own retry). For each
 executor x arm: valid cases, official resolved rate, wall time, execution/Jev requests and theoretical USD (catalog
 prices, exact-prefix reuse, same assumptions for every arm; see singlecase_export.export). Paired comparisons per
 executor match the same (task, repeat) across arms; differences are A minus the other arm, with a percentile
-bootstrap 95% interval over tasks (task-level means across repeats; 10000 resamples, fixed seed).
+bootstrap 95% interval over tasks (task-level means across repeats; 10000 resamples, fixed seed). Reruns after infra
+errors are counted per arm from _infra-archive; because long runs are likelier to hit a transient error, a
+sensitivity table repeats the paired comparison without any pair that involved a rerun.
 
 Usage: full_report.py ROOT [--json OUT] [--md OUT]
 """
@@ -26,11 +29,12 @@ LABEL = {'A': 'AutoCTX', 'B': 'single agent (plugin off)', 'C': 'native subagent
 
 
 def jev_transport(case):
+    """Jev fell back after the plugin's own retry (`jev_unavailable`); retried-and-recovered calls are valid."""
     try:
-        calls = json.loads((case / 'requests.json').read_text())
+        records = json.loads((case / 'decisions-and-children.json').read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return 0
-    return sum(1 for c in calls if c.get('kind') == 'jev' and c.get('httpStatus') != 200 and c.get('transportError'))
+    return sum(1 for r in records if r.get('kind') == 'jev_unavailable')
 
 
 def repeat_of(case):
@@ -52,6 +56,18 @@ def cases(root):
         yield case
 
 
+def reruns(root):
+    """(executor, arm, task, repeat) keys with archived infra-affected attempts, and the attempt counts."""
+    counts = {}
+    for result in (root / '_infra-archive').glob('**/result.json'):
+        case = result.parent
+        arm = case.name.split('-')[0]
+        executor = json.loads(result.read_text()).get('model')
+        key = (executor, arm, case.parent.name, repeat_of(case))
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def collect(root):
     rows = []
     for case in cases(root):
@@ -60,7 +76,7 @@ def collect(root):
         if (case / 'infra-error.json').exists():
             invalid.append('infra-error')
         if case.name == 'A' and jev_transport(case):
-            invalid.append('jev-transport')
+            invalid.append('jev-unavailable')
         rows.append({'executor': e['executor'], 'arm': case.name, 'task': case.parent.name, 'repeat': repeat_of(case),
                      'valid': not invalid, 'invalid': invalid, 'resolved': e['official']['resolved'] is True,
                      'graded': e['official']['status'] is not None, 'status': e['executionStatus'],
@@ -81,8 +97,38 @@ def bootstrap(diffs, n=10000, seed=1):
     return [round(means[int(0.025 * n)], 4), round(means[int(0.975 * n) - 1], 4)]
 
 
-def summarize(rows):
-    out = {'arms': [], 'paired': []}
+def paired(rows, ex, other, exclude):
+    """A vs other on the same (task, repeat); pairs where either arm has a key in `exclude` are dropped."""
+    key = lambda r: (r['task'], r['repeat'])
+    skip = {(t, k) for (e, _, t, k) in exclude if e == ex}
+    a = {key(r): r for r in rows if r['executor'] == ex and r['arm'] == 'A' and r['valid']}
+    o = {key(r): r for r in rows if r['executor'] == ex and r['arm'] == other and r['valid']}
+    keys = sorted((a.keys() & o.keys()) - skip)
+    pairs = [(a[k], o[k]) for k in keys]
+    if not pairs:
+        return None
+    tasks = sorted({k[0] for k in keys})
+    per_task = {m: [statistics.fmean(f(x, y) for (x, y) in pairs if x['task'] == t) for t in tasks] for m, f in {
+        'resolved': lambda x, y: int(x['resolved']) - int(y['resolved']),
+        'wall': lambda x, y: x['wall'] - y['wall'],
+        'usd': lambda x, y: x['usd'] - y['usd']}.items()}
+    return {
+        'executor': ex, 'comparison': f'A vs {other}', 'pairs': len(pairs), 'tasks': len(tasks),
+        'aResolvedOnly': sum(1 for x, y in pairs if x['resolved'] and not y['resolved']),
+        'otherResolvedOnly': sum(1 for x, y in pairs if y['resolved'] and not x['resolved']),
+        'bothResolved': sum(1 for x, y in pairs if x['resolved'] and y['resolved']),
+        'neitherResolved': sum(1 for x, y in pairs if not x['resolved'] and not y['resolved']),
+        'meanResolvedDiff': mean(per_task['resolved']), 'resolvedDiffCI95': bootstrap(per_task['resolved']),
+        'meanWallDiffSeconds': mean(per_task['wall']), 'wallDiffCI95': bootstrap(per_task['wall']),
+        'aFasterPairs': sum(1 for x, y in pairs if x['wall'] < y['wall']),
+        'meanUSDDiff': mean(per_task['usd']), 'usdDiffCI95': bootstrap(per_task['usd']),
+        'aCheaperPairs': sum(1 for x, y in pairs if x['usd'] < y['usd']),
+    }
+
+
+def summarize(rows, rerun_keys=None):
+    rerun_keys = rerun_keys or {}
+    out = {'arms': [], 'paired': [], 'pairedCleanOnly': []}
     executors = sorted({r['executor'] for r in rows})
     for ex in executors:
         for arm in ARMS:
@@ -99,49 +145,34 @@ def summarize(rows):
                 'meanUSD': mean([r['usd'] for r in ok]), 'totalUSD': round(sum(r['usd'] for r in ok), 4),
                 'meanExecRequests': mean([r['requests'] for r in ok if r['requests'] is not None]),
                 'meanJevRequests': mean([r['jev'] for r in ok]), 'meanChildren': mean([r['children'] for r in ok]),
+                'casesRerun': sum(1 for k in rerun_keys if k[0] == ex and k[1] == arm),
+                'archivedAttempts': sum(n for k, n in rerun_keys.items() if k[0] == ex and k[1] == arm),
             })
-        for other in ('B', 'C'):
-            key = lambda r: (r['task'], r['repeat'])
-            a = {key(r): r for r in rows if r['executor'] == ex and r['arm'] == 'A' and r['valid']}
-            o = {key(r): r for r in rows if r['executor'] == ex and r['arm'] == other and r['valid']}
-            pairs = [(a[k], o[k]) for k in sorted(a.keys() & o.keys())]
-            if not pairs:
-                continue
-            tasks = sorted({k[0] for k in a.keys() & o.keys()})
-            per_task = {m: [statistics.fmean(f(x, y) for (x, y) in pairs if x['task'] == t) for t in tasks] for m, f in {
-                'resolved': lambda x, y: int(x['resolved']) - int(y['resolved']),
-                'wall': lambda x, y: x['wall'] - y['wall'],
-                'usd': lambda x, y: x['usd'] - y['usd']}.items()}
-            out['paired'].append({
-                'executor': ex, 'comparison': f'A vs {other}', 'pairs': len(pairs), 'tasks': len(tasks),
-                'aResolvedOnly': sum(1 for x, y in pairs if x['resolved'] and not y['resolved']),
-                'otherResolvedOnly': sum(1 for x, y in pairs if y['resolved'] and not x['resolved']),
-                'bothResolved': sum(1 for x, y in pairs if x['resolved'] and y['resolved']),
-                'neitherResolved': sum(1 for x, y in pairs if not x['resolved'] and not y['resolved']),
-                'meanResolvedDiff': mean(per_task['resolved']), 'resolvedDiffCI95': bootstrap(per_task['resolved']),
-                'meanWallDiffSeconds': mean(per_task['wall']), 'wallDiffCI95': bootstrap(per_task['wall']),
-                'aFasterPairs': sum(1 for x, y in pairs if x['wall'] < y['wall']),
-                'meanUSDDiff': mean(per_task['usd']), 'usdDiffCI95': bootstrap(per_task['usd']),
-                'aCheaperPairs': sum(1 for x, y in pairs if x['usd'] < y['usd']),
-            })
+        for clean in (False, True):
+            for other in ('B', 'C'):
+                p = paired(rows, ex, other, rerun_keys if clean else {})
+                if p:
+                    out['pairedCleanOnly' if clean else 'paired'].append(p)
     return out
 
 
 def markdown(summary, title):
     lines = [f'# {title}', '', 'Theoretical cost at catalog list prices (not billed); official SWE-bench grading. '
              'Invalid = infra-affected after reruns (excluded).', '',
-             '| Executor | Arm | Valid / cases | Resolved | Rate | Non-finished | Mean wall s | Median wall s | Mean USD | Total USD | Mean exec req | Mean Jev req | Mean children |',
-             '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
+             '| Executor | Arm | Valid / cases | Ungraded | Resolved | Rate | Non-finished | Mean wall s | Median wall s | Mean USD | Total USD | Mean exec req | Mean Jev req | Mean children | Cases rerun (archived attempts) |',
+             '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for a in summary['arms']:
-        lines.append(f"| {a['executor']} | {a['arm']} {a['label']} | {a['valid']} / {a['cases']} | {a['resolved']} | {a['resolvedRate']} | {a['timeouts']} | "
-                     f"{a['meanWallSeconds']} | {a['medianWallSeconds']} | {a['meanUSD']} | {a['totalUSD']} | {a['meanExecRequests']} | {a['meanJevRequests']} | {a['meanChildren']} |")
-    lines += ['', '## Paired (same task and repeat; A minus other arm; 95% bootstrap CI over task means)', '',
-              '| Executor | Comparison | Pairs (tasks) | A only / other only / both / neither resolved | Resolved diff [CI] | Wall diff s [CI] | A faster | USD diff [CI] | A cheaper |',
-              '|---|---|---|---|---|---|---:|---|---:|']
-    for p in summary['paired']:
-        lines.append(f"| {p['executor']} | {p['comparison']} | {p['pairs']} ({p['tasks']}) | {p['aResolvedOnly']} / {p['otherResolvedOnly']} / {p['bothResolved']} / {p['neitherResolved']} | "
-                     f"{p['meanResolvedDiff']} {p['resolvedDiffCI95']} | {p['meanWallDiffSeconds']} {p['wallDiffCI95']} | {p['aFasterPairs']}/{p['pairs']} | "
-                     f"{p['meanUSDDiff']} {p['usdDiffCI95']} | {p['aCheaperPairs']}/{p['pairs']} |")
+        lines.append(f"| {a['executor']} | {a['arm']} {a['label']} | {a['valid']} / {a['cases']} | {a['ungraded']} | {a['resolved']} | {a['resolvedRate']} | {a['timeouts']} | "
+                     f"{a['meanWallSeconds']} | {a['medianWallSeconds']} | {a['meanUSD']} | {a['totalUSD']} | {a['meanExecRequests']} | {a['meanJevRequests']} | {a['meanChildren']} | {a['casesRerun']} ({a['archivedAttempts']}) |")
+    for name, title in (('paired', 'Paired (same task and repeat; A minus other arm; 95% bootstrap CI over task means)'),
+                        ('pairedCleanOnly', 'Sensitivity: paired, excluding pairs where either arm was rerun after an infra error')):
+        lines += ['', f'## {title}', '',
+                  '| Executor | Comparison | Pairs (tasks) | A only / other only / both / neither resolved | Resolved diff [CI] | Wall diff s [CI] | A faster | USD diff [CI] | A cheaper |',
+                  '|---|---|---|---|---|---|---:|---|---:|']
+        for p in summary[name]:
+            lines.append(f"| {p['executor']} | {p['comparison']} | {p['pairs']} ({p['tasks']}) | {p['aResolvedOnly']} / {p['otherResolvedOnly']} / {p['bothResolved']} / {p['neitherResolved']} | "
+                         f"{p['meanResolvedDiff']} {p['resolvedDiffCI95']} | {p['meanWallDiffSeconds']} {p['wallDiffCI95']} | {p['aFasterPairs']}/{p['pairs']} | "
+                         f"{p['meanUSDDiff']} {p['usdDiffCI95']} | {p['aCheaperPairs']}/{p['pairs']} |")
     return '\n'.join(lines) + '\n'
 
 
@@ -149,7 +180,7 @@ def main():
     root = Path(sys.argv[1]).resolve()
     args = sys.argv[2:]
     rows = collect(root)
-    summary = summarize(rows)
+    summary = summarize(rows, reruns(root))
     summary['cases'] = rows
     if '--json' in args:
         Path(args[args.index('--json') + 1]).write_text(json.dumps(summary, indent=1) + '\n')

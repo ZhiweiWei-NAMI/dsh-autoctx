@@ -1,0 +1,43 @@
+{
+  "dataset": "princeton-nlp/SWE-bench_Verified",
+  "split": "test",
+  "selection_rule": "First 12 pytest-dev/pytest instances by lexicographic instance_id, fixed before solving; narrow preliminary sample to reuse CPU Docker environments.",
+  "tasks": [
+    {
+      "instance_id": "pytest-dev__pytest-10081",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "da9a2b584eb7a6c7e924b2621ed0ddaeca0a7bea",
+      "version": "7.2"
+    },
+    {
+      "instance_id": "pytest-dev__pytest-5262",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "58e6a09db49f34886ff13f3b7520dd0bcd7063cd",
+      "version": "4.5"
+    },
+    {
+      "instance_id": "pytest-dev__pytest-5787",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "955e54221008aba577ecbaefa15679f6777d3bf8",
+      "version": "5.1"
+    },
+    {
+      "instance_id": "pytest-dev__pytest-5840",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "73c5b7f4b11a81e971f7d1bb18072e06a87060f4",
+      "version": "5.1"
+    },
+    {
+      "instance_id": "pytest-dev__pytest-6202",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "3a668ea6ff24b0c8f00498c3144c63bac561d925",
+      "version": "5.2"
+    },
+    {
+      "instance_id": "pytest-dev__pytest-7236",
+      "repo": "pytest-dev/pytest",
+      "base_commit": "c98bc4cd3d687fe9b392d8eecd905627191d4f06",
+      "version": "5.4"
+    }
+  ]
+}
