@@ -53,3 +53,49 @@ test("withdrawn feedback leaves the pending card under a new version", () => {
   assert.deepEqual(Object.keys(ledger.pending.items), ["t|m|reviewer"]);
   assert.equal(ledger.pending.version, 2);
 });
+
+test("user reason and actual stored value are retained, including clearing an override", () => {
+  let ledger = setUser(emptyLedger(), "t|m|worker", 0.23456, 10, "Prefer this route");
+  assert.deepEqual(ledger.history.at(-1).changes, [
+    { key: "t|m|worker", from: null, to: 0.235, source: "user", reason: "Prefer this route" },
+  ]);
+  ledger = setUser(ledger, "t|m|worker", null, 20, "Use learned weight");
+  assert.deepEqual(ledger.history.at(-1).changes, [
+    { key: "t|m|worker", from: 0.235, to: null, source: "user", reason: "Use learned weight" },
+  ]);
+  assert.equal(ledger.weights["t|m|worker"].user, undefined);
+});
+
+test("auto and approved changes preserve full basis, evidence ids and proposal source", () => {
+  const item = { ...proposal("t|m|worker", 1, "turn:real"), basis: "Jev basis ".repeat(60), source: "jev" };
+  for (const mode of ["auto", "manual"]) {
+    let ledger = propose(emptyLedger(mode), [item], 1).ledger;
+    if (mode === "manual") ledger = approve(ledger, ledger.pending.version, 2).ledger;
+    const change = ledger.history.at(-1).changes[0];
+    assert.equal(change.basis, item.basis);
+    assert.equal(change.source, "jev");
+    assert.deepEqual(change.evidence, ["turn:real"]);
+    const restored = revert(ledger, ledger.version, 3).ledger.history.at(-1).changes[0];
+    assert.equal(restored.basis, item.basis);
+    assert.deepEqual(restored.evidence, ["turn:real"]);
+  }
+});
+
+test("old histories and pending items without provenance remain usable", () => {
+  const old = JSON.parse(JSON.stringify({ ...emptyLedger("manual"), version: 1,
+    weights: { "t|m|worker": { learned: 0.75, n: 1 } },
+    history: [{ version: 1, at: 1, via: "auto", changes: [{ key: "t|m|worker", from: 0.5, to: 0.75 }] }],
+    pending: { version: 1, baseVersion: 1, items: { "t|m|worker": { current: 0.75, target: 1, proposed: 0.833, evidence: ["e2"] } } },
+  }));
+  const approved = approve(old, 1, 2).ledger;
+  assert.equal(approved.weights["t|m|worker"].learned, 0.833);
+  assert.equal(approved.history.at(-1).changes[0].source, undefined);
+  assert.equal(revert(old, 1, 3).ledger.weights["t|m|worker"].learned, 0.5);
+  assert.equal(setUser(old, "t|m|worker", 0, 4).weights["t|m|worker"].user, 0);
+});
+
+test("user edits refuse invalid values rather than clipping or coercing them", () => {
+  for (const value of [-0.1, 1.1, NaN, Infinity, false, "0.5", undefined])
+    assert.throws(() => setUser(emptyLedger(), "t|m|worker", value, 1), TypeError);
+  assert.throws(() => setUser(emptyLedger(), "t|m|worker", 0.5, 1, {}), TypeError);
+});
