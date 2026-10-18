@@ -1,12 +1,12 @@
 # dsh-autoctx
 
-面向 dsh 的上下文与子代理决策插件，版本 **1.2.3**。Jev 负责评分和结构化选择，插件通过 dsh 原生会话、工具、子代理和压缩执行决策；编码仍由执行模型完成。
+面向 dsh 的上下文与子代理决策插件，版本 **1.2.4**。Jev 负责评分和结构化选择，插件通过 dsh 原生会话、工具、子代理和压缩执行决策；编码仍由执行模型完成。
 
 [English](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/README.en.md) · [源码](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
 
 ## 环境与所需账号
 
-已验证的宿主为 **dsh `0.2.0-rc.2`**，使用 Node 22。`@deepseek-ai/dsh-*` 包的 peer dependency 范围为 `^0.1.5-rc.1 || ^0.2.0-rc.1`。npm 包名为 `dsh-autoctx`，入口为 `index.js`，Web 客户端为 `./client.js`。
+已验证的宿主为 **dsh `0.2.0-rc.2` 与 `0.2.1-rc.2`**，使用 Node 22。`@deepseek-ai/dsh-*` 包的 peer dependency 范围为 `^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1`。1.2.4 适配 dsh 0.2.1 的子代理启动接口（`startActivation`），同时兼容 0.2.0；调度与学习逻辑与 1.2.3 相同。npm 包名为 `dsh-autoctx`，入口为 `index.js`，Web 客户端为 `./client.js`。
 
 你需要提供：
 
@@ -31,7 +31,7 @@
    ```sh
    dsh plugin --profile autoctx add dsh-autoctx
    # 或使用发布标签
-   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.3
+   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.4
    ```
 
    `dsh plugin --profile <name> <pnpm-args...>` 把参数传给 pnpm。Profile 位于 `$DSH_HOME/profiles/<name>`。包声明的 dsh bundle patch（`cordis.patch.yml`）会挂载插件并停用原生 `compaction-basic`，无需手工重复挂载。
@@ -61,7 +61,7 @@ dsh --profile autoctx --patch "$DSH_HOME/profiles/autoctx/node_modules/dsh-autoc
 ```sh
 dsh plugin --profile autoctx add dsh-autoctx@latest
 # 或固定版本
-dsh plugin --profile autoctx add dsh-autoctx@1.2.3
+dsh plugin --profile autoctx add dsh-autoctx@1.2.4
 ```
 
 卸载前，先删除自己在 profile 的 `cordis.patch.yml` 中添加的 `- id: dsh-autoctx` 覆盖项，再执行：
@@ -139,7 +139,7 @@ Jev 调用、reviewer/advisor 子代理及其执行模型调用、回合结束�
 | H | 原生异构子代理；在执行模型及额外 3 个模型的每个（模型，effort）组合上提供一个原生子代理工具，由执行模型选择 |
 | AutoCTX frozen / auto | 1.2.3；reviewer `auto`、advisor `auto`、相同的额外 3 个模型、`jev-1.13`；分别使用 frozen 和 auto 学习；auto 在同一次运行的案例间沿用账本 |
 
-额外 3 个模型为 `glm-5.3-flash`（执行模型为它时改用 `deepseek-v4.1-flash`）、`deepseek-v4-pro`、`claude-haiku-5-5`。B/C/H 不加载插件，均早于 1.2.3 运行。B/C 与 1.2.3 使用同一 harness 入口；H 第 1 轮使用更早的 harness 快照（`run.py` 有差异），任务和上述限制相同。
+额外 3 个模型为 `glm-5.3-flash`（执行模型为它时改用 `deepseek-v4.1-flash`）、`deepseek-v4-pro`、`claude-haiku-5-5`。以下结果为 1.2.3 在 dsh 0.2.0-rc.2 上的测量；1.2.4 只改动宿主兼容层，未重新跑基准。B/C/H 不加载插件，均早于 1.2.3 运行。B/C 与 1.2.3 使用同一 harness 入口；H 第 1 轮使用更早的 harness 快照（`run.py` 有差异），任务和上述限制相同。
 
 | 指标（每组 72 个案例） | AutoCTX frozen | AutoCTX auto | B | C | H |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -179,4 +179,4 @@ python3 bench/grade.py <dir> --parallel 3
 
 ## 从旧版本升级
 
-按上面的升级步骤安装 1.2.3，并对照当前配置表检查 profile 覆盖项。不要沿用旧 README 中的默认模型或安装标签；当前默认是计费的 `jev-1.13`，发布标签为 `v1.2.3`。
+按上面的升级步骤安装 1.2.4，并对照当前配置表检查 profile 覆盖项。不要沿用旧 README 中的默认模型或安装标签；当前默认是计费的 `jev-1.13`，发布标签为 `v1.2.4`。

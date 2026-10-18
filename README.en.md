@@ -1,12 +1,12 @@
 # dsh-autoctx
 
-Context and subagent decision plugin for dsh, version **1.2.3**. Jev scores options and makes structured choices; the plugin implements them through native dsh sessions, tools, subagents and compaction. The executor model still does all the coding.
+Context and subagent decision plugin for dsh, version **1.2.4**. Jev scores options and makes structured choices; the plugin implements them through native dsh sessions, tools, subagents and compaction. The executor model still does all the coding.
 
 [中文](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/README.md) · [Source](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
 
 ## Environment and accounts
 
-The verified host is **dsh `0.2.0-rc.2`**, using Node 22. Peer dependencies for the `@deepseek-ai/dsh-*` packages accept `^0.1.5-rc.1 || ^0.2.0-rc.1`. The npm package is `dsh-autoctx`, its entry is `index.js`, and its web client is `./client.js`.
+Verified hosts are **dsh `0.2.0-rc.2` and `0.2.1-rc.2`**, using Node 22. Peer dependencies for the `@deepseek-ai/dsh-*` packages accept `^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1`. 1.2.4 adapts to dsh 0.2.1's subagent start API (`startActivation`) while keeping 0.2.0 support; scheduling and learning logic are unchanged from 1.2.3. The npm package is `dsh-autoctx`, its entry is `index.js`, and its web client is `./client.js`.
 
 You must provide:
 
@@ -31,7 +31,7 @@ Without `apiKey`, the plugin makes no network call, the session runs in native m
    ```sh
    dsh plugin --profile autoctx add dsh-autoctx
    # Or use the release tag
-   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.3
+   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.4
    ```
 
    `dsh plugin --profile <name> <pnpm-args...>` passes arguments to pnpm. Profiles live in `$DSH_HOME/profiles/<name>`. The package's declared dsh bundle patch (`cordis.patch.yml`) mounts the plugin and disables native `compaction-basic`; no duplicate manual mount is needed.
@@ -61,7 +61,7 @@ Upgrade to the latest version, or pin this version:
 ```sh
 dsh plugin --profile autoctx add dsh-autoctx@latest
 # Or pin the version
-dsh plugin --profile autoctx add dsh-autoctx@1.2.3
+dsh plugin --profile autoctx add dsh-autoctx@1.2.4
 ```
 
 Before uninstalling, delete any `- id: dsh-autoctx` override you added to the profile's `cordis.patch.yml`, then run:
@@ -139,7 +139,7 @@ Limits are identical for every arm: **600 seconds per task, 64 model requests pe
 | H | Native heterogeneous subagents; one native subagent tool per (model, effort) over the executor plus 3 extra models, chosen by the executor |
 | AutoCTX frozen / auto | 1.2.3; reviewer `auto`, advisor `auto`, the same 3 extra models, `jev-1.13`; frozen and auto learning respectively; auto carries the ledger across cases within a run |
 
-The 3 extra models are `glm-5.3-flash` (use `deepseek-v4.1-flash` when the executor is glm), `deepseek-v4-pro` and `claude-haiku-5-5`. B/C/H do not load the plugin and were run before 1.2.3. B/C used the same harness entry as 1.2.3; H run 1 used an earlier harness snapshot (its `run.py` differs) with the same tasks and the limits above.
+The 3 extra models are `glm-5.3-flash` (use `deepseek-v4.1-flash` when the executor is glm), `deepseek-v4-pro` and `claude-haiku-5-5`. These results were measured with 1.2.3 on dsh 0.2.0-rc.2; 1.2.4 changes only the host compatibility layer and was not re-benchmarked. B/C/H do not load the plugin and were run before 1.2.3. B/C used the same harness entry as 1.2.3; H run 1 used an earlier harness snapshot (its `run.py` differs) with the same tasks and the limits above.
 
 | Metric (72 cases per arm) | AutoCTX frozen | AutoCTX auto | B | C | H |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -179,4 +179,4 @@ Replace `<dir>` with an output directory. A is AutoCTX; use separate directories
 
 ## Upgrading from older versions
 
-Install 1.2.3 using the upgrade steps above and check profile overrides against the current configuration table. Do not carry over the old README's default model or installation tag: the current default is billed `jev-1.13`, and the release tag is `v1.2.3`.
+Install 1.2.4 using the upgrade steps above and check profile overrides against the current configuration table. Do not carry over the old README's default model or installation tag: the current default is billed `jev-1.13`, and the release tag is `v1.2.4`.
