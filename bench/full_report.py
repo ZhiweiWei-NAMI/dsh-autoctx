@@ -57,13 +57,13 @@ def cases(root):
 
 
 def reruns(root):
-    """(executor, arm, task, repeat) keys with archived infra-affected attempts, and the attempt counts."""
+    """(executor, arm, task, repeat) keys with archived infra-affected attempts, and the attempt counts. Archived
+    attempts are counted by their infra-reasons.json (some were archived before writing result.json)."""
+    archive = root / '_infra-archive'
     counts = {}
-    for result in (root / '_infra-archive').glob('**/result.json'):
-        case = result.parent
-        arm = case.name.split('-')[0]
-        executor = json.loads(result.read_text()).get('model')
-        key = (executor, arm, case.parent.name, repeat_of(case))
+    for reasons in archive.glob('**/infra-reasons.json'):
+        case = reasons.parent
+        key = (case.relative_to(archive).parts[0], case.name.split('-')[0], case.parent.name, repeat_of(case))
         counts[key] = counts.get(key, 0) + 1
     return counts
 
