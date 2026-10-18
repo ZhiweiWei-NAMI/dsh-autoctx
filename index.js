@@ -130,10 +130,10 @@ export const Config = z.object({
     ),
   learning: z
     .union(["auto", "manual", "frozen"])
-    .default("auto")
+    .default("frozen")
     .volatile()
     .description(
-      "Workspace adaptation weights: auto applies Jev's proposals, manual waits for approval, frozen only records them",
+      "Workspace adaptation weights: frozen (default) only records evidence, auto (beta) applies Jev's proposals, manual waits for approval",
     ),
   advisorMaxConsults: z
     .number()

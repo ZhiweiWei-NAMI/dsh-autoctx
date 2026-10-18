@@ -55,5 +55,5 @@
   "scripts": {
     "test": "node --test test/*.test.js"
   },
-  "description": "Jev-decided auto routing, subagents and context compaction for dsh, with a settings page and a composer statistics chip"
+  "description": "dsh plugin: Jev-scored delegation, evidence-based context selection, independent review/advisor and per-workspace model weights, with a settings page and a composer chip"
 }
