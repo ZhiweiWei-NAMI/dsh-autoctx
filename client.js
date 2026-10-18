@@ -52,7 +52,7 @@ window.__ModuleLoader__.load({
 			configuredRoutes: "Configured routes", catalogModels: "Catalog models", noCandidates: "No candidates recorded.",
 			candidateHint: "Latest retained pool per role for the root session. Refresh view reads records; it does not recompute the pool.",
 			injectedTitle: "Injected by AutoCTX", noInjections: "No retained injection records in this turn.",
-			injectionHint: "Source metadata for this native conversation turn. Records are bounded in memory and are lost on restart.",
+			injectionHint: "Source labels of messages AutoCTX added in this turn (label, kind, size and time; no message text). Saved by the plugin and kept across restarts; sessions from earlier plugin versions have none.",
 			messageKind: "Kind", chars: "{n} characters", from: "From",
 
 			summary: "Auto routing, subagents and context compaction decided by Jev.",
@@ -249,7 +249,7 @@ window.__ModuleLoader__.load({
 			configuredRoutes: "配置路由", catalogModels: "目录模型", noCandidates: "暂无候选记录。",
 			candidateHint: "显示根会话每个角色最近保留的候选池。刷新视图只读取记录，不会重新计算候选池。",
 			injectedTitle: "由 AutoCTX 注入", noInjections: "本回合暂无保留的注入记录。",
-			injectionHint: "当前原生会话回合的来源元数据。记录有内存上限，重启后丢失。",
+			injectionHint: "本回合由 AutoCTX 添加的消息的来源标签（标签、类型、大小与时间，不含消息正文）。由插件持久保存，重启后仍在；旧版本插件运行的会话没有这些记录。",
 			messageKind: "类型", chars: "{n} 字符", from: "来自",
 
 			summary: "自动路由、子代理与上下文压缩均由 Jev 决策。",
