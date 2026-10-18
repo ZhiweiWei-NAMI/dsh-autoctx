@@ -144,7 +144,7 @@ def main():
             import mechanism_check
             m = mechanism_check.check(case)
             entry.update(reuseByAgent=m['reuseByAgent'], reuseTotals=m['reuseTotals'], children=m['children'],
-                         exploration=m['exploration'], mechanismReuseBasis=m['reuseBasis'], mechanismLabel=m['label'])
+                         exploration=m['exploration'], parentWork=m['parentWork'], mechanismReuseBasis=m['reuseBasis'], mechanismLabel=m['label'])
         summary['cases'].append(entry)
     for arg in separate:
         label, rest = arg.split('=', 1)
@@ -198,6 +198,54 @@ def main():
                              f"{ch['firstRequestSharedPrefixWithOtherSession']} / {ch['firstRequestMessages']} | "
                              f"{ch['firstRequestSharedPrefixTokens']} / {ch['firstRequestInputTokens']} / {ch['firstRequestObservedProviderCachedTokens']} | "
                              f"{ch['inspectionCalls']} | {ch['inspectionCallsOnParentKnownFiles']} |")
+        lines += ['', '## Child redundancy (own calls only; inherited seed calls excluded)', '',
+                  'A seeded child session begins with copies of the parent\'s events; those tool calls are the parent\'s work and are '
+                  'not counted for the child. Covered = child line-range reads already inside a parent read made before the child '
+                  'started (and not edited since). Repeated = exact repeats of the parent\'s pre-start grep/bash inspection commands.', '',
+                  '| Arm | Child | Inherited seed tool calls | Own tool calls | Ranged reads | Covered by inherited parent reads | Repeated parent inspection commands |',
+                  '|---|---|---:|---:|---:|---:|---:|']
+        for c in summary['cases']:
+            for ch in c['children']:
+                lines.append(f"| {c['label']} | {ch['child']} | {ch.get('inheritedSeedToolCalls', 0)} | {ch['toolCalls']} | {ch.get('childRangedReads', '-')} | "
+                             f"{ch.get('childReadsCoveredByInheritedReads', '-')} | {ch.get('childInspectionCommandsRepeatingParent', '-')} |")
+        lines += ['', '## Child edits and tests', '',
+                  'Edits: edit/write tools and bash in-place edits/redirections into repository-style paths (scratch files included). '
+                  'Test outcome from the last pytest summary line, else a reported exit code; deliberate pre-fix failure checks count as failed.', '',
+                  '| Arm | Child | Edit calls | Files edited | Of those in final patch | Test runs | Outcomes | Last test |',
+                  '|---|---|---:|---|---|---:|---|---|']
+        for c in summary['cases']:
+            for ch in c['children']:
+                outcomes = ', '.join(f"{k} {v}" for k, v in sorted(ch.get('childTestOutcomes', {}).items())) or '-'
+                lines.append(f"| {c['label']} | {ch['child']} | {ch.get('childEditCalls', 0)} | {', '.join(ch.get('childFilesEdited', [])) or '-'} | "
+                             f"{', '.join(ch.get('childEditedFilesInFinalPatch', [])) or '-'} | {ch.get('childTestRuns', 0)} | {outcomes} | {ch.get('childLastTestOutcome') or '-'} |")
+        lines += ['', '## Ownership until settlement and parent waits', '',
+                  'Outstanding window: child start until its settlement notice enters the parent\'s inbox (not its first message). '
+                  'Child files = files the child inspected or edited. Worktree resets = git stash/checkout --/restore/reset --hard/clean in '
+                  'the shared checkout (whole = no paths). Idle = window time outside the parent\'s model/tool steps.', '',
+                  '| Arm | Child | First message / settled s after start | Parent calls in window | Parent inspections on child files (window / before first message) | '
+                  'Parent edits on child files (window / before first message) | Parent edits on child-edited files | Parent test runs | '
+                  'Worktree resets (whole / covering child edits) | Native waits on child | Other waits (job_output) | Sleeps | Messages to child | '
+                  'Turn ends before settlement (wait s) | Idle s |',
+                  '|---|---|---|---:|---|---|---:|---:|---|---:|---:|---:|---:|---|---:|']
+        for c in summary['cases']:
+            for ch in c['children']:
+                if 'childSettledSecondsAfterStart' not in ch:
+                    continue
+                ends = ', '.join(ch['parentTurnEndsBeforeSettlement']) or 'none'
+                lines.append(f"| {c['label']} | {ch['child']} | {ch['resultDeliveredSecondsAfterStart']} / {ch['childSettledSecondsAfterStart']} | "
+                             f"{ch['parentCallsWhileOutstanding']} | {ch['parentInspectionsOnChildFilesWhileOutstanding']} / {ch['parentInspectionsOnChildFilesBeforeFirstMessage']} | "
+                             f"{ch['parentEditsOnChildFilesWhileOutstanding']} / {ch['parentEditsOnChildFilesBeforeFirstMessage']} | {ch['parentEditsOnChildEditedFilesWhileOutstanding']} | "
+                             f"{ch['parentTestRunsWhileOutstanding']} | {ch['parentWorktreeResetsWhileOutstanding']} ({ch['parentWholeWorktreeResetsWhileOutstanding']} / "
+                             f"{ch['parentWorktreeResetsCoveringChildEditedFiles']}) | {ch['parentNativeWaitCallsOnChild']} | {ch['parentWaitCallsOnOtherJobs']} | "
+                             f"{ch['parentSleepCallsWhileOutstanding']} | {ch['parentMessagesToChildWhileOutstanding']} | {ends} ({ch['parentWaitAfterTurnEndSeconds']}) | "
+                             f"{ch['parentIdleSecondsWhileOutstanding']} |")
+        lines += ['', '## Parent edits and tests', '', '| Arm | Edit calls | Files edited | Test runs | Outcomes | Worktree resets | Final patch files |',
+                  '|---|---:|---|---:|---|---:|---|']
+        for c in summary['cases']:
+            w = c.get('parentWork') or {}
+            outcomes = ', '.join(f"{k} {v}" for k, v in sorted(w.get('testOutcomes', {}).items())) or '-'
+            lines.append(f"| {c['label']} | {w.get('editCalls', 0)} | {', '.join(w.get('filesEdited', [])) or '-'} | {w.get('testRuns', 0)} | {outcomes} | "
+                         f"{w.get('worktreeResets', 0)} | {', '.join(w.get('finalPatchFiles', [])) or '-'} |")
         lines += ['', '## Exploration counts (heuristic: read-only inspection calls and repository files they touch)', '',
                   '| Arm | Tool calls | Inspection calls | Distinct files | Revisits same session | Revisits cross session | Parent inspections before / after first child | Files inspected by >1 child |',
                   '|---|---:|---:|---:|---:|---:|---|---:|']

@@ -12,6 +12,14 @@ Per case directory (result.json, requests.json, decisions-and-children.json, tri
 - Exploration: read-only inspection actions (read/grep/glob tools; bash commands made only of inspection programs)
   and the repository files they touch. Child re-exploration = child inspections of files the parent had already
   inspected before the child started; sibling overlap = files inspected by more than one child.
+- A seeded child session begins with copies of the parent's events (up to `session/end-seed`); those inherited tool
+  calls are the parent's work and are excluded from every child count (reported as inheritedSeedToolCalls).
+- Ownership: the child's result is outstanding from the child's start until its settlement (the `subagent-settled`
+  notice entering the parent's inbox), not until its first message; parent work in that window on files the child
+  inspected or edited is overlap. Also: worktree-wide resets/stashes in the shared checkout, child edits and test runs
+  (outcome from the pytest summary line or exit code in the tool result; only the outcome is kept), whether the child's
+  edited files are in the final patch, and how the parent waited (native waits, sleeps, messages to the child, turn
+  ends before settlement, idle time outside model/tool steps).
 Theoretical estimates, not billed cost.
 
 Usage: mechanism_check.py LABEL=CASE_DIR [...] [--json OUT]
@@ -125,15 +133,54 @@ def covered(rng, earlier):
 
 
 def editing(name, args):
-    """(is_edit, files) for one tool call: file-editing tools, or bash with in-place edits / redirections into repo files."""
+    """(is_edit, files) for one tool call: file-editing tools, or bash with in-place edits / redirections into repo files /
+    inline Python file writes (write_text, open(..., 'w'|'a'))."""
     if name in EDIT_TOOLS:
         text = ' '.join(str(v) for v in args.values() if isinstance(v, str))
         return True, {m.group(1) for m in PATH.finditer(text)}
     if name == 'bash':
         command = args.get('command') or ''
-        if re.search(r'sed\s+-i|>\s*\S+\.(py|rst|txt|cfg|toml)|apply_patch|git\s+apply|patch\s+-p', command):
+        if re.search(r'sed\s+-i|>\s*\S+\.(py|rst|txt|cfg|toml)|apply_patch|git\s+apply|patch\s+-p'
+                     r'|\.write_text\(|open\([^)]*,\s*[\'"][wa]\+?[\'"]', command):
             return True, {m.group(1) for m in PATH.finditer(command)}
     return False, set()
+
+
+TEST = re.compile(r'\bpytest\b|\btox\b|-m\s+unittest\b')
+ANSI = re.compile(r'\x1b\[[0-9;]*m')
+WAIT_TOOLS = {'job_output', 'wait', 'wait_agent', 'agent_wait', 'subagent_wait'}
+
+
+def test_outcome(text):
+    """'passed' / 'failed' / 'unknown' from a test command's tool result (last pytest summary line, else exit code)."""
+    text = ANSI.sub('', text)
+    lines = [line for line in text.splitlines() if re.search(r'\b\d+ (passed|failed|errors?)\b|no tests ran', line)]
+    if lines:
+        last = lines[-1]
+        return 'failed' if re.search(r'\b\d+ (failed|errors?)\b', last) else 'passed' if 'passed' in last else 'unknown'
+    codes = re.findall(r'[Ee]xit[ _]?code\W{0,3}(\d+)', text)
+    return 'failed' if codes and codes[-1] != '0' else 'unknown'
+
+
+def worktree_op(name, args):
+    """Repository files a bash command stashes or resets in the shared checkout ('*' = whole worktree)."""
+    if name != 'bash':
+        return set()
+    files = set()
+    for m in re.finditer(r'git\s+(stash|checkout|restore|reset|clean)\b([^&;|]*)', args.get('command') or ''):
+        verb, rest = m.group(1), m.group(2)
+        words = rest.split()
+        if verb == 'stash' and words and words[0] in ('pop', 'apply', 'list', 'show', 'drop', 'clear', 'branch'):
+            continue
+        if (verb == 'checkout' and '--' not in words) or (verb == 'reset' and '--hard' not in words) \
+                or (verb == 'clean' and not any(w.startswith('-') and 'f' in w for w in words)):
+            continue
+        files |= {p.group(1) for p in PATH.finditer(rest)} or {'*'}
+    return files
+
+
+def result_text(message):
+    return ' '.join(b.get('text', '') for b in message.get('content') or [] if isinstance(b, dict))
 
 
 def sessions(case):
@@ -142,25 +189,53 @@ def sessions(case):
         events = load_session(path)
         header = events[0] if events and events[0].get('type') == 'session' else {}
         descriptor = next((e['data'] for e in events if e.get('type') == 'subagent/descriptor'), {})
-        calls, deliveries, assistant_times = [], [], []
-        for e in events:
+        seed_end = max((i for i, e in enumerate(events) if e.get('type') == 'session/end-seed'), default=-1)
+        inherited = sum(1 for e in events[:seed_end + 1] if e.get('type') == 'tool/call')
+        calls, deliveries, splices, assistant_times, finals, steps, turn_ends, by_id = [], [], [], [], [], [], [], {}
+        step_start = None
+        for e in events[seed_end + 1:]:
             d = e.get('data') or {}
-            if e.get('type') == 'tool/call':
+            kind = e.get('type')
+            if kind == 'tool/call':
                 args = arguments(d)
                 is_inspect, files = inspection(d.get('name'), args)
                 edit, edit_files = editing(d.get('name'), args)
-                calls.append({'time': e.get('time'), 'name': d.get('name'), 'inspect': is_inspect, 'files': files,
-                              'edit': edit, 'editFiles': edit_files, 'text': json.dumps(args),
-                              'ranges': read_ranges(d.get('name'), args),
-                              'key': (d.get('name'), json.dumps(args, sort_keys=True)) if is_inspect and d.get('name') != 'read' else None})
-            elif e.get('type') == 'user/message' and isinstance(d.get('source'), dict) and d['source'].get('senderSessionId'):
+                call = {'time': e.get('time'), 'name': d.get('name'), 'inspect': is_inspect, 'files': files,
+                        'edit': edit, 'editFiles': edit_files, 'text': json.dumps(args),
+                        'ranges': read_ranges(d.get('name'), args),
+                        'key': (d.get('name'), json.dumps(args, sort_keys=True)) if is_inspect and d.get('name') != 'read' else None,
+                        'test': d.get('name') == 'bash' and bool(TEST.search(args.get('command') or '')), 'testOutcome': None,
+                        'worktree': worktree_op(d.get('name'), args), 'args': args}
+                calls.append(call)
+                by_id[d.get('callId')] = call
+            elif kind == 'tool/result':
+                call = by_id.get((d.get('message') or {}).get('toolCallId'))
+                if call and call['test']:
+                    call['testOutcome'] = test_outcome(result_text(d['message']))
+            elif kind == 'user/message' and isinstance(d.get('source'), dict) and d['source'].get('senderSessionId'):
                 deliveries.append({'time': e.get('time'), 'from': d['source']['senderSessionId'], 'kind': d['source'].get('kind')})
-            elif e.get('type') == 'assistant/message':
+            elif kind == 'agent/inbox/spliced':
+                for item in d.get('inserted') or []:
+                    source = item.get('source') if isinstance(item.get('source'), dict) else {}
+                    if source.get('senderSessionId'):
+                        splices.append({'time': e.get('time'), 'from': source['senderSessionId'], 'kind': source.get('kind')})
+            elif kind == 'assistant/message':
                 assistant_times.append(e.get('time'))
+                content = (d.get('message') or d).get('content') or []
+                if not any('tool' in str(b.get('type') or '').lower() for b in content if isinstance(b, dict)):
+                    finals.append(e.get('time'))
+            elif kind == 'step/start':
+                step_start = e.get('time')
+            elif kind == 'step/end' and step_start is not None:
+                steps.append((step_start, e.get('time')))
+                step_start = None
+            elif kind == 'turn/end':
+                turn_ends.append({'time': e.get('time'), 'reason': (d.get('reason') or {}).get('kind')})
         out[header.get('id') or os.path.basename(os.path.dirname(path))] = {
             'parent': header.get('parentSession'), 'seeded': header.get('isSeeded'), 'created': header.get('createdAt'),
             'provider': descriptor.get('provider'), 'model': descriptor.get('agentModel'),
-            'effort': descriptor.get('agentReasoningEffort'), 'calls': calls, 'deliveries': deliveries,
+            'effort': descriptor.get('agentReasoningEffort'), 'calls': calls, 'deliveries': deliveries, 'splices': splices,
+            'inheritedCalls': inherited, 'finals': finals, 'steps': steps, 'turnEnds': turn_ends,
             'lastAssistant': max(assistant_times, default=None), 'lastEvent': max((e.get('time') or 0 for e in events), default=None),
             'seedEvents': sum(1 for e in events if e.get('type') == 'session/end-seed')}
     return out
@@ -214,31 +289,75 @@ def reuse_split(calls, space_kind='content'):
     return rows
 
 
-def ownership(sess, root, child, child_files, rows):
-    """Delivery/consumption of one child's result in the parent, and parent work overlapping the child's files while
-    the child's result was outstanding. Times are session event times (ms)."""
+def ownership(sess, root, child, child_files, rows, patch_files):
+    """Delivery/consumption of one child's result in the parent; parent work overlapping the child's files, worktree
+    resets and how the parent waited, while the child's result was outstanding (child start -> settlement, where
+    settlement is the `subagent-settled` notice entering the parent's inbox; unsettled = until the parent's last event).
+    Also the child's own edits and test runs. Times are session event times (ms)."""
     if not root:
         return {}
     parent, v = sess[root], sess[child]
     start = v['created'] or 0
     mine = [d for d in parent['deliveries'] if d['from'] == child]
-    first = min((d['time'] for d in mine), default=None)
-    settled = min((d['time'] for d in mine if d['kind'] == 'subagent-settled'), default=None)
+    spliced = [d for d in parent['splices'] if d['from'] == child]
+    first = min((d['time'] for d in spliced + mine), default=None)
+    settled = min((d['time'] for d in spliced + mine if d['kind'] == 'subagent-settled'), default=None)
     parent_requests = [row['request'] for row in rows if row['request'].get('session') == root and row['request'].get('role') == 'main']
     after = [r for r in parent_requests if first is not None and (r.get('startedUnix') or 0) * 1000 > first]
-    end = first if first is not None else (parent['lastAssistant'] or 0)
+    end = settled if settled is not None else (parent['lastEvent'] or 0)
     window = [x for x in parent['calls'] if start <= (x['time'] or 0) <= end]
+    early = [x for x in window if first is not None and (x['time'] or 0) <= first]
+    child_edited = {re.sub(r'^/testbed/', '', f) for x in v['calls'] if x['edit'] for f in x['editFiles']}
+    touched = child_files | child_edited
+    norm = lambda fs: {re.sub(r'^/testbed/', '', f) for f in fs}
+    resets = [x for x in window if x['worktree']]
+    to_child = [x for x in parent['calls'] if x['name'] == 'send_message' and x['args'].get('agent_id') == child]
+    idle = 0.0
+    if end > start:
+        covered_ms, cursor = 0, start
+        for a, b in sorted(parent['steps']):
+            a, b = max(a or 0, cursor), min(b or 0, end)
+            if b > a:
+                covered_ms += b - a
+                cursor = b
+        idle = round((end - start - covered_ms) / 1000, 1)
+    ends_before = [t for t in parent['turnEnds'] if start <= (t['time'] or 0) < end]
+    tests = [x for x in v['calls'] if x['test']]
     return {
         'resultDeliveries': [d['kind'] for d in mine],
         'resultDeliveredSecondsAfterStart': round((first - start) / 1000, 1) if first is not None else None,
         'resultDeliveredBeforeParentFinalAnswer': first is not None and parent['lastAssistant'] is not None and first < parent['lastAssistant'],
         'parentRequestsAfterDelivery': len(after),
         'childSettledSecondsAfterStart': round((settled - start) / 1000, 1) if settled is not None else None,
+        'outstandingWindow': 'child start -> settlement' if settled is not None else 'child start -> parent end (never settled)',
         'parentCallsWhileOutstanding': len(window),
-        'parentInspectionsOnChildFilesWhileOutstanding': sum(1 for x in window if x['inspect'] and x['files'] & child_files),
+        'parentInspectionsOnChildFilesWhileOutstanding': sum(1 for x in window if x['inspect'] and norm(x['files']) & touched),
         'parentEditsWhileOutstanding': sum(1 for x in window if x['edit']),
-        'parentEditsOnChildFilesWhileOutstanding': sum(1 for x in window if x['edit'] and x['editFiles'] & child_files),
+        'parentEditsOnChildFilesWhileOutstanding': sum(1 for x in window if x['edit'] and norm(x['editFiles']) & touched),
+        'parentEditsOnChildEditedFilesWhileOutstanding': sum(1 for x in window if x['edit'] and norm(x['editFiles']) & child_edited),
+        'parentInspectionsOnChildFilesBeforeFirstMessage': sum(1 for x in early if x['inspect'] and norm(x['files']) & touched),
+        'parentEditsOnChildFilesBeforeFirstMessage': sum(1 for x in early if x['edit'] and norm(x['editFiles']) & touched),
+        'parentTestRunsWhileOutstanding': sum(1 for x in window if x['test']),
+        'parentWorktreeResetsWhileOutstanding': len(resets),
+        'parentWholeWorktreeResetsWhileOutstanding': sum(1 for x in resets if '*' in x['worktree']),
+        'parentWorktreeResetsCoveringChildEditedFiles': sum(1 for x in resets if '*' in x['worktree'] or norm(x['worktree']) & child_edited),
         'parentCallsNamingChild': sorted({x['name'] for x in parent['calls'] if child in x['text']}),
+        'parentNativeWaitCallsOnChild': sum(1 for x in window if x['name'] in WAIT_TOOLS and child in x['text']),
+        'parentWaitCallsOnOtherJobs': sum(1 for x in window if x['name'] in WAIT_TOOLS and child not in x['text']),
+        'parentSleepCallsWhileOutstanding': sum(1 for x in window if x['name'] == 'bash' and re.search(r'\bsleep\s+\d', x['args'].get('command') or '')),
+        'parentMessagesToChild': len(to_child),
+        'parentMessagesToChildWhileOutstanding': sum(1 for x in to_child if start <= (x['time'] or 0) <= end),
+        'parentTurnEndsBeforeSettlement': [t['reason'] for t in ends_before],
+        'parentWaitAfterTurnEndSeconds': round((end - ends_before[0]['time']) / 1000, 1) if ends_before else 0.0,
+        'parentIdleSecondsWhileOutstanding': idle,
+        'parentFinalAnswerBeforeSettlement': settled is not None and any(start <= t < settled for t in parent['finals']),
+        'inheritedSeedToolCalls': v['inheritedCalls'],
+        'childEditCalls': sum(1 for x in v['calls'] if x['edit']),
+        'childFilesEdited': sorted(child_edited),
+        'childEditedFilesInFinalPatch': sorted(child_edited & patch_files),
+        'childTestRuns': len(tests),
+        'childTestOutcomes': dict(collections.Counter(x['testOutcome'] or 'unknown' for x in tests)),
+        'childLastTestOutcome': (tests[-1]['testOutcome'] or 'unknown') if tests else None,
     }
 
 
@@ -272,6 +391,8 @@ def check(case):
     rows = reuse_split(calls, 'content')
     rows_split = {id(row['request']): row for row in reuse_split(calls, 'config')}
     sess = sessions(case)
+    patch_path = os.path.join(case, 'patch.diff')
+    patch_files = set(re.findall(r'^diff --git a/(\S+) b/', open(patch_path).read(), re.M)) if os.path.exists(patch_path) else set()
     root = next((s for s, v in sess.items() if not v['parent']), None)
     children = sorted((s for s, v in sess.items() if v['parent']), key=lambda s: sess[s]['created'] or 0)
     tag = {root: 'parent', **{c: f'child{i + 1}' for i, c in enumerate(children)}}
@@ -314,7 +435,7 @@ def check(case):
             'firstRequestContainsWholeEarlierRequestOfMessages': first['containsOtherRequestMessages'] if first else None,
             'firstRequestInputTokens': first['request']['inputTokens'] if first else None,
             'firstRequestObservedProviderCachedTokens': (first['request'].get('cachedTokens') or 0) if first else None,
-            **ownership(sess, root, c, files, rows),
+            **ownership(sess, root, c, files, rows, patch_files),
             **redundancy(sess, root, c),
             'toolCalls': len(v['calls']), 'inspectionCalls': len(inspects), 'filesInspected': len(files),
             'parentFilesKnownAtStart': len(known),
@@ -337,6 +458,7 @@ def check(case):
             else:
                 first_seen[f] = {s}
     parent_calls = sess[root]['calls'] if root else []
+    parent_tests = [x for x in parent_calls if x['test']]
     first_child = min((sess[c]['created'] for c in children), default=None)
     return {
         'arm': base['arm'], 'executor': base['executor'], 'officialResolved': base['official']['resolved'],
@@ -355,6 +477,14 @@ def check(case):
             'parentInspectionCallsBeforeFirstChild': sum(1 for x in parent_calls if x['inspect'] and first_child and x['time'] < first_child),
             'parentInspectionCallsAfterFirstChild': sum(1 for x in parent_calls if x['inspect'] and first_child and x['time'] >= first_child),
             'filesInspectedByMoreThanOneChild': sum(1 for n in sibling.values() if n > 1),
+        },
+        'parentWork': {
+            'editCalls': sum(1 for x in parent_calls if x['edit']),
+            'filesEdited': sorted({re.sub(r'^/testbed/', '', f) for x in parent_calls if x['edit'] for f in x['editFiles']}),
+            'testRuns': len(parent_tests),
+            'testOutcomes': dict(collections.Counter(x['testOutcome'] or 'unknown' for x in parent_tests)),
+            'worktreeResets': sum(1 for x in parent_calls if x['worktree']),
+            'finalPatchFiles': sorted(patch_files),
         },
         'reuseBasis': 'theoretical: same model + identical serialized content (tools block + system + messages), exact message hashes; '
                       'effort not assumed to split the cache (the IfEffortSplitsCache fields are that provider-specific assumption); '
