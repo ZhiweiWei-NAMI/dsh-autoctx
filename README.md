@@ -1,139 +1,182 @@
 # dsh-autoctx
 
-dsh 的 Auto 决策插件。填写自己的 API Key 后直连 `jev-1.13-free` 获取结构化决策，插件通过 dsh 原生会话、工具和子代理接口落实决策。主代理和子代理使用配置的执行模型。插件不包含智能体执行运行时。未配置 `apiKey` 时按原生模式运行，不调用任何网络服务。
+面向 dsh 的上下文与子代理决策插件，版本 **1.2.3**。Jev 负责评分和结构化选择，插件通过 dsh 原生会话、工具、子代理和压缩执行决策；编码仍由执行模型完成。
 
-需要 dsh `0.1.5-rc.1` 或 `0.2.x`（已在 `0.2.0-rc.2` 上实测）。
+[English](README.en.md) · [源码](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
 
-## 从 0.6.x 升级
+## 环境与所需账号
 
-0.7.0 起插件改名为 `dsh-autoctx`：把 profile 覆盖里的 `dsh-auto-context` 条目改名为 `dsh-autoctx`，再卸载旧包（`dsh plugin --profile auto remove dsh-auto-context`）后安装新包。存储域名保持 `dsh_auto`，已有策略数据继续可用。
+已验证的宿主为 **dsh `0.2.0-rc.2`**，使用 Node 22。`@deepseek-ai/dsh-*` 包的 peer dependency 范围为 `^0.1.5-rc.1 || ^0.2.0-rc.1`。npm 包名为 `dsh-autoctx`，入口为 `index.js`，Web 客户端为 `./client.js`。
 
-## 设置页与输入框统计（0.6.0 新增）
+你需要提供：
 
-插件自带浏览器端页面：**Plugins → dsh-autoctx → Configure** 可以编辑模式、Jev API Key、Jev 模型、决策预算、子代理与上下文相关字段；路由、策略与权重仍由 YAML 维护。会话输入框右下角会出现一个统计小徽章（仅在本会话被 Auto 处理过时显示）：圆环表示上下文压力，数字为 `决策/预算 · 运行中的子代理`，悬停展开详情卡片（模式、决策进度、子代理、上下文占用、压缩次数与节省 tokens、最近路由）。
+- **执行模型连接**：在 dsh profile 的设置/provider 中配置；插件不提供模型访问权限。
+- **Jev API key**：在 [opencode.ai](https://opencode.ai) 获取 workspace key，填写 `apiKey`。该 key 发送至 `jevEndpoint`，默认地址为 `https://opencode.ai/inference/v1/systemone`。
+- **可选的其他模型路由**：若 reviewer/advisor 使用其他模型，在 `modelRoutes` 中配置「模型 id → dsh provider 名称」；付费路由还需要 `allowPaidModels: true`。
 
-## 安装
+未配置 `apiKey` 时，插件不发起网络调用，会话按原生模式运行，并记录 `reason: 'no-api-key'`。
 
-插件直连 Jev，不依赖其他网关：配置了 `apiKey` 就走直连，未配置时按原生模式运行。
+## 安装与配置
 
-```bash
-# 新建 profile，然后从 GitHub 或 npm 安装
-dsh --profile auto --from-default-profile headless --dump-config >/dev/null
-dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-autoctx#v0.7.0
-# 或 npm 包 dsh-autoctx
-dsh plugin --profile auto add dsh-autoctx
+1. 首次创建 profile。此命令会启动它；用 Ctrl+C 停止后继续安装。
+
+   ```sh
+   dsh --profile autoctx --from-default-profile web
+   ```
+
+   需要 headless profile 时，首次创建命令中的模板改为 `headless`。自定义 profile 启动时使用 `dsh --profile autoctx ...`。
+
+2. 从 npm 安装，或选择 GitHub 发布标签来源。
+
+   ```sh
+   dsh plugin --profile autoctx add dsh-autoctx
+   # 或使用发布标签
+   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.3
+   ```
+
+   `dsh plugin --profile <name> <pnpm-args...>` 把参数传给 pnpm。Profile 位于 `$DSH_HOME/profiles/<name>`。包声明的 dsh bundle patch（`cordis.patch.yml`）会挂载插件并停用原生 `compaction-basic`，无需手工重复挂载。
+
+3. 配置 dsh 自身的执行模型连接，并在 **profile 自己的** `$DSH_HOME/profiles/autoctx/cordis.patch.yml` 中加入以下最小配置，不要写到 home 级 patch。
+
+   ```yaml
+   - id: dsh-autoctx
+     config:
+       apiKey: <your opencode workspace key>
+   ```
+
+4. 启动 Web 应用。
+
+   ```sh
+   dsh --profile autoctx
+   ```
+
+仅一次启动停用插件并恢复原生压缩：
+
+```sh
+dsh --profile autoctx --patch "$DSH_HOME/profiles/autoctx/node_modules/dsh-autoctx/off.patch.yml"
 ```
 
-在 profile 自己的 `cordis.patch.yml` 里给 `dsh-autoctx` 填最小配置。`apiKey` 到 <https://opencode.ai> 的 workspace API Keys 页面获取：
+升级到最新版，或固定到本版本：
 
-```yaml
-- id: dsh-autoctx
-  config:
-    apiKey: <你的 opencode workspace key>
-    routes:
-      - id: general
-        label: 通用实现
-        model: deepseek-v4.1-flash
-        description: 实现与修改代码
-        efforts: [high]
-      - id: review
-        label: 独立检查
-        model: deepseek-v4.1-flash
-        description: 复核实现与测试证据
-        efforts: [high]
+```sh
+dsh plugin --profile autoctx add dsh-autoctx@latest
+# 或固定版本
+dsh plugin --profile autoctx add dsh-autoctx@1.2.3
 ```
 
-`routes` 是允许使用的角色、模型和 effort，执行模型连接仍由 `settings.yaml` 决定。省略 `routes` 时自动使用当前会话的原生模型作为唯一默认路由。省略 `strategy` 时使用 `automatic` 模式和默认权重 `{quality: 0.8, latency: 0.5, usage: 0.5, cache: 0.8}`；`mode: single` / `native` 分别固定单代理和原生压缩。`apiKey` 声明为 secret，不会写入日志或记录文件。
+卸载前，先删除自己在 profile 的 `cordis.patch.yml` 中添加的 `- id: dsh-autoctx` 覆盖项，再执行：
 
-未设置 `apiKey` 时不访问任何网络服务：会话按原生模式运行（等同 `strategy.mode: native`），并记录一条 `reason: 'no-api-key'` 的 `policy_snapshot`，不会抛错。
-
-### 从 0.4.x 升级
-
-profile 覆盖里的 `magpie-auto` 需改名为 `dsh-autoctx`；`endpoint` 字段已删除，应一并移除。
-
-## 启用
-
-服务器已安装到本机 `$DSH_HOME/profiles/auto`，直接选择：
-
-```bash
-# 启用 Auto，执行当前目录的任务
-dsh --profile auto "你的编程任务"
-
-# 同一模型连接，关闭 Auto，使用原生 dsh
-dsh --profile auto --patch "$DSH_HOME/profiles/auto/node_modules/dsh-autoctx/off.patch.yml" "你的编程任务"
+```sh
+dsh plugin --profile autoctx remove dsh-autoctx
 ```
 
-原有 `web`、`headless` 等 profile 保持原配置。`auto` 使用本机 dsh 的会话、工具和存储，不另设运行时或 `DSH_HOME`。以上开关在启动时选择，长任务中不要切换。
+移除 bundle 层会恢复原生压缩。
 
-其他机器安装到一个新 profile（首次初始化执行一次）：
+## 设置与默认值
 
-```bash
-dsh --profile auto --from-default-profile headless --dump-config >/dev/null
-dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-autoctx#v0.7.0
-```
+Web 界面：左下角 **Settings → DSH AutoCTX**，或 **Plugins → dsh-autoctx → Configure**。可设置模式、学习、上下文选择、自适应思考强度、Jev endpoint、模型路由和 ceiling ratio。输入框徽章显示上下文压力与决策；详情卡显示调度、思考策略及学习账本，manual 模式下还显示待审批提案。`apiKey` 是 secret 字段，不写入日志或记录文件。
 
-v0.5.0 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `compaction-basic`，无需手写 `insert`。卸载时先移除 profile 中自定义的 `dsh-autoctx` 覆盖条目，再运行 `dsh plugin --profile auto remove dsh-autoctx`，会移除该层并恢复原生压缩。旧版手工添加的插件和压缩开关应先从用户 patch 中移除，避免重复挂载。
-
-执行模型连接仍需配置。服务器 `auto/cordis.patch.yml` 将 `settings` 指向同目录的 `settings.yaml`，其中选择 `deepseek-official` 适配器、`dsh-workbuddy/deepseek-v4.1-flash` 模型和 `http://127.0.0.1:3435/v1` 网关。该 profile 的 `.credentials.yaml` 仅存本机网关所需的非秘密占位值，不含上游账号或 Console 密钥。
-
-需要覆盖插件限制时，在 **profile 自己的** `$DSH_HOME/profiles/auto/cordis.patch.yml` 增加：
-
-```yaml
-- id: dsh-autoctx
-  config:
-    maxChildren: 2
-    maxConcurrent: 2
-    maxChildRequests: 16
-    maxChildTurnRequests: 8
-    maxDecisions: 12
-    pressureTokens: 64000
-    retainTokens: 8000
-```
-
-Jev 决策在插件内直接调用，不再经过外部网关。执行模型连接使用 `settings.yaml` 中已有的 dsh 连接和 dsh-workbuddy 服务。
-
-本机 Auto 的模型连接和默认执行模型位于 `$DSH_HOME/profiles/auto/settings.yaml`；插件限制位于同目录 `cordis.patch.yml`。不要写进 home 级 patch，以免影响其他 profile。`recordFile` 可指定一个已存在、可写目录中的 JSONL 文件，记录模型用量和原生子代理生命周期。
-
-## 行为
-
-执行模型通过原生 `subagent` 或 `subagent_fork` 提出具体子任务；Jev 分别判断未完成价值、依赖、配置匹配和会话延续性。插件据此让主代理继续、创建原生 continuable 子代理，或通过 `sendMessage` 延续已有子代理。默认后台执行，主代理可以同时工作；显式前台请求才等待。Jev 是评分/选择模型，不生成自由文本任务计划。
-
-决策证据排除尚未执行的工具调用，并明确当前提案尚未分配。Jev 拒绝后，主代理应继续工作；取得新的工具结果或用户/子代理消息前，改写提案不会重复调用 Jev。
-
-策略完全来自本地配置（`routes` + `strategy`），新会话创建时固定，已有会话不随全局编辑漂移。策略存入 dsh 原生 storage domain：`$DSH_HOME/storages/dsh_auto/`；模型历史仍由原生 session 管理，不向事件日志写入 SDK 不认识的事件类型。
-
-`routes` 是允许使用的角色、模型和 effort。插件用 dsh 的连接准备接口检查候选配置；主代理默认模型仍由 `settings.yaml` 设置。当前服务器只实测 `deepseek-v4.1-flash` + `high`，不能据此声称跨模型路由提高了质量。策略权重是用户偏好，不是模型成功概率。
-
-执行请求保留系统提示、工具定义和历史顺序，新内容追加。仅在压力达到阈值时，对旧区域的完整逻辑块分别问重要性与归属；不确定的证据保留。超大的块完整分片，任一片段保留则保留整块。选择后仍需达到最低预计缩减比例，才通过 dsh 原生压缩事务替换；否则提高下一次触发阈值。原始任务要求、近期工具配对和完整原始日志保留。归属评分参与保留判断和审计，不自动广播原始历史给全部子代理。
-
-压力使用最近 API 实际输入加新增内容估算，避免原生累计估算量过高导致重复决策。没有 usage 时明确使用原生估算；估算不记作消耗。质量偏好提高保守保留和委派的置信门槛，缓存偏好提高替换所需缩减比例与再次决策间隔；时间/用量偏好提高委派收益门槛，角色初始偏好影响合格配置的排名。这些是可检查的启发式规则，尚非经过性能标定的最优策略。
-
-任务共享子代理数量、并发和请求预算；达到子代理预算后主代理仍可继续。每次原生激活单列计数，不把同一子代理两次继续计成两个代理。决策预算不足时明确记录并使用原生压缩；Jev HTTP 错误直接保留并报告，不重试或伪造保留答案，不切换付费模型。Jev 与执行模型分别调用、分别计量。
-
-## 关闭
-
-使用上面的 `off.patch.yml`，同时卸载本次进程中的 Auto 插件并恢复 `compaction-basic`；关闭后不调用 Jev，也不施加插件的子代理预算。普通 `headless` / `web` profile 原本就未启用本插件。
-
-只关闭 Jev、保留任务子代理上限时，可以把 `mode` 改为 `native`，同时把 `compaction-basic.disabled` 改为 `false`。
-
-`mode: single` 禁止原生子代理调用，供单代理对照实验使用。单代理模式同样需要启用原生 `compaction-basic`。
-
-也可以直接设定插件的 `mode` 来固定单代理或原生调度：`mode: native` 采用原生压缩，任务中不调用 Jev。它与 `strategy.mode` 的 `single` / `native` 是不同层级的入口。
-
-## 验证
-
-v0.3.1 已从 GitHub 安装到本机原生 `auto` profile，完成真实代码修改、子代理执行、结果回收和独立判题。配置开关、关闭后的代码产物也通过验证，已有默认配置保持不变。[安装验证记录](validation/local-install-20261013.json) 包含实际用量、首次/后续请求和未成功的开发探针。这是功能验证，不是性能 benchmark。
-
-| 指标 | 本机安装后的子代理流程 |
+| 配置键 | 默认值与含义 |
 | --- | --- |
-| M1 正确性 | 插件短回归 9/9；最终代码测试 3/3，测试文件未改动 |
-| M2 耗时 | 49.676 秒 |
-| M3 用量 | DeepSeek 输入 138,403 / 输出 4,628；Jev 输入 2,375 / 输出 66 |
-| M4 缓存 | DeepSeek 命中 24,448 / 未命中 113,955；写入及 Jev 缓存字段未提供 |
-| M5 决策开销 | Jev 1 次、0.640 秒；DeepSeek 共 16 次 |
-| M6 抖动 | 此次未做重复性能测量，不能估计 |
-| M7 协作 | 1 个原生子代理完成并回收；主代理 10 次、子代理 6 次执行模型调用 |
+| `mode` | `auto`；可选 `auto`、`single`、`native` |
+| `apiKey` | 未设置；未设置时使用原生模式 |
+| `jevModel` | `jev-1.13`，计费；`jev-1.13-free` 可用但有限流 |
+| `jevEndpoint` | `https://opencode.ai/inference/v1/systemone` |
+| `modelRoutes` | `{}`；模型 id → dsh provider 名称 |
+| `allowPaidModels` | `false`；是否允许付费路由 |
+| `reviewerModel` | `same`；使用执行模型 fork 审查；`auto` 由 Jev 选择，也可指定模型 id |
+| `reviewBeforeFinish` | `true`；修改文件的根回合结束前启动一个独立审查子代理 |
+| `reviewMaxRequests` | `6`；审查请求上限 |
+| `advisorModel` | `off`；可选 `off`、`auto` 或模型 id |
+| `advisorMaxConsults` | `1`；顾问咨询上限 |
+| `advisorStallSteps` | `6`；停滞步数阈值 |
+| `adaptiveEffort` | `high`；Jev 思考策略要求时使用的 effort；`off` 保留默认 effort |
+| `learning` | `frozen`；可选 `auto`、`manual`、`frozen` |
+| `contextSelection` | `jev`；可选 `jev`、`summary` |
+| `maxDecisions` | `12`；每个根任务的 Jev 决策调用上限 |
+| `maxChildren` | `2`；子代理数量上限 |
+| `maxConcurrent` | `2`；并发子代理数量上限 |
+| `maxChildRequests` | `16`；子代理请求上限 |
+| `maxChildTurnRequests` | `8`；子代理每回合请求上限 |
+| `pressureTokens` | `64000` tokens；上下文压力阈值 |
+| `ceilingRatio` | `1.5`；达到 `pressureTokens × ceilingRatio` 时必须缩减上下文 |
+| `retainTokens` | `8000` tokens；保留 token 配置 |
 
-修复前的补测发生 12 次拒绝且没有创建子代理；修复后同一职责流程由 Jev 选择创建并成功回收，拒绝记录没有删除。另一次安装失败后误用旧版本的探针被中断，也单列保留。没有据此宣称整体性能提高；账单字段未提供，不计算费用。
+## 工作方式
 
-此前 v0.3.0 已验证同一原生子代理的两次激活及 Jev 上下文替换。旧 v0.2.2 的十二题 SWE-bench Verified 官方解决率为 Auto 6/12、单代理与原生可选协作各 8/12。未证明 Auto 普遍优于原生 dsh；共享 WorkBuddy 仍轮换账号，缓存抖动尚未全部解决。
+**决策。** 普通单代理持续累积一份上下文；原生子代理由执行模型自行选择 spawn/fork，原生压缩总结旧上下文。AutoCTX 在特定节点向 Jev 请求结构化决策。Jev 是评分/选择模型，不编写计划或代码。它判断拟议委派是否值得创建子代理及采用哪条路由；在回合开始给出任务标签与思考策略；在上下文压力下选择证据并判断现在还是稍后替换上下文，权衡重新读取未缓存内容的成本与后续请求缩小的收益；当角色设为 `auto` 时选择 reviewer/advisor 模型。
+
+思考策略为 `off`、`decision_points` 或 `always`；决策点包括回合开始、测试失败、审查/顾问报告和停滞。每个任务的决策次数受 `maxDecisions` 限制。临时 Jev 网关/网络失败会重试一次，随后暂停 Jev 60 秒；认证、计费或 HTTP 429 会停止该任务的 Jev 调用，由本地回退接管：原生压缩、不委派。
+
+**上下文选择。** `contextSelection: jev` 在上下文超过 `pressureTokens` 时，把旧区域拆成测试失败段、diff hunk、按函数/类划分的代码和段落等证据片段，而非整块输出。Jev 根据明确的待解决问题（例如仍失败的测试）以及必留内容，评估每片证据额外提供了什么。插件本地去重只保留一份；保留的报告会带入其引用的定义；增益低的片段各归档为一行。达到 `pressureTokens × ceilingRatio` 时必须缩减，必要时使用原生压缩。`summary` 则由执行模型总结。
+
+**Reviewer。** 修改过文件的根回合结束前，一个审查子代理检查实际改动。简报先包含工作区 git diff 和每个改动 hunk 周围的代码，再附问题与证据账本。`DEFECTS` 报告返回执行模型处理，`LGTM` 结束回合。
+
+**Advisor。** 默认关闭。在同一测试上反复修改并重跑仍失败，或出现停滞时，不带工具的顾问模型接收具体问题、原始失败摘录、diff、周边代码和此前尝试。
+
+**学习。** 账本按工作区路径区分，存于 dsh storage 的 `dsh_auto`。每个根回合完成后，Jev 对每个使用过的（模型，角色），先判断其具体主张能否用它指明的后续修改/测试运行核验，再评价质量。整体任务成功或执行模型未采纳建议都不是证据；无法评估时，权重和样本数均不变。原生回答的赞/踩也是证据。
+
+- `frozen`（默认）：仅记录证据，权重不变。
+- `auto`（BETA，默认关闭）：自动应用有界更新。
+- `manual`：将提案汇集到一张审批卡片。
+
+自动学习有望随时间在保持质量的同时降低成本，但这只是预期，尚未展示；本次基准中 auto 未超过 frozen。
+
+## 额外调用与费用
+
+Jev 调用、reviewer/advisor 子代理及其执行模型调用、回合结束时的学习调用，均由用户自己的 API 账号承担费用，不是免费服务。`models.json` 模型表中 `jev-1.13` 的价格为 **每 100 万输入 tokens $0.042，输出 tokens $0**；`jev-1.13-free` 有限流。下方基准的费用为 API 目录价估算。
+
+## 基准结果与限制
+
+仅报告本次运行，不代表普遍优势。每组使用相同的 **72 个评分案例 = 12 个固定 SWE-bench Verified pytest 任务（`bench/tasks.json`）× 3 个执行模型 × 每模型 2 次运行**。执行模型为 `deepseek-v4.1-flash`、`glm-5.3-flash`、`deepseek-v4-flash`。官方 SWE-bench harness **v4.1.0** 判定 resolved；运行完成或 HTTP 200 均不等于通过。
+
+每组限制相同：**每任务 600 秒、每任务 64 个模型请求（AutoCTX 包含 Jev 调用）、案例并行数 3、最多 2 个子代理/2 个并发子代理**。
+
+| 组别 | 配置 |
+| --- | --- |
+| B | 单代理；无子代理工具，原生压缩 |
+| C | 原生 spawn/fork，仅执行模型；原生压缩，无 reviewer/advisor/额外模型 |
+| H | 原生异构子代理；在执行模型及额外 3 个模型的每个（模型，effort）组合上提供一个原生子代理工具，由执行模型选择 |
+| AutoCTX frozen / auto | 1.2.3；reviewer `auto`、advisor `auto`、相同的额外 3 个模型、`jev-1.13`；分别使用 frozen 和 auto 学习；auto 在同一次运行的案例间沿用账本 |
+
+额外 3 个模型为 `glm-5.3-flash`（执行模型为它时改用 `deepseek-v4.1-flash`）、`deepseek-v4-pro`、`claude-haiku-5-5`。B/C/H 不加载插件；这些基线较早运行，使用相同 harness 入口、任务与限制。
+
+| 指标（每组 72 个案例） | AutoCTX frozen | AutoCTX auto | B | C | H |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Resolved / 72 | 52/72 | 49/72 | 39/72 | 44/72 | 42/72 |
+| API 目录价估算费用，执行模型 + 子代理 + Jev（USD） | $1.514 | $1.374* | $0.876 | $0.933 | $1.018 |
+| 上述费用中的 Jev（USD） | $0.076 | $0.068* | 不适用 | 不适用 | 不适用 |
+| 墙钟时间总和（秒） | 18060 | 17670 | 17454 | 16520 | 17076 |
+| Prompt 缓存命中率 | 87.5% | 88.4% | 94.3% | 94.6% | 93.9% |
+
+\* Auto 有 1 个请求缺少 usage，未计价。
+
+| 执行模型（每组、每模型 24 个案例；resolved / 24） | Frozen | Auto | B | C | H |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| deepseek-v4.1-flash | 17/24 | 16/24 | 11/24 | 15/24 | 14/24 |
+| glm-5.3-flash | 18/24 | 18/24 | 17/24 | 18/24 | 18/24 |
+| deepseek-v4-flash | 17/24 | 15/24 | 11/24 | 11/24 | 10/24 |
+
+Auto 运行中，49 个已完成回合进入学习：35/49 个被判无法评估，权重不变；14/49 个应用了小幅更新。此处 auto 未超过 frozen。较低缓存命中率的可能解释包括上下文替换改写部分 prompt、review/advisor 简报以及 Jev 切换思考模式带来新的未缓存输入；这些仅是假设，未证实因果。
+
+测量范围仅为上述 12 个 pytest 任务和 3 个 flash 执行模型；重复运行之间，每次共 12 个任务的运行，resolved 数约波动 ±2 个。AutoCTX 在此处比基线更贵；auto learning 仍为 beta。宿主还存在限制：回合中途创建的 fork 只继承已完成回合，因此审查简报须自行携带当前回合证据。
+
+## 复现
+
+在仓库目录中准备 [bench/README.md](bench/README.md) 所列前置条件，包括 Docker 与 SWE-bench 镜像、模型网关和 `JEV_API_KEY`，然后运行：
+
+```sh
+python3 bench/run.py --model deepseek-v4.1-flash --arms A --tasks bench/tasks.json --out <dir> --plugin . --parallel 3 \
+  --extra-models glm-5.3-flash,deepseek-v4-pro,claude-haiku-5-5 --reviewer auto --advisor auto --max-usd 0.10 \
+  --jev-model jev-1.13 --learning frozen        # 或 --learning auto
+python3 bench/run.py --model deepseek-v4.1-flash --arms B,C --tasks bench/tasks.json --out <dir> --plugin . --parallel 3
+python3 bench/run.py --model deepseek-v4.1-flash --arms H --tasks bench/tasks.json --out <dir> --plugin . --parallel 3 \
+  --extra-models glm-5.3-flash,deepseek-v4-pro,claude-haiku-5-5 --max-usd 0.10
+python3 bench/grade.py <dir> --parallel 3
+```
+
+`<dir>` 替换为输出目录。A 是 AutoCTX；frozen 与 auto 使用各自目录。对全部 3 个执行模型分别运行，每个模型做 2 次运行，独立运行使用不同目录。`glm-5.3-flash` 对应的 `--extra-models` 改为 `deepseek-v4.1-flash,deepseek-v4-pro,claude-haiku-5-5`；`deepseek-v4-flash` 使用示例中的额外模型。重跑相同命令会续跑未完成案例。`--max-usd 0.10` 是 bench observer 的每案例 $0.10 花费上限。
+
+## 从旧版本升级
+
+按上面的升级步骤安装 1.2.3，并对照当前配置表检查 profile 覆盖项。不要沿用旧 README 中的默认模型或安装标签；当前默认是计费的 `jev-1.13`，发布标签为 `v1.2.3`。

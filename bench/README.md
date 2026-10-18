@@ -1,9 +1,16 @@
 # A/B/C SWE-bench harness v2
 
 Runs the fixed 12 pytest instances in `tasks.json` (identifiers and base commits only) with native dsh. Issue texts are read at run time from the local evaluator dataset; solvers receive only `problem_statement`. A loads
-`dsh-autoctx` in auto mode with native compaction disabled; B disables delegation
-and uses native compaction; C enables native spawn/fork with native compaction.
-B/C never load the plugin under test.
+`dsh-autoctx` 1.2.3 in auto mode with native compaction disabled, reviewer/advisor
+`auto`, `jev-1.13`, and learning `frozen` or `auto` (auto carries the ledger across
+cases within a run). B is a single agent without subagent tools, using native
+compaction. C uses native spawn/fork with the executor model only, native
+compaction, and no reviewer/advisor/extra models. H uses native heterogeneous
+subagents: one native subagent tool per (model, effort) over the executor plus
+3 extra models, selected by the executor. A and H use the same 3 extra models:
+`glm-5.3-flash` (or `deepseek-v4.1-flash` for a glm executor), `deepseek-v4-pro`,
+and `claude-haiku-5-5`. B/C/H never load the plugin under test; these baselines
+were run earlier with the same harness entry, tasks and limits.
 
 ## Prerequisites
 
@@ -32,29 +39,37 @@ not been verified.
 
 ## Reproduce
 
-From this plugin repository, with the prerequisites and environment ready:
+From this plugin repository, prepare the prerequisites above: Docker and the
+SWE-bench images, a model gateway, and `JEV_API_KEY`. The reported run used the
+official SWE-bench harness v4.1.0; only its resolved outcome counts as a pass,
+not a completed solver run or HTTP 200.
 
 ```sh
-python bench/run.py --model deepseek-v4.1-flash --arms A,B,C --tasks bench/tasks.json --out bench/results/deepseek-v41 --plugin . --parallel 3
-python bench/run.py --model deepseek-v4-flash --arms A,B,C --tasks bench/tasks.json --out bench/results/deepseek-v4 --plugin . --parallel 3
-python bench/run.py --model glm-5.3-flash --arms A,B,C --tasks bench/tasks.json --out bench/results/glm-53 --plugin . --parallel 3
-
-python bench/grade.py bench/results/deepseek-v41 bench/results/deepseek-v4 bench/results/glm-53
-python bench/summarize.py bench/results/deepseek-v41 bench/results/deepseek-v4 bench/results/glm-53
+python3 bench/run.py --model deepseek-v4.1-flash --arms A --tasks bench/tasks.json --out <dir> --plugin . --parallel 3 \
+  --extra-models glm-5.3-flash,deepseek-v4-pro,claude-haiku-5-5 --reviewer auto --advisor auto --max-usd 0.10 \
+  --jev-model jev-1.13 --learning frozen        # or --learning auto
+python3 bench/run.py --model deepseek-v4.1-flash --arms B,C --tasks bench/tasks.json --out <dir> --plugin . --parallel 3
+python3 bench/run.py --model deepseek-v4.1-flash --arms H --tasks bench/tasks.json --out <dir> --plugin . --parallel 3 \
+  --extra-models glm-5.3-flash,deepseek-v4-pro,claude-haiku-5-5 --max-usd 0.10
+python3 bench/grade.py <dir> --parallel 3
 ```
 
-`--plugin` accepts another local plugin checkout. Its `package.json` and declared
-`files` are snapshotted once into the run and mounted read-only for A; repository
-history, evaluator outputs and credentials are not included. Use a new output
-folder for a changed plugin, model or task selection.
+Replace `<dir>` with an output directory. Keep frozen and auto in separate
+directories. For each arm, the reported 72 graded cases comprise the same
+12 fixed pytest tasks in `bench/tasks.json` × 3 executors
+(`deepseek-v4.1-flash`, `glm-5.3-flash`, `deepseek-v4-flash`) × 2 runs per model.
+Run the commands for each executor, using a separate output directory for each
+independent run. For `glm-5.3-flash`, use
+`--extra-models deepseek-v4.1-flash,deepseek-v4-pro,claude-haiku-5-5`;
+`deepseek-v4-flash` uses the extra models shown above. Re-running the same command
+resumes unfinished cases.
 
-`--parallel N` runs at most N cases (default 3). Arms rotate ABC/BCA/CAB by task.
-`--repeat K` uses `repeat-0/<instance>/<arm>/`, `repeat-1/<instance>/<arm>/`, etc.;
-a single repeat uses `<instance>/<arm>/`. All commands use this same layout.
-Re-run the same command to resume: only cases with `result.json` are skipped.
-Incomplete cases get a fresh solver home. An empty pending queue exits immediately.
-Worker failures propagate; they leave no completion marker. Grading errors remain
-ungraded and are retried by the next grading command.
+Every arm has a 600-second per-task deadline, 64 model requests per task
+(including Jev calls for A), case parallelism 3, and at most 2 children /
+2 concurrent children. `--max-usd 0.10` is the bench observer's $0.10 per-case
+spend cap. A uses reviewer/advisor `auto` in both learning settings; auto carries
+the ledger across the cases of a run. Jev is billed: `jev-1.13` costs $0.042 per
+1 million input tokens and $0 for output tokens in `models.json`.
 
 ## Outputs and accounting
 
