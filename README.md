@@ -154,7 +154,7 @@ Jev 调用、reviewer/advisor 子代理及其执行模型调用、回合结束�
 | --- | --- |
 | B | 单代理，插件关闭；明确要求不委派 |
 | C | 执行模型的原生 spawn/fork 子代理，插件关闭 |
-| A | AutoCTX 1.2.6（发布版与评测构建 `5679358` 仅相差两条 UI 提示文案和版本号），`mode: auto`、学习 frozen、结束前 reviewer 关闭、advisor 关闭 |
+| A | AutoCTX 1.2.6（发布版与评测构建 `f1d6c49` 仅相差两条 UI 提示文案和版本号），`mode: auto`、学习 frozen、结束前 reviewer 关闭、advisor 关闭 |
 
 C 与 A 收到相同的一句委派指令：“Split the task into subtasks and delegate suitable subtasks to subagents with the subagent or subagent_fork tools, then integrate their results and verify the final change yourself.”
 

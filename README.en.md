@@ -154,7 +154,7 @@ The same **12 fixed SWE-bench Verified pytest tasks × 2 executors × 2 repeats*
 | --- | --- |
 | B | Single agent, plugin off; explicitly told not to delegate |
 | C | Native spawn/fork subagents with the executor model, plugin off |
-| A | AutoCTX 1.2.6 (the release differs from the evaluated build, commit `5679358`, only in two UI hint strings and the version number), `mode: auto`, learning frozen, reviewer before finish off, advisor off |
+| A | AutoCTX 1.2.6 (the release differs from the evaluated build, commit `f1d6c49`, only in two UI hint strings and the version number), `mode: auto`, learning frozen, reviewer before finish off, advisor off |
 
 C and A receive the same one-sentence delegation instruction: “Split the task into subtasks and delegate suitable subtasks to subagents with the subagent or subagent_fork tools, then integrate their results and verify the final change yourself.”
 
