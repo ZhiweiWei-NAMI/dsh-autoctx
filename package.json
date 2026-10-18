@@ -17,6 +17,7 @@
     "routeledger.js",
     "client.js",
     "uiapi.js",
+    "uistore.js",
     "priors.js",
     "stats.js",
     "cachespace.js",
