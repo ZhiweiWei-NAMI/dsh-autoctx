@@ -843,6 +843,7 @@ export function apply(ctx, options) {
     },
   });
   let planToolInstalled = false;
+  const planSnapshots = new Set();
   const installPlanTool = () => {
     if (planToolInstalled) return;
     ctx.tools.register({
@@ -2494,6 +2495,10 @@ export function apply(ctx, options) {
     graphFor(id);
     if (config.mode === "plan") {
       installPlanTool();
+      if (!isChild && !planSnapshots.has(id)) {
+        planSnapshots.add(id);
+        record({ kind: "policy_snapshot", session: id, mode: "plan", routing: config.planRouting ?? "jev" });
+      }
       if (isChild) {
         const used = planDispatcher.childRequests(id), cap = config.planChildRequests ?? 16;
         if (used >= cap) throw new Error("Plan child request budget exhausted.");
