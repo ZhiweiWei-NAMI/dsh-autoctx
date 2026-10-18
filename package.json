@@ -14,6 +14,8 @@
     "plandispatch.js",
     "routeledger.js",
     "client.js",
+    "uiapi.js",
+    "priors.js",
     "stats.js",
     "cachespace.js",
     "decisions.js",

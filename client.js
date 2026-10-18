@@ -5,6 +5,56 @@ window.__ModuleLoader__.load({
 		const { jsx, jsxs } = require("react/jsx-runtime");
 		const ui = require("@deepseek-ai/dsh-client-ui-primitives");
 		const en = {
+			routes: "Task routes (JSON)",
+			routesHint: 'JSON array of {id, label, model, provider, description, efforts?}. All named text fields are required; efforts is a list of strings.',
+			strategy: "Strategy (JSON)",
+			strategyHint: 'Object with optional mode (automatic/single/native), weights (quality, latency, usage, cache in [0,1]), and routeWeights (object). Omitted members inherit schema defaults.',
+			preferredProviders: "Preferred providers",
+			preferredProvidersHint: "Comma-separated provider names preferred when suitability is comparable.",
+			allowedProviders: "Additional allowed providers",
+			allowedProvidersHint: "Comma-separated names. Together with preferred providers, restricts executor-side routes whenever one fits. Empty lists impose no provider preference.",
+			effortSwitchFreeTokens: "Free effort-switch tokens",
+			effortSwitchFreeTokensHint: "Estimated uncached reread tokens allowed before asking Jev about an effort switch (minimum 0).",
+			maxEffortDecisions: "Effort decision budget",
+			maxEffortDecisionsHint: "Separate Jev effort decisions per root task (minimum 0).",
+			effortPhaseRequests: "Effort phase requests",
+			effortPhaseRequestsHint: "High-effort requests after a phase trigger (minimum 1); a new trigger renews the window.",
+			cacheTtlSeconds: "Assumed cache lifetime (seconds)",
+			cacheTtlSecondsHint: "Conservative reuse estimate (minimum 0), not a verified provider TTL.",
+			maxChildRequests: "Child request cap",
+			maxChildRequestsHint: "Total model requests per child (integer, minimum 1).",
+			maxChildTurnRequests: "Child turn request cap",
+			maxChildTurnRequestsHint: "Model requests per child turn (integer, minimum 2).",
+			nativeThresholdRatio: "Native compaction threshold",
+			nativeThresholdRatioHint: "Native context threshold ratio, from 0.01 to 1.",
+			recordFile: "Record file",
+			recordFileHint: "Optional server-side record path. Leave blank to inherit the profile value; Reset removes the override.",
+			invalidRoutes: "Enter a JSON array matching the route fields above. Unknown fields are refused.",
+			invalidStrategy: "Enter a JSON object matching the strategy fields above. Unknown fields are refused.",
+			sectionAdvanced: "Routes and strategy",
+			priorsTitle: "Model capability priors",
+			priorsHint: "Deployment-wide text overrides, shared by all workspaces. Clearing restores the catalog text. These are priors, not measurements.",
+			catalogPrior: "Catalog prior",
+			userPrior: "Your override",
+			noPrior: "No prior text recorded.",
+			noModels: "No catalog models or configured routes match this filter.",
+			edit: "Edit", clear: "Clear override", cancel: "Cancel", reason: "Reason (optional)",
+			priorValue: "Capability prior text", weightValue: "User weight [0,1]", userWeight: "User weight",
+			invalidWeight: "Enter a number from 0 to 1, or use Clear override.",
+			invalidPrior: "Enter nonempty prior text, or use Clear override.",
+			loadFailed: "Could not load this data.", loading: "Loading…", refresh: "Refresh view",
+			historyTitle: "Change history", noHistory: "No retained changes match these filters.",
+			historyHint: "All retained workspace ledger changes and deployment-wide prior edits. Older records may lack reasons or evidence ids.",
+			search: "Filter model, key, reason or evidence id", all: "All", previous: "Previous", next: "Next",
+			historyPage: "{start}–{end} of {total}", source: "Source", time: "Time", beforeAfter: "Before → after", changeReason: "Reason / Jev basis", evidenceIds: "Evidence source ids",
+			candidatesTitle: "Candidate models", notComputed: "Not computed yet — configured routes and catalog only; availability has not been checked.",
+			computedAt: "Computed at", memoized: "Memoized", yes: "yes", no: "no", unavailableModels: "Unavailable",
+			configuredRoutes: "Configured routes", catalogModels: "Catalog models", noCandidates: "No candidates recorded.",
+			candidateHint: "Latest retained pool per role for the root session. Refresh view reads records; it does not recompute the pool.",
+			injectedTitle: "Injected by AutoCTX", noInjections: "No retained injection records in this turn.",
+			injectionHint: "Source metadata for this native conversation turn. Records are bounded in memory and are lost on restart.",
+			messageKind: "Kind", chars: "{n} characters", from: "From",
+
 			summary: "Auto routing, subagents and context compaction decided by Jev.",
 			pageIntro: "Jev decides who works on a task (reviewer, advisor, workers), when to think and when to compact context; it learns from finished tasks in this workspace. The composer card shows each session's choices, costs and pending weight changes.",
 			title: "Auto context",
@@ -50,7 +100,7 @@ window.__ModuleLoader__.load({
 			advisorStallStepsHint: "Root requests without new evidence before the advisor is consulted (min 3).",
 			keepRatio: "Keep ratio",
 			keepRatioHint: "Share of a compacted region's tokens kept by budgeted selection (0.1–0.8).",
-			yamlNote: "Routes, strategy and weights stay in the profile's cordis.patch.yml.",
+			yamlNote: "Settings use the host profile; workspace weights and deployment-wide prior overrides have separate persistent stores.",
 			unavailable: "This plugin is not available for configuration.",
 			readOnly: "This deployment stores settings read-only.",
 			overridden: "Overridden",
@@ -156,6 +206,52 @@ window.__ModuleLoader__.load({
 			actionFailed: "The server did not accept this action."
 		};
 		const zh = {
+			routes: "任务路由（JSON）",
+			routesHint: "JSON 数组，每项含 id、label、model、provider、description 文本，efforts 可选（字符串数组）。",
+			strategy: "策略（JSON）",
+			strategyHint: "对象，可含 mode（automatic/single/native）、weights（quality、latency、usage、cache，各为 [0,1]）、routeWeights（对象）。省略的成员使用 schema 默认值。",
+			preferredProviders: "优先 provider",
+			preferredProvidersHint: "逗号分隔；适配程度相近时优先使用这些 provider。",
+			allowedProviders: "额外允许的 provider",
+			allowedProvidersHint: "逗号分隔；与优先列表共同约束执行侧路由，有适配项时排除其他 provider。两列表均为空时不施加偏好。",
+			effortSwitchFreeTokens: "免决策切换 tokens",
+			effortSwitchFreeTokensHint: "预估未缓存重读不超过此 tokens 数时，无需询问 Jev 即可切换强度（最小 0）。",
+			maxEffortDecisions: "强度决策预算",
+			maxEffortDecisionsHint: "每根任务独立的 Jev 强度决策次数（最小 0）。",
+			effortPhaseRequests: "强度阶段请求数",
+			effortPhaseRequestsHint: "阶段触发后允许的高强度请求数（最小 1）；新触发会刷新窗口。",
+			cacheTtlSeconds: "假定缓存寿命（秒）",
+			cacheTtlSecondsHint: "保守复用估算（最小 0），并非已验证的 provider TTL。",
+			maxChildRequests: "子代理总请求上限",
+			maxChildRequestsHint: "每个子代理的模型请求总数（整数，最小 1）。",
+			maxChildTurnRequests: "子代理单轮请求上限",
+			maxChildTurnRequestsHint: "子代理每回合的模型请求数（整数，最小 2）。",
+			nativeThresholdRatio: "原生压缩阈值",
+			nativeThresholdRatioHint: "原生上下文阈值比例，范围 0.01 到 1。",
+			recordFile: "记录文件",
+			recordFileHint: "可选的服务端记录路径。留空继承 profile 配置；恢复默认会移除覆盖值。",
+			invalidRoutes: "请输入符合上述字段的路由 JSON 数组；不接受未知字段。",
+			invalidStrategy: "请输入符合上述字段的策略 JSON 对象；不接受未知字段。",
+			sectionAdvanced: "路由与策略",
+			priorsTitle: "模型能力先验",
+			priorsHint: "文本覆盖按部署保存，所有工作区共享。清除后恢复目录先验；先验不代表实测结果。",
+			catalogPrior: "目录先验", userPrior: "用户覆盖", noPrior: "暂无先验文本。", noModels: "暂无匹配筛选条件的目录模型或配置路由。",
+			edit: "编辑", clear: "清除覆盖", cancel: "取消", reason: "原因（可选）",
+			priorValue: "能力先验文本", weightValue: "用户权重 [0,1]", userWeight: "用户权重",
+			invalidWeight: "请输入 0 到 1 的数字，或使用清除覆盖。", invalidPrior: "请输入非空先验文本，或使用清除覆盖。",
+			loadFailed: "无法读取数据。", loading: "读取中…", refresh: "刷新视图",
+			historyTitle: "变更历史", noHistory: "保留的变更中暂无匹配记录。",
+			historyHint: "包含全部保留的工作区账本变更和部署级先验编辑。旧记录可能没有原因或证据 id。",
+			search: "筛选模型、key、原因或证据 id", all: "全部", previous: "上一页", next: "下一页",
+			historyPage: "{start}–{end} / {total}", source: "来源", time: "时间", beforeAfter: "修改前 → 修改后", changeReason: "原因 / Jev 依据", evidenceIds: "证据来源 id",
+			candidatesTitle: "候选模型", notComputed: "尚未计算：仅列出配置路由与目录，尚未检查可用性。",
+			computedAt: "计算时间", memoized: "使用 memo", yes: "是", no: "否", unavailableModels: "不可用",
+			configuredRoutes: "配置路由", catalogModels: "目录模型", noCandidates: "暂无候选记录。",
+			candidateHint: "显示根会话每个角色最近保留的候选池。刷新视图只读取记录，不会重新计算候选池。",
+			injectedTitle: "由 AutoCTX 注入", noInjections: "本回合暂无保留的注入记录。",
+			injectionHint: "当前原生会话回合的来源元数据。记录有内存上限，重启后丢失。",
+			messageKind: "类型", chars: "{n} 字符", from: "来自",
+
 			summary: "自动路由、子代理与上下文压缩均由 Jev 决策。",
 			pageIntro: "由 Jev 决定任务由谁参与（复核、顾问、子任务）、何时思考、何时压缩上下文，并从本工作区已完成的任务中学习。输入框统计卡片会显示每个会话的选择、成本与待确认的权重调整。",
 			title: "Auto 上下文",
@@ -201,7 +297,7 @@ window.__ModuleLoader__.load({
 			advisorStallStepsHint: "根任务连续多少请求没有新证据后咨询顾问（最少 3）。",
 			keepRatio: "保留比例",
 			keepRatioHint: "预算选择保留被压缩区域 tokens 的比例（0.1–0.8）。",
-			yamlNote: "路由、策略与权重仍在 profile 的 cordis.patch.yml 里维护。",
+			yamlNote: "设置使用宿主 profile；工作区权重与部署级先验覆盖分别持久保存。",
 			unavailable: "该插件当前无法配置。",
 			readOnly: "本部署的设置为只读。",
 			overridden: "已覆盖",
@@ -309,7 +405,7 @@ window.__ModuleLoader__.load({
 		const NS = "plugins.dshAutoctx";
 		const CONFIG_KEY = "dsh-autoctx#dsh-autoctx";
 		const inject = ["slots", "locale", "configForms"];
-		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "ceilingRatio", "retainTokens", "keepRatio", "reviewMaxRequests", "advisorMaxConsults", "advisorStallSteps", "planMaxChildren", "planMaxJevCalls", "planChildRequests"];
+		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "ceilingRatio", "retainTokens", "keepRatio", "reviewMaxRequests", "advisorMaxConsults", "advisorStallSteps", "planMaxChildren", "planMaxJevCalls", "planChildRequests", "effortSwitchFreeTokens", "maxEffortDecisions", "effortPhaseRequests", "cacheTtlSeconds", "maxChildRequests", "maxChildTurnRequests", "nativeThresholdRatio"];
 		// Enumerated fields render as segmented controls.
 		const SEGMENTED = { mode: ["auto", "single", "native", "plan"], planRouting: ["jev", "fixed"], learning: ["auto", "manual", "frozen"], contextSelection: ["jev", "summary"] };
 		// modelRoutes is a model -> provider map, edited as "model=provider, model=provider".
@@ -319,7 +415,7 @@ window.__ModuleLoader__.load({
 			parse: (text) => {
 				const parts = text.split(/[,\n]/).map((part) => part.trim()).filter(Boolean);
 				if (!parts.length) return { kind: "clear" };
-				const routes = {};
+				const routes = Object.create(null);
 				for (const part of parts) {
 					const [model, provider, extra] = part.split("=").map((x) => x.trim());
 					if (!model || !provider || extra !== undefined) return undefined;
@@ -327,6 +423,45 @@ window.__ModuleLoader__.load({
 				}
 				return { kind: "set", value: routes };
 			}
+		};
+		const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+		const only = (object, names) => Object.keys(object).every((key) => names.includes(key));
+		const structured = (field, validate) => ({
+			field, format: (value) => value === undefined ? "" : JSON.stringify(value, null, 2),
+			parse: (input) => {
+				if (!input.trim()) return { kind: "clear" };
+				try { const value = JSON.parse(input); return validate(value) ? { kind: "set", value } : undefined; }
+				catch { return undefined; }
+			}
+		});
+		const routeJSON = structured("routes", (value) => Array.isArray(value) && value.every((route) =>
+			isObject(route) && only(route, ["id", "label", "model", "provider", "description", "efforts"]) &&
+			["id", "label", "model", "provider", "description"].every((key) => typeof route[key] === "string") &&
+			(route.efforts === undefined || Array.isArray(route.efforts) && route.efforts.every((effort) => typeof effort === "string"))));
+		const strategyJSON = structured("strategy", (value) => isObject(value) && only(value, ["mode", "weights", "routeWeights"]) &&
+			(value.mode === undefined || ["automatic", "single", "native"].includes(value.mode)) &&
+			(value.weights === undefined || isObject(value.weights) && only(value.weights, ["quality", "latency", "usage", "cache"]) &&
+				Object.values(value.weights).every((weight) => typeof weight === "number" && weight >= 0 && weight <= 1)) &&
+			(value.routeWeights === undefined || isObject(value.routeWeights)));
+		const listField = (field) => ({ field,
+			format: (value) => Array.isArray(value) ? value.join(", ") : "",
+			parse: (input) => ({ kind: "set", value: input.split(/[,\n]/).map((part) => part.trim()).filter(Boolean) })
+		});
+		const NUMBER_RULES = {
+			maxDecisions: [1, Infinity, true], maxChildren: [0, Infinity, true], maxConcurrent: [1, Infinity, true],
+			pressureTokens: [1024], ceilingRatio: [1], retainTokens: [1024], keepRatio: [0.1, 0.8],
+			reviewMaxRequests: [1, Infinity, true], advisorMaxConsults: [0, Infinity, true], advisorStallSteps: [3, Infinity, true],
+			planMaxChildren: [0, Infinity, true], planMaxJevCalls: [0, Infinity, true], planChildRequests: [1, Infinity, true],
+			effortSwitchFreeTokens: [0], maxEffortDecisions: [0], effortPhaseRequests: [1], cacheTtlSeconds: [0],
+			maxChildRequests: [1, Infinity, true], maxChildTurnRequests: [2, Infinity, true], nativeThresholdRatio: [0.01, 1]
+		};
+		const numberField = (name) => {
+			const spec = ui.settingsNumberField(name), [min, max = Infinity, integer] = NUMBER_RULES[name];
+			return { ...spec, parse: (input) => {
+				const write = spec.parse(input);
+				return write && (write.kind === "clear" || Number.isFinite(write.value) && write.value >= min && write.value <= max &&
+					(!integer || Number.isInteger(write.value))) ? write : undefined;
+			} };
 		};
 		const BOOLEAN_FIELDS = ["economyGuidance", "reviewBeforeFinish", "allowPaidModels"];
 		const booleanField = (field) => ({
@@ -343,17 +478,20 @@ window.__ModuleLoader__.load({
 		const specs = Object.fromEntries([
 			...Object.keys(SEGMENTED).map((name) => ui.settingsTextField(name)),
 			ui.settingsTextField("jevModel"), ui.settingsTextField("jevEndpoint"), ui.settingsTextField("adaptiveEffort"),
-			ui.settingsTextField("reviewerModel"), ui.settingsTextField("advisorModel"), routesField,
-			...NUMERIC_FIELDS.map((name) => ui.settingsNumberField(name)),
+			ui.settingsTextField("reviewerModel"), ui.settingsTextField("advisorModel"), ui.settingsTextField("recordFile"), routesField,
+			routeJSON, strategyJSON, listField("preferredProviders"), listField("allowedProviders"),
+			...NUMERIC_FIELDS.map(numberField),
 			...BOOLEAN_FIELDS.map(booleanField)
 		].map((spec) => [spec.field, spec]));
 		// Its own entry in the settings navigation: the same form, bound to the plugin's config entry.
 		function AutoSettingsSection({ t, form }) {
 			const snapshot = react.useSyncExternalStore((listener) => form.subscribe(listener), () => form.getSnapshot());
+			const [revision, setRevision] = react.useState(0);
 			return jsxs("div", { className: "dac-page", children: [
 				jsx("h2", { className: "dac-pageTitle", children: "DSH AutoCTX" }),
 				jsx("p", { className: "dac-pageIntro", children: t("pageIntro") }),
-				jsx(AutoConfigForm, { t, form: { state: snapshot, mutate: (ops, revision) => form.mutate(ops, revision) } })
+				jsx(AutoConfigForm, { t, form: { state: snapshot, mutate: (ops, revision) => form.mutate(ops, revision) } }),
+				jsx(PriorsPanel, { t, onChange: () => setRevision((value) => value + 1) }), jsx(HistoryPanel, { t, kind: "prior", revision })
 			] });
 		}
 		function AutoConfigCard({ t, view, form }) {
@@ -364,10 +502,10 @@ window.__ModuleLoader__.load({
 			const [draft, setDraft] = react.useState(null);
 			const [saving, setSaving] = react.useState(false);
 			const [failed, setFailed] = react.useState(false);
-			const [keySet, setKeySet] = react.useState(false);
+			const [keySet, setKeySet] = react.useState(null);
 			react.useEffect(() => {
 				fetch(new URL("./api/dsh-autoctx/stats", document.baseURI)).then((response) => response.ok ? response.json() : null)
-					.then((body) => setKeySet(!!body?.apiKeyConfigured)).catch(() => {});
+					.then((body) => setKeySet(typeof body?.apiKeyConfigured === "boolean" ? body.apiKeyConfigured : null)).catch(() => setKeySet(null));
 			}, [saving]);
 			const snapshot = form?.state;
 			const baseline = draft?.baseline ?? snapshot;
@@ -410,10 +548,21 @@ window.__ModuleLoader__.load({
 					text: edit?.text ?? spec.format(baseline?.value?.[name]),
 					overridden: edit ? write?.kind === "set" : Object.hasOwn(baseline?.user ?? {}, name),
 					invalid: !!edit && !write,
-					overriddenLabel: t("overridden"), resetLabel: t("reset"), invalidLabel: t("invalid"),
+					overriddenLabel: t("overridden"), resetLabel: t("reset"), invalidLabel: t(name === "routes" ? "invalidRoutes" : name === "strategy" ? "invalidStrategy" : "invalid"),
 					onEdit: (text) => stage(name, text),
 					onReset: () => stage(name, spec.format(baseline?.base?.[name]), true)
 				};
+				if (name === "routes" || name === "strategy") return jsxs("div", { className: "dac-block", children: [
+					jsx("label", { className: "dac-label", htmlFor: props.id, children: props.label }),
+					jsx("div", { className: "dac-hint", id: props.id + "-hint", children: props.hint }),
+					jsx("textarea", { id: props.id, className: "dac-input dac-json", value: props.text, disabled,
+						"aria-invalid": props.invalid, "aria-describedby": props.id + "-hint " + props.id + "-error",
+						onChange: (event) => props.onEdit(event.target.value), rows: 8, spellCheck: false }),
+					jsx("div", { id: props.id + "-error", role: props.invalid ? "alert" : undefined,
+						className: "dac-error", children: props.invalid ? props.invalidLabel : null }),
+					props.overridden ? jsx("button", { type: "button", className: "dac-link", disabled,
+						onClick: props.onReset, children: props.resetLabel }) : null
+				] }, name);
 				if (SEGMENTED[name]) return jsxs("div", { className: "dac-mode", children: [
 					jsxs("div", { className: "dac-modeHead", children: [
 						jsx("span", { className: "dac-label", children: props.label }),
@@ -450,16 +599,19 @@ window.__ModuleLoader__.load({
 					jsx(ui.SettingsSecretField, {
 						id: "dac-apiKey", label: t("apiKey"), hint: t("apiKeyHint"), disabled,
 						text: draft?.fields.apiKey?.text ?? "", configured: keySet,
-						stateLabel: t(keySet ? "keySet" : "keyUnset"),
+						stateLabel: keySet === null ? "–" : t(keySet ? "keySet" : "keyUnset"),
 						onEdit: (text) => stage("apiKey", text)
 					}),
 					field("jevModel"), field("learning"), field("adaptiveEffort"), field("maxDecisions"), field("jevEndpoint"),
-					section("sectionSubagents"), field("modelRoutes"), field("reviewerModel"), field("advisorModel"),
-					field("allowPaidModels"), field("maxChildren"), field("maxConcurrent"),
+					field("effortSwitchFreeTokens"), field("maxEffortDecisions"), field("effortPhaseRequests"), field("cacheTtlSeconds"),
+					section("sectionSubagents"), field("reviewerModel"), field("advisorModel"),
+					field("allowPaidModels"), field("maxChildren"), field("maxConcurrent"), field("maxChildRequests"), field("maxChildTurnRequests"),
 					field("reviewBeforeFinish"), field("reviewMaxRequests"),
 					field("advisorMaxConsults"), field("advisorStallSteps"),
 					section("sectionContext"), field("contextSelection"), field("pressureTokens"), field("ceilingRatio"),
-					field("retainTokens"), field("keepRatio"), field("economyGuidance"),
+					field("retainTokens"), field("keepRatio"), field("nativeThresholdRatio"), field("economyGuidance"),
+					section("sectionAdvanced"), field("routes"), field("modelRoutes"), field("preferredProviders"), field("allowedProviders"),
+					field("strategy"), field("recordFile"),
 					jsx("div", { className: "dac-hint", children: t("yamlNote") })
 				] })
 			});
@@ -536,8 +688,21 @@ window.__ModuleLoader__.load({
 .dac-btn[data-primary=true]{background:var(--dsw-alias-state-business-primary);border-color:transparent;color:#fff}
 .dac-btn:disabled{opacity:.5;cursor:default}
 .dac-badge{padding:0 6px;border-radius:var(--dsw-radius-xs);background:var(--dsw-alias-state-warn-primary);color:#fff;font-size:11px;line-height:16px;font-weight:500}
-.dac-segSm .dac-segItem{min-width:0;padding:2px 10px;font-size:12px}`;
-		const usd = (n) => "$" + (Number(n) || 0).toFixed(Math.abs(n) >= 1 ? 2 : 4);
+.dac-segSm .dac-segItem{min-width:0;padding:2px 10px;font-size:12px}
+.dac-input{box-sizing:border-box;width:100%;min-width:0;font:inherit;padding:6px 8px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}
+.dac-input:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
+.dac-input[aria-invalid=true]{border-color:var(--dsw-alias-state-error-primary)}
+.dac-json{font-family:monospace;resize:vertical;tab-size:2}
+.dac-error{color:var(--dsw-alias-state-error-primary);font-size:12px}
+.dac-editor{display:flex;flex-direction:column;gap:6px;padding:4px 0}
+.dac-prose{white-space:pre-wrap;overflow-wrap:anywhere}
+.dac-injections{font-size:12px;line-height:18px;margin:8px 0;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-2)}
+.dac-injections>summary,.dac-item>summary{cursor:pointer;font-weight:500}
+.dac-sessionDetails{position:relative;font-size:12px}
+.dac-sessionDetails>.dac-card{position:absolute;bottom:100%;right:0;z-index:20}
+.dac-card:has(.dac-editor){width:560px}
+.dac-tbl:has(.dac-editor){overflow-x:auto}`;
+		const usd = (n) => typeof n === "number" && Number.isFinite(n) ? "$" + n.toFixed(Math.abs(n) >= 1 ? 2 : 4) : "–";
 		const pct = (p) => p == null ? "–" : Math.round(p * 100) + "%";
 		const fixed2 = (n) => n == null ? "–" : Number(n).toFixed(2);
 		const text = (v) => v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
@@ -559,7 +724,198 @@ window.__ModuleLoader__.load({
 				className: cell?.className, title: cell?.title, children: typeof cell === "object" && cell ? cell.text : cell
 			}, r + ":" + i)))
 		] });
-		function SchedulePanel({ t, stats, ledger, busy, failed, updated, post }) {
+		const apiURL = (path) => new URL("./api/dsh-autoctx/" + path, document.baseURI);
+		async function api(path, payload) {
+			const response = await fetch(apiURL(path), payload === undefined ? { cache: "no-store" } : {
+				method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload)
+			});
+			if (!response.ok) throw new Error("AutoCTX request failed");
+			return response.json();
+		}
+		// Several native turn tails can mount together. Share their in-flight metadata read;
+		// only the open turn polls, and no completed response is cached beyond its readers.
+		const injectionRequests = new Map();
+		function readInjections(path) {
+			if (!injectionRequests.has(path)) {
+				const pending = api(path).finally(() => injectionRequests.delete(path));
+				injectionRequests.set(path, pending);
+			}
+			return injectionRequests.get(path);
+		}
+		function useResource(path, revision, interval) {
+			const [state, setState] = react.useState({ path, loading: true });
+			const [refresh, setRefresh] = react.useState(0);
+			react.useEffect(() => {
+				let alive = true, inFlight = false;
+				const controller = new AbortController();
+				setState((current) => ({ path, data: current.path === path ? current.data : undefined, loading: true }));
+				const pull = async () => {
+					if (inFlight) return;
+					inFlight = true;
+					try {
+						let data;
+						if (path.startsWith("injections?")) data = await readInjections(path);
+						else {
+							const response = await fetch(apiURL(path), { cache: "no-store", signal: controller.signal });
+							if (!response.ok) throw new Error("AutoCTX request failed");
+							data = await response.json();
+						}
+						if (alive) setState({ path, data });
+					} catch (error) {
+						if (alive && error.name !== "AbortError") setState((current) => ({ ...current, loading: false, failed: true }));
+					} finally { inFlight = false; }
+				};
+				pull();
+				const timer = interval ? setInterval(() => { if (document.visibilityState === "visible") pull(); }, interval) : null;
+				return () => { alive = false; controller.abort(); clearInterval(timer); };
+			}, [path, revision, interval, refresh]);
+			return { ...(state.path === path ? state : { loading: true }), reload: () => setRefresh((value) => value + 1) };
+		}
+		const timeText = (value) => {
+			if (value === undefined || value === null) return "–";
+			const date = new Date(value);
+			return Number.isNaN(date.getTime()) ? "–" : date.toLocaleString();
+		};
+		const valueText = (value) => value === null || value === undefined ? "–" : text(value);
+		const actionButton = (label, onClick, disabled) => jsx("button", { type: "button", className: "dac-btn", onClick, disabled, children: label });
+		function ResourceStatus({ t, resource }) {
+			return jsxs(react.Fragment, { children: [
+				resource.loading ? jsx("div", { className: "dac-hint", role: "status", children: t("loading") }) : null,
+				resource.failed ? jsx("div", { className: "dac-error", role: "alert", children: t("loadFailed") }) : null
+			] });
+		}
+		function OverrideEditor({ t, value, weight, busy: parentBusy, onSave }) {
+			const [editing, setEditing] = react.useState(false), [draft, setDraft] = react.useState(""), [reason, setReason] = react.useState("");
+			const [busy, setBusy] = react.useState(false), [failed, setFailed] = react.useState(false);
+			const numeric = Number(draft), valid = weight ? draft.trim() !== "" && Number.isFinite(numeric) && numeric >= 0 && numeric <= 1 : !!draft.trim();
+			const disabled = busy || parentBusy;
+			const submit = async (clear) => {
+				setBusy(true); setFailed(false);
+				try {
+					const accepted = await onSave(clear ? null : weight ? numeric : draft, reason.trim() || undefined);
+					if (accepted === false) setFailed(true);
+					else { setEditing(false); setReason(""); }
+				} catch { setFailed(true); }
+				finally { setBusy(false); }
+			};
+			if (!editing) return actionButton(t("edit"), () => { setDraft(value === undefined ? "" : String(value)); setReason(""); setFailed(false); setEditing(true); }, disabled);
+			return jsxs("div", { className: "dac-editor", children: [
+				jsx(weight ? "input" : "textarea", { className: "dac-input", "aria-label": t(weight ? "weightValue" : "priorValue"),
+					value: draft, disabled, type: weight ? "number" : undefined, min: weight ? 0 : undefined, max: weight ? 1 : undefined,
+					step: weight ? "any" : undefined, rows: weight ? undefined : 5,
+					"aria-invalid": !valid, onChange: (event) => setDraft(event.target.value) }),
+				!valid ? jsx("div", { className: "dac-hint", children: t(weight ? "invalidWeight" : "invalidPrior") }) : null,
+				jsx("input", { className: "dac-input", value: reason, disabled, "aria-label": t("reason"), placeholder: t("reason"), onChange: (event) => setReason(event.target.value) }),
+				jsxs("div", { className: "dac-actions", children: [
+					actionButton(t(busy ? "saving" : "save"), () => submit(false), disabled || !valid),
+					actionButton(t("clear"), () => submit(true), disabled || value === undefined),
+					actionButton(t("cancel"), () => setEditing(false), disabled)
+				] }),
+				failed ? jsx("div", { className: "dac-error", role: "alert", children: t("actionFailed") }) : null
+			] });
+		}
+		function PriorsPanel({ t, onChange }) {
+			const resource = useResource("priors"), [query, setQuery] = react.useState("");
+			const models = resource.data?.models.filter((model) => model.id.toLowerCase().includes(query.toLowerCase()));
+			return jsxs("section", { className: "dac-sched", children: [
+				jsx("h3", { className: "dac-sectionTitle", children: t("priorsTitle") }),
+				jsx("div", { className: "dac-hint", children: t("priorsHint") }),
+				jsx("input", { className: "dac-input", value: query, "aria-label": t("search"), placeholder: t("search"), onChange: (event) => setQuery(event.target.value) }),
+				actionButton(t("refresh"), resource.reload, resource.loading), jsx(ResourceStatus, { t, resource }),
+				models?.length === 0 ? jsx("div", { className: "dac-hint", children: t("noModels") }) : null,
+				...(models ?? []).map((model) => jsxs("details", { className: "dac-item", children: [
+					jsx("summary", { children: model.id }),
+					model.routes.length ? jsx("div", { className: "dac-hint", children: model.routes.map((route) => [route.id, route.provider].filter(Boolean).join(" / ")).join(", ") }) : null,
+					jsx("div", { className: "dac-label", children: t("catalogPrior") }),
+					jsx("div", { className: "dac-prose", children: model.catalog ?? t("noPrior") }),
+					jsx("div", { className: "dac-label", children: t("userPrior") }),
+					jsx("div", { className: "dac-prose", children: model.override ?? "–" }),
+					jsx(OverrideEditor, { t, value: model.override, onSave: async (value, reason) => {
+						await api("priors", { model: model.id, value, reason }); resource.reload(); onChange?.();
+					} })
+				] }, model.id))
+			] });
+		}
+		function HistoryPanel({ t, sessionId, kind, revision }) {
+			const [offset, setOffset] = react.useState(0), [query, setQuery] = react.useState(""), [via, setVia] = react.useState("");
+			const params = new URLSearchParams({ offset: String(offset), limit: "25" });
+			if (sessionId) params.set("session", sessionId);
+			if (kind) params.set("kind", kind);
+			if (query) params.set("q", query);
+			if (via) params.set("via", via);
+			const resource = useResource("history?" + params.toString(), revision), data = resource.data;
+			return jsxs("section", { className: "dac-block", children: [
+				jsx("h3", { className: "dac-sectionTitle", children: t("historyTitle") }),
+				jsx("div", { className: "dac-hint", children: t("historyHint") }),
+				jsx("input", { className: "dac-input", value: query, placeholder: t("search"), "aria-label": t("search"),
+					onChange: (event) => { setQuery(event.target.value); setOffset(0); } }),
+				jsx("select", { className: "dac-input", value: via, "aria-label": t("source"), onChange: (event) => { setVia(event.target.value); setOffset(0); },
+					children: ["", "auto", "approved", "rejected", "revert", "user", "prior"].map((value) => jsx("option", { value, children: value || t("all") }, value)) }),
+				actionButton(t("refresh"), resource.reload, resource.loading), jsx(ResourceStatus, { t, resource }),
+				data?.entries.length === 0 ? jsx("div", { className: "dac-hint", children: t("noHistory") }) : null,
+				...(data?.entries ?? []).map((entry) => jsxs("article", { className: "dac-item", children: [
+					jsx("div", { className: "dac-strong", children: entry.model ?? entry.key }),
+					jsx("div", { className: "dac-sub", children: timeText(entry.at) + " · " + valueText(entry.via) + " / " + valueText(entry.source) }),
+					jsx("div", { className: "dac-prose", "aria-label": t("beforeAfter"), children: valueText(entry.before) + " → " + valueText(entry.after) }),
+					jsx("div", { className: "dac-prose dac-sub", children: t("changeReason") + ": " + valueText(entry.reason) }),
+					jsx("div", { className: "dac-sub", children: Array.isArray(entry.evidence) ? t("evidence", { n: String(entry.evidence.length) }) : t("evidenceIds") + ": –" }),
+					Array.isArray(entry.evidence) && entry.evidence.length ? jsx("div", { className: "dac-prose dac-sub", children: entry.evidence.join("\n") }) : null
+				] }, entry.id)),
+				data ? jsxs("div", { className: "dac-actions", children: [
+					actionButton(t("previous"), () => setOffset(Math.max(0, offset - data.limit)), resource.loading || offset === 0),
+					jsx("span", { className: "dac-hint", children: t("historyPage", { start: String(data.entries.length ? offset + 1 : 0), end: String(data.entries.length ? offset + data.entries.length : 0), total: String(data.total) }) }),
+					actionButton(t("next"), () => setOffset(data.nextOffset), resource.loading || data.nextOffset === null)
+				] }) : null
+			] });
+		}
+		function CandidatePanel({ t, sessionId }) {
+			const resource = useResource("candidates?session=" + encodeURIComponent(sessionId), undefined, 3000), data = resource.data;
+			const candidates = (entries) => entries?.length ? table("minmax(0,1fr) minmax(0,1fr) auto", [t("colModel"), "provider / id", "efforts"],
+				entries.map((entry) => [entry.model ?? entry.id, [entry.provider, entry.id].filter(Boolean).join(" / ") || "–", entry.efforts?.join(", ") || "–"]))
+				: jsx("div", { className: "dac-hint", children: t("noCandidates") });
+			return jsxs("section", { className: "dac-block", children: [
+				jsx("h3", { className: "dac-sectionTitle", children: t("candidatesTitle") }),
+				jsx("div", { className: "dac-hint", children: t("candidateHint") }),
+				actionButton(t("refresh"), resource.reload, resource.loading), jsx(ResourceStatus, { t, resource }),
+				data?.computed === false ? jsxs(react.Fragment, { children: [
+					jsx("p", { className: "dac-hint", children: t("notComputed") }),
+					jsx("div", { className: "dac-label", children: t("configuredRoutes") }),
+					candidates([...data.configured.routes, ...data.configured.modelRoutes]),
+					jsx("div", { className: "dac-label", children: t("catalogModels") }),
+					...data.configured.catalog.map((entry) => jsx("div", { className: "dac-sub", children: entry.id + (entry.providers?.length ? " · " + entry.providers.join(", ") : "") }, entry.id))
+				] }) : null,
+				...(data?.pools ?? []).map((pool) => jsxs("div", { className: "dac-item", children: [
+					jsx("div", { className: "dac-strong", children: pool.role }),
+					jsx("div", { className: "dac-sub", children: t("computedAt") + ": " + timeText(pool.at) + " · " + t("memoized") + ": " + (pool.memoized === true ? t("yes") : pool.memoized === false ? t("no") : "–") }),
+					candidates(pool.candidates),
+					jsx("div", { className: "dac-prose", children: t("basis") + ": " + valueText(pool.basis) }),
+					...(pool.unavailable ?? []).map((entry, index) => jsx("div", { className: "dac-prose dac-sub", children: t("unavailableModels") + ": " + entry.id + " · " + valueText(entry.reason) }, "u" + index)),
+					...(pool.filtered ?? []).map((entry, index) => jsx("div", { className: "dac-prose dac-sub", children: t("filtered") + ": " + entry.model + " · " + valueText(entry.reason) }, "f" + index))
+				] }, pool.role))
+			] });
+		}
+		// No generic per-message decoration slot exists on this host. The additive turn-tail slot
+		// also renders in one-shot and embedded child Chat, where the ordinary composer is hidden.
+		function InjectionPanel({ t, sessionId, turn }) {
+			const resource = useResource("injections?session=" + encodeURIComponent(sessionId), undefined, turn.status === "open" ? 3000 : undefined);
+			const start = turn.start?.time, end = turn.end?.time;
+			const entries = resource.data?.injections.filter((entry) => {
+				const at = typeof entry.at === "number" ? entry.at : Date.parse(entry.at);
+				return (turn.turn === 1 || start === undefined || at >= start) && (end === undefined || at <= end);
+			});
+			return jsxs("details", { className: "dac-injections", children: [
+				jsx("summary", { children: t("injectedTitle") }),
+				jsx("div", { className: "dac-hint", children: t("injectionHint") }),
+				actionButton(t("refresh"), resource.reload, resource.loading), jsx(ResourceStatus, { t, resource }),
+				entries?.length === 0 ? jsx("div", { className: "dac-hint", children: t("noInjections") }) : null,
+				...(entries ?? []).map((entry, index) => jsxs("div", { className: "dac-item", children: [
+					jsx("span", { className: "dac-badge", children: entry.sourceLabel }),
+					jsx("div", { className: "dac-sub", children: valueText(entry.messageKind) + " · " + t("chars", { n: compact(entry.chars) }) + " · " + timeText(entry.at) }),
+					jsx("div", { className: "dac-sub", children: t("from") + ": " + valueText(entry.from) })
+				] }, entry.contentSha256 + ":" + index))
+			] });
+		}
+		function SchedulePanel({ t, sessionId, stats, ledger, busy, failed, updated, post, revision }) {
 			const mode = ledger?.mode ?? stats.learning?.mode;
 			const history = ledger?.history ?? [];
 			const lastAuto = [...history].reverse().find((entry) => entry.via === "auto");
@@ -592,7 +948,7 @@ window.__ModuleLoader__.load({
 							jsx("div", { className: "dac-hint", children: [
 								item.basis != null ? t("basis") + ": " + text(item.basis) : null,
 								item.uncertainty != null ? t("uncertainty", { x: fixed2(item.uncertainty) }) : null,
-								t("evidence", { n: String(item.evidence?.length ?? 0) })
+								Array.isArray(item.evidence) ? t("evidence", { n: String(item.evidence.length) }) : null
 							].filter(Boolean).join(" · ") })
 						]
 					}, key)),
@@ -618,9 +974,10 @@ window.__ModuleLoader__.load({
 				] }, role)),
 				ledger ? jsxs("div", { className: "dac-block", children: [
 					jsx("div", { className: "dac-blockHead", children: t("weightsTitle") }),
-					weights.length ? table("auto minmax(0,1fr) auto auto", [t("colTag"), t("colModel"), t("colRole"), t("colWeight")],
-						weights.map((entry) => [...keyParts(entry.key), weightLabel(t, entry.weight, entry.source, entry.n)]
-							.map((cell) => ({ text: cell, title: entry.summary }))))
+					weights.length ? table("auto minmax(0,1fr) auto auto minmax(100px,1fr)", [t("colTag"), t("colModel"), t("colRole"), t("colWeight"), t("userWeight")],
+						weights.map((entry) => [...keyParts(entry.key), weightLabel(t, entry.weight, entry.source, entry.n),
+							{ text: jsx(OverrideEditor, { t, weight: true, value: entry.user, busy,
+								onSave: (value, reason) => post({ action: "user", key: entry.key, value, reason }) }, entry.key) }]))
 						: jsx("div", { className: "dac-hint", children: t("noWeights") })
 				] }) : null,
 				lastAuto ? jsxs("div", { className: "dac-block", children: [
@@ -634,6 +991,7 @@ window.__ModuleLoader__.load({
 					] })
 				] }) : null,
 				failed ? jsx("div", { className: "dac-hint", children: t("actionFailed") }) : null,
+				jsx(CandidatePanel, { t, sessionId }), jsx(HistoryPanel, { t, sessionId, revision }),
 				jsx("div", { className: "dac-hint", children: t("feedbackNote") })
 			] });
 		}
@@ -642,23 +1000,26 @@ window.__ModuleLoader__.load({
 			const [peek, setPeek] = react.useState(false);
 			const [pinned, setPinned] = react.useState(false);
 			const [sched, setSched] = react.useState(false);
+			const [detailsOpen, setDetailsOpen] = react.useState(false);
 			const [ledger, setLedger] = react.useState(null);
+			const [statsFailed, setStatsFailed] = react.useState(false), [ledgerFailed, setLedgerFailed] = react.useState(false);
 			const [busy, setBusy] = react.useState(false);
 			const [failed, setFailed] = react.useState(false);
 			const [updated, setUpdated] = react.useState(false);
 			const pendingRef = react.useRef(null);
+			const [revision, setRevision] = react.useState(0);
 			const open = peek || pinned;
 			react.useEffect(() => {
 				if (!sessionId) return;
 				const url = new URL("./api/dsh-autoctx/stats?session=" + encodeURIComponent(sessionId), document.baseURI);
 				let alive = true;
 				setStats(null);
-				setLedger(null);
+				setLedger(null); setStatsFailed(false); setLedgerFailed(false);
 				const pull = () => {
 					if (document.visibilityState !== "visible") return;
-					fetch(url).then((response) => response.ok ? response.json() : null)
-						.then((body) => { if (alive) setStats(body?.stats ?? null); })
-						.catch(() => {});
+					fetch(url).then((response) => { if (!response.ok) throw new Error("AutoCTX stats unavailable"); return response.json(); })
+						.then((body) => { if (alive) { setStats(body.stats); setStatsFailed(false); } })
+						.catch(() => { if (alive) setStatsFailed(true); });
 				};
 				pull();
 				const timer = setInterval(pull, 3000);
@@ -681,9 +1042,9 @@ window.__ModuleLoader__.load({
 				if (!open) setUpdated(false);
 				const pull = () => {
 					if (document.visibilityState !== "visible") return;
-					fetch(url).then((response) => response.ok ? response.json() : null)
-						.then((body) => { if (alive) receive(body); })
-						.catch(() => {});
+					fetch(url).then((response) => { if (!response.ok) throw new Error("AutoCTX ledger unavailable"); return response.json(); })
+						.then((body) => { if (alive) { receive(body); setLedgerFailed(false); } })
+						.catch(() => { if (alive) setLedgerFailed(true); });
 				};
 				pull();
 				const timer = open ? setInterval(pull, 3000) : null;
@@ -705,12 +1066,16 @@ window.__ModuleLoader__.load({
 					});
 					const body = await response.json().catch(() => null);
 					if (response.status === 409 && body?.ledger) receive(body, true);
-					else if (response.ok) receive(body);
+					else if (response.ok && body?.ledger && !body.error) { receive(body); setRevision((value) => value + 1); return true; }
 					else setFailed(true);
-				} catch { setFailed(true); }
+					return false;
+				} catch { setFailed(true); return false; }
 				finally { setBusy(false); }
 			};
-			if (!stats) return null;
+			if (!stats) return jsxs("details", { className: "dac-sessionDetails", onToggle: (event) => setDetailsOpen(event.currentTarget.open), children: [
+				jsx("summary", { className: "dac-link", children: t("title") }),
+				detailsOpen ? jsxs("div", { className: "dac-card", children: [jsx(ResourceStatus, { t, resource: { failed: statsFailed || ledgerFailed } }), jsx(CandidatePanel, { t, sessionId }), jsx(HistoryPanel, { t, sessionId })] }) : null
+			] });
 			const decisions = stats.maxDecisions > 0 ? Math.min(1, stats.decisions / stats.maxDecisions) : 0;
 			const context = stats.pressureTokens > 0 && stats.contextTokens !== null
 				? Math.min(1, stats.contextTokens / stats.pressureTokens) : 0;
@@ -726,7 +1091,7 @@ window.__ModuleLoader__.load({
 			const cost = stats.cost;
 			const cache = Object.entries(stats.cache ?? {});
 			const plan = stats.plan;
-			const showSched = !!(stats.choices || stats.learning || ledger);
+			const showSched = !!sessionId;
 			return jsxs("div", {
 				className: "dac-chip", tabIndex: 0, "aria-expanded": open,
 				onMouseEnter: () => setPeek(true), onMouseLeave: () => setPeek(false),
@@ -747,6 +1112,7 @@ window.__ModuleLoader__.load({
 					hasPending ? jsx("span", { className: "dac-dot", title: t("pendingDot"), "aria-label": t("pendingDot") }) : null,
 					open ? jsx("div", { className: "dac-pop", onClick: (event) => { event.stopPropagation(); setPinned(true); }, children: jsxs("div", { className: "dac-card", children: [
 						jsx("p", { className: "dac-cardTitle", children: t("title") }),
+						jsx(ResourceStatus, { t, resource: { failed: statsFailed || ledgerFailed } }),
 						jsxs("div", { className: "dac-grid", children: [
 							jsx("span", { className: "dac-key", children: t("statsMode") }),
 							jsx("span", { children: stats.mode }),
@@ -771,7 +1137,8 @@ window.__ModuleLoader__.load({
 								stats.deferrals > 0 ? " · " + t("statsDeferrals", { n: String(stats.deferrals) }) : null
 							] }),
 							cost ? row(t("statsCost"), [
-								usd((cost.executor ?? 0) + (cost.children ?? 0) + (cost.jev ?? 0) + (cost.compaction ?? 0)),
+								usd([cost.executor, cost.children, cost.jev, cost.compaction].every((value) => typeof value === "number")
+									? cost.executor + cost.children + cost.jev + cost.compaction : undefined),
 								jsx("div", { className: "dac-sub", children: [
 									...[["costExecutor", cost.executor], ["costChildren", cost.children], ["costJev", cost.jev], ["costCompaction", cost.compaction]]
 										.map(([key, value]) => t(key) + " " + usd(value)),
@@ -781,10 +1148,10 @@ window.__ModuleLoader__.load({
 							cache.length ? row(t("statsCache"), [
 								jsx("div", { className: "dac-sub", children: t("cacheReported") }, "head"),
 								...cache.map(([key, entry]) => jsx("div", { children: (key === "executor" ? t("cacheExecutor") : key) + " "
-									+ pct(entry.input > 0 ? entry.cacheRead / entry.input : null) + " · " + t("cacheCalls", { n: String(entry.calls ?? 0) }) }, key))
+									+ pct(entry.input > 0 ? entry.cacheRead / entry.input : null) + " · " + t("cacheCalls", { n: compact(entry.calls) }) }, key))
 							]) : null,
 							stats.forks > 0 ? row(t("statsPrefix"), [
-								t("prefixValue", { seeded: String(stats.historySeeded ?? 0), forks: String(stats.forks) }),
+								t("prefixValue", { seeded: compact(stats.historySeeded), forks: String(stats.forks) }),
 								jsx("div", { className: "dac-hint", children: t("prefixHint") }, "hint")
 							]) : null,
 							plan ? row(t("statsPlan"), [[
@@ -811,7 +1178,7 @@ window.__ModuleLoader__.load({
 							(sched ? "▾ " : "▸ ") + t("schedTitle"),
 							hasPending ? jsx("span", { className: "dac-dot dac-dotInline", title: t("pendingDot") }) : null
 						] }) : null,
-						showSched && sched ? jsx(SchedulePanel, { t, stats, ledger, busy, failed, updated, post }) : null
+						showSched && sched ? jsx(SchedulePanel, { t, sessionId, stats, ledger, busy, failed, updated, post, revision }) : null
 					] }) }) : null
 				]
 			});
@@ -840,6 +1207,9 @@ window.__ModuleLoader__.load({
 				key: CONFIG_KEY,
 				locale: NS
 			}, AutoConfigCard)), "dsh-autoctx: row config page");
+			ctx.effect(() => ctx.slots.inject("conversation.chat.turnTail", () => ctx.slots.register({
+				name: "conversation.chat.turnTail", id: "dsh-autoctx-injections", order: 60, locale: NS
+			}, InjectionPanel)), "dsh-autoctx: injected context sources");
 			ctx.effect(() => ctx.slots.inject("conversation.input.right", () => ctx.slots.register({
 				name: "conversation.input.right",
 				id: "dsh-autoctx-stats",

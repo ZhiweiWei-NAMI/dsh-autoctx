@@ -74,7 +74,54 @@ Removing the bundle layer restores native compaction.
 
 ## Settings and defaults
 
-In the web UI, open bottom-left **Settings → DSH AutoCTX**, or **Plugins → dsh-autoctx → Configure**. Fields include mode, learning, context selection, adaptive thinking effort, Jev endpoint, model routes and ceiling ratio. A composer chip shows context pressure and decisions; its card shows the schedule, thinking policy and learning ledger, including pending proposals in manual mode. `apiKey` is a secret field and is not written to logs or record files.
+In the web UI, open bottom-left **Settings → DSH AutoCTX**, or **Plugins → dsh-autoctx → Configure**. The form covers every current Config key, including plan budgets, provider comma lists, effort/cache budgets, child limits, native threshold and record path. `routes` and `strategy` use JSON editors that refuse malformed or schema-invalid input. Settings remain in the host configuration form, with its revision and writability checks. `apiKey` remains a secret field; the client reads only its configured status.
+
+The Settings page also lists catalog models and configured routes with catalog prior text and an editable user override. Overrides and their full edit history live in the deployment-wide `dsh_auto_priors` storage domain (`priors` table, `catalog` record), shared across workspaces because they describe model capabilities. Clearing an override restores the catalog prior. Workspace outcome weights remain in the existing per-workspace ledger. In the composer card's **Scheduling & learning** table, each weight has **Edit**, **Save** and **Clear override**, with an optional reason. Learned weights never overwrite user preferences. Change history pages every retained ledger change (the existing retention is 20 batches), plus prior edits, with source, reason/Jev basis and evidence ids when recorded; old missing fields show “–”.
+
+The composer card lists the latest retained candidate pool per root-session role, with actual computation time, memoized flag, unavailable/filtered entries and the backend's verbatim basis. Before a pool exists it labels configured routes/catalog as **Not computed yet**. Refreshing the view reads records; it does not trigger candidate computation. The host has no generic per-message decoration slot: the additive `conversation.chat.turnTail` slot displays **Injected by AutoCTX** panels by turn, including native one-shot and embedded child conversations. Panels list recorded source label, kind, character count and time without changing messages. The first turn also includes injection records preceding its start. Session metadata is bounded in memory and disappears on restart; no message text is retained by the UI tap.
+
+<details>
+<summary>UI backend integration in index.js (owned by the main agent)</summary>
+
+This UI worktree deliberately leaves `index.js` unchanged. Apply the fragments below at the indicated existing locations (under 20 executable lines). Rename the imported `knowledge` to `catalogKnowledge`; the local wrapper then covers all four existing knowledge-builder call sites. Make `apply` async and await the prior domain before registering model-facing handlers. `openPriors` owns its disposal. Append `tap.push` at the **start** of `record(value)` so capture is independent of record-file logging. Register the UI routes immediately after `updateLedger` is declared. Replace the existing user-action handler and its validation condition, retaining its following 400 response. Replace `ledgerView`'s eight-entry history slice with the full retained history.
+
+```js
+import { registerUiRoutes, createRecordTap } from "./uiapi.js";
+import { openPriors, priorTextOf } from "./priors.js";
+// models.js import: replace `knowledge,` with:
+  knowledge as catalogKnowledge,
+export async function apply(ctx, options) { // replace existing signature
+  // after the existing config declaration:
+  const tap = createRecordTap(1000), priors = await openPriors(ctx);
+  const knowledge = list => catalogKnowledge(list.map(entry => ({ ...entry,
+    prior: priorTextOf(entry.id) ?? entry.prior })));
+  // first line of record(value):
+  tap.push({ at: Date.now(), ...value });
+  // after updateLedger:
+  registerUiRoutes(ctx, { config, readLedger, updateLedger, statsRoot,
+    cwdOf: id => ctx.agents.get(id)?.session.header.cwd, catalog: CATALOG.models, tap, priors });
+  // replace actions.user:
+  user: ledger => ({ ledger: setUser(ledger, body.key, body.value, now, body.reason) }),
+  // replace the existing user validation `if` condition:
+  if (body.action === "user" && (typeof body.key !== "string" || !body.key.trim() || (body.value !== null && (typeof body.value !== "number" || !Number.isFinite(body.value) || body.value < 0 || body.value > 1)) || (body.reason !== undefined && typeof body.reason !== "string")))
+  // replace ledgerView.history:
+  history: ledger.history,
+```
+
+The snippets are placement instructions, not one contiguous function. For configured-only models that never enter `knowledge(...)`, also apply `priorTextOf(route.model)` when assembling their capability/route description; do not overwrite catalog measurements. The main agent owns that model-routing decision. If changing the `apply` signature is undesirable, await `openPriors(ctx)` in the existing startup lifecycle before any `priorTextOf` call; the synchronous getter refuses use before initialization.
+
+`registerUiRoutes(ctx, deps)` consumes `config`, `readLedger(cwd)`, `statsRoot(sessionId)`, `cwdOf(rootSessionId)`, `catalog` (the `models[]` array), `tap`, and `priors` (`snapshot()` and durable `set(model, valueOrNull, reason)`). It does not register a second ledger route. `createRecordTap(limit)` returns synchronous `push(record)`, `injections(sessionIds)` and `candidates(sessionIds)`; arrays of session ids are accepted, injections match **to**, candidates match **session** and select the latest timestamp per role. Only whitelisted metadata from the two agreed record kinds is copied. The limit is a combined FIFO count across both kinds. Supply `at` from the producer; the shown wiring stamps records lacking it.
+
+Additional endpoints, all with `cache-control: no-store`:
+
+- `GET /api/dsh-autoctx/injections?session=<viewed-id>` returns `{session, injections}` for that recipient, without root remapping.
+- `GET /api/dsh-autoctx/candidates?session=<id>` maps to the root and returns `{session, computed, pools}`. With no retained pool it adds `status: "not computed yet"` and `configured: {routes, modelRoutes, catalog}`; these are configuration facts, not availability claims.
+- `GET /api/dsh-autoctx/priors` returns `{scope: "deployment", models: [{id, catalog?, override?, routes}]}`. `POST` accepts `{model, value: string|null, reason?}`; an unknown model or invalid edit returns 400.
+- `GET /api/dsh-autoctx/history?session=<id>&offset=0&limit=25&kind=ledger|prior&via=auto|approved|rejected|revert|user|prior&q=<text>` returns `{cwd?, entries, total, offset, limit, nextOffset}`. Filters are optional; limit is 1–100. `kind=prior` needs no session. All other history reads require a known session workspace, never an invented empty workspace. Prior entries are deployment-wide; ledger entries belong to that workspace.
+
+New test sources cover these contracts and ledger compatibility. They were written without running tests, Node, builds, typechecks, browsers, servers or models. Runtime verification and the above integration remain with the main agent.
+
+</details>
 
 | Key | Default and meaning |
 | --- | --- |

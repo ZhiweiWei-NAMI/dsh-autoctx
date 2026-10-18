@@ -74,7 +74,13 @@ dsh plugin --profile autoctx remove dsh-autoctx
 
 ## 设置与默认值
 
-Web 界面：左下角 **Settings → DSH AutoCTX**，或 **Plugins → dsh-autoctx → Configure**。可设置模式、学习、上下文选择、自适应思考强度、Jev endpoint、模型路由和 ceiling ratio。输入框徽章显示上下文压力与决策；详情卡显示调度、思考策略及学习账本，manual 模式下还显示待审批提案。`apiKey` 是 secret 字段，不写入日志或记录文件。
+Web 界面：左下角 **Settings → DSH AutoCTX**，或 **Plugins → dsh-autoctx → Configure**。表单覆盖当前全部 Config 字段，含计划预算、provider 逗号列表、强度与缓存预算、子代理请求上限、原生阈值和记录路径。`routes` 与 `strategy` 使用 JSON 编辑器，拒绝格式或字段结构不符的输入。设置仍走宿主配置表单的版本与可写性检查；`apiKey` 保持 secret 控件，客户端只读取是否已配置。
+
+设置页另列模型目录与配置路由，展示目录先验并允许编辑或清除文本覆盖、填写原因。先验描述模型能力，因此按部署共享，存于独立的 `dsh_auto_priors` storage domain（`priors` 表的 `catalog` 记录），完整保留用户编辑历史。清除覆盖后恢复目录先验。任务结果权重仍按工作区保存在原账本；输入框卡片的「调度与学习」权重表支持逐项编辑 [0,1] 的用户权重、清除覆盖和填写原因，学习不覆盖用户偏好。历史可筛选、翻页，读取全部保留的账本变更（沿用最近 20 批的保留范围）和部署级先验历史，展示原因 / Jev 依据、来源与证据 id；旧记录缺失字段显示「–」。
+
+候选列表显示根会话每个角色最近保留的真实候选池，含计算时间、memoized 状态、不可用与过滤项、原始 basis。尚无记录时，配置路由与目录明确标为「尚未计算」，不宣称已检查可用性；刷新视图只读取记录，不触发候选池重算。宿主没有通用逐消息装饰插槽，因此在现有 `conversation.chat.turnTail` 中按回合展示「由 AutoCTX 注入」面板，包含原生 one-shot 与侧栏子会话；仅列来源、类型、字符数与时间，不改消息内容。首回合也包含其开始前的注入记录。注入与候选元数据有内存上限，重启后丢失；UI tap 不保存消息正文。
+
+本工作树不修改 `index.js`。主助手需要：启动时等待 `openPriors(ctx)`；在 `record()` 开头接入带时间戳的 tap；在 `updateLedger` 后调用 `registerUiRoutes`；将先验 getter 接入模型知识构建；让原有 ledger 的 `user` action 传递 `body.reason` 并严格验证类型和值域；将原账本视图的 8 条历史截断改为全部保留历史。具体替换代码、依赖契约与 API 见 [英文 UI 接线说明](README.en.md#settings-and-defaults)。配置中独有、尚未进入知识构建器的模型，也需在路由能力描述中使用其覆盖先验。新增测试只写未运行；未运行 Node、构建、类型检查、浏览器、服务或模型。
 
 | 配置键 | 默认值与含义 |
 | --- | --- |

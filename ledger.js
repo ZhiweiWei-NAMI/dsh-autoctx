@@ -43,8 +43,11 @@ function applied(ledger, items, via, at) {
     const before = weights[item.key];
     weights[item.key] = { ...before, learned: item.proposed, n: (before?.n ?? 0) + 1,
       summary: clip(item.basis, 160), updatedAt: at };
-    changes.push({ key: item.key, from: before?.learned ?? DEFAULT_WEIGHT, to: item.proposed, target: item.target });
-    for (const id of item.evidence) consumed.add(id);
+    changes.push({ key: item.key, from: before?.learned ?? DEFAULT_WEIGHT, to: item.proposed, target: item.target,
+      ...(item.basis === undefined ? {} : { basis: item.basis }),
+      ...(item.evidence === undefined ? {} : { evidence: [...item.evidence] }),
+      ...(item.source === undefined ? {} : { source: item.source }) });
+    for (const id of item.evidence ?? []) consumed.add(id);
   }
   if (!changes.length) return ledger;
   const version = ledger.version + 1;
@@ -84,7 +87,8 @@ export function propose(ledger, proposals, at) {
     // A later proposal for the same weight replaces the displayed target; its evidence joins the earlier one.
     const evidence = [...new Set([...(before[item.key]?.evidence ?? []), ...item.evidence])];
     items[item.key] = { current: item.current, proposed: item.proposed, target: item.target,
-      basis: clip(item.basis, 240), uncertainty: item.uncertainty, evidence, updatedAt: at };
+      basis: item.basis, uncertainty: item.uncertainty, evidence, updatedAt: at,
+      ...(item.source === undefined ? {} : { source: item.source }) };
   }
   const version = nextPending(ledger);
   const pending = { version, baseVersion: ledger.version, items, updatedAt: at };
@@ -105,7 +109,11 @@ export function reject(ledger, version, at) {
   const evidence = Object.values(ledger.pending.items).flatMap(item => item.evidence);
   const consumed = [...new Set([...ledger.consumed, ...evidence])].slice(-CONSUMED);
   const history = [...ledger.history, { version: ledger.version, at, via: 'rejected',
-    changes: Object.keys(ledger.pending.items).map(key => ({ key, kept: effective(ledger, key).weight })) }].slice(-HISTORY);
+    changes: Object.entries(ledger.pending.items).map(([key, item]) => ({ key, kept: effective(ledger, key).weight,
+      from: effective(ledger, key).weight, to: effective(ledger, key).weight, target: item.target,
+      ...(item.basis === undefined ? {} : { basis: item.basis }),
+      ...(item.evidence === undefined ? {} : { evidence: [...item.evidence] }),
+      ...(item.source === undefined ? {} : { source: item.source }) })) }].slice(-HISTORY);
   return { ledger: { ...ledger, pending: null, consumed, history } };
 }
 
@@ -124,7 +132,10 @@ export function revert(ledger, version, at) {
   for (const change of entry.changes) {
     const now = weights[change.key];
     weights[change.key] = { ...now, learned: change.from, updatedAt: at };
-    changes.push({ key: change.key, from: now?.learned ?? DEFAULT_WEIGHT, to: change.from });
+    changes.push({ key: change.key, from: now?.learned ?? DEFAULT_WEIGHT, to: change.from,
+      ...(change.basis === undefined ? {} : { basis: change.basis }),
+      ...(change.evidence === undefined ? {} : { evidence: [...change.evidence] }),
+      ...(change.source === undefined ? {} : { source: change.source }) });
   }
   const next = ledger.version + 1;
   return { ledger: rebase({ ...ledger, version: next, weights,
@@ -132,12 +143,17 @@ export function revert(ledger, version, at) {
 }
 
 /** Explicit user preference for one weight (null clears it); learning never writes this field. */
-export function setUser(ledger, key, value, at) {
+export function setUser(ledger, key, value, at, reason) {
+  if (typeof key !== 'string' || !key.trim() ||
+    (value !== null && (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1)))
+    throw new TypeError('user weight needs a key and a number in [0, 1] or null');
+  if (reason !== undefined && typeof reason !== 'string') throw new TypeError('reason must be text');
   const now = ledger.weights[key] ?? {};
   const entry = value === null ? (({ user: _user, ...rest }) => rest)(now) : { ...now, user: round(value) };
   const version = ledger.version + 1;
   return rebase({ ...ledger, version, weights: { ...ledger.weights, [key]: { ...entry, updatedAt: at } },
-    history: [...ledger.history, { version, at, via: 'user', changes: [{ key, from: now.user ?? null, to: value }] }].slice(-HISTORY) });
+    history: [...ledger.history, { version, at, via: 'user', changes: [{ key, from: now.user ?? null,
+      to: entry.user ?? null, source: 'user', ...(reason === undefined ? {} : { reason }) }] }].slice(-HISTORY) });
 }
 
 /** Compact rows for Jev and the UI: weight, its source and evidence count, never a fabricated rate. */
