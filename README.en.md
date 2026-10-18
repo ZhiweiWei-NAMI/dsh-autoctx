@@ -169,7 +169,7 @@ With the `log` method applied to every arm, the theoretical total is $1.547 for 
 
 AutoCTX resolves more cases than B, C and H on this sample and costs more; on theoretical cost, 1.2.5 frozen is about 70–80% more than C overall and ~48% more per resolved case. Comparing 1.2.5 with 1.2.3 frozen, lane-matched and `exact`: 53 vs 52 resolved (6 wins / 5 losses, no quality difference); theoretical total cost is down 4.0% ($1.738 vs $1.810), theoretical executor cache rate is 87.0% vs 85.4%, and theoretical Jev cost is up $0.006.
 
-1.2.5 effort decisions across 72 cases: 201 cheap (no Jev call), 86 skip, 51 phase, 9 pulse, 11 after context replacement, and 11 fell back after the effort budget was spent; 19 cases reached the 64-request limit (1.2.3: 18).
+1.2.5 effort decisions across 72 cases: 201 cheap (no Jev call), 86 skip, 51 phase, 9 pulse, 11 after context replacement, and 11 fell back after the effort budget was spent; 19 cases reached the 64-request limit (1.2.3: 18). The limit counts Jev calls, so AutoCTX reaches it with fewer executor requests than the baselines: 10 of those 19 cases were unresolved, and Jev made 77 of their 640 requests (12%). B/C/H also hit the limit (17/20/16 cases), with executor requests only. This benchmark keeps the shared limit; a rerun excluding Jev from it has not been done.
 
 | Executor (24 cases per model per arm; resolved / 24) | AutoCTX 1.2.5 frozen | AutoCTX 1.2.3 frozen | AutoCTX 1.2.3 auto | B | C | H |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
