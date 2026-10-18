@@ -257,9 +257,13 @@ test("direct Jev answers require valid primitive fields", () => {
     /owner: choice was not offered/,
   );
 });
-test("ambiguous benefit does not start expensive investigation", () => {
-  const uncertain = { ...answer, useful: { score: 1.8, confidence: 0.09 } };
-  assert.equal(selectDelegation(uncertain, profiles, [], null, { canCreate: true }).action, "main");
+test("an explicit native delegation is routed, not vetoed, when no profile is a clear match", () => {
+  const weak = { fit_0: { score: 0.9, confidence: 0.3 }, fit_1: { score: 1.1, confidence: 0.3 } };
+  const result = selectDelegation(weak, profiles, [], null, { canCreate: true });
+  assert.equal(result.action, "start");
+  assert.equal(result.profile.id, "review/high");
+  assert.equal(result.clearMatch, false);
+  assert.equal(selectDelegation(weak, profiles, [], null, { canCreate: false }).action, "main");
 });
 test("a matching continuing conversation can be reused when new child slots are exhausted", () => {
   const result = selectDelegation(

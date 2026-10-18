@@ -24,11 +24,8 @@ export function validateJevAnswers(questions,answers) {
 }
 
 export function delegationQuestions(profiles, children) {
-  const questions = {
-    independent:{type:'noul',instructions:'Can the proposed subtask proceed using available inputs without waiting for unfinished work owned by the parent or an active child? Assess dependencies only.'},
-    useful:score('Is the pending proposal a still-needed deliverable for this task? Judge completion and ownership from observed results and the actual children list. The root request and this pending proposal describe work to do; neither is evidence that a child was assigned or that the work is complete.',
-      ['Observed results or actual child assignments show that it is already done, already owned, or unrelated.', 'Whether the deliverable is still needed is uncertain.', 'The task still needs this concrete deliverable and no active child owns it.']),
-  };
+  // The main agent decided to delegate by calling the native tool; Jev only chooses where the subtask runs.
+  const questions = {};
   for (const [i,profile] of profiles.entries()) questions['fit_'+i]=score(
     `How suitable is configured profile ${profile.id} for the proposed subtask? Use its stated capability and actual model/effort, not the order of candidates.`,
     ['Its stated capability does not match the assignment.', 'It can handle the assignment but is not a clear match.', 'Its stated capability directly matches the assignment.']);
@@ -46,30 +43,27 @@ export function delegationDecline(limits) {
 
 export function selectDelegation(answers, profiles, children, policy, limits) {
   const weights=policy?.weights ?? {quality:0.5,latency:0.5,usage:0.5,cache:0.5};
-  const usefulThreshold=1.2+0.2*weights.usage+0.2*weights.latency;
   const confidenceThreshold=0.4+0.2*weights.quality;
   const routeWeights=policy?.routeWeights ?? {};
   for (const [routeId,preference] of Object.entries(routeWeights)) {
     if (!finiteInRange(preference,1))
       throw new Error('routeWeights.'+routeId+' must be a number between 0 and 1.');
   }
-  if (answers.useful.score < usefulThreshold || answers.useful.confidence < confidenceThreshold)
-    return {action:'main',reason:'The proposal lacks a sufficiently clear unfinished deliverable.'};
   const reuse=children.map((child,i)=>({child,answer:answers['reuse_'+i]}))
     .filter(x=>x.answer.score>=1.6 && x.answer.confidence>=confidenceThreshold)
     .sort((a,b)=>b.answer.score-a.answer.score);
   if (reuse.length) return {action:'reuse',child:reuse[0].child};
-  if (answers.independent.noul < 0.7)
-    return {action:'main',reason:'A new child would wait for unfinished parent work.'};
   if (!limits.canCreate) return {action:'main',reason:'The task has no remaining child slot; continue in the parent or explicitly message an existing child.'};
-  const ranked=profiles.map((profile,i)=>{
+  const all=profiles.map((profile,i)=>{
     const fit=answers['fit_'+i];
     const prior=Object.hasOwn(routeWeights,profile.routeId) ? routeWeights[profile.routeId] : 0.5;
     return {profile,fit,weight:fit.score*(0.75+prior/2)};
-  }).filter(x=>x.fit.confidence>=confidenceThreshold && x.fit.score>=1.25)
-    .sort((a,b)=>b.weight-a.weight || a.profile.id.localeCompare(b.profile.id));
-  if (!ranked.length) return {action:'main',reason:'No configured profile has a sufficiently clear capability match.'};
-  return {action:'start',profile:ranked[0].profile,ranking:ranked.map(x=>({id:x.profile.id,score:x.fit.score,confidence:x.fit.confidence,weightedScore:x.weight}))};
+  }).sort((a,b)=>b.weight-a.weight || a.profile.id.localeCompare(b.profile.id));
+  if (!all.length) return {action:'main',reason:'No child profile is configured.'};
+  // Clear matches first; without one the best-scoring profile still runs the requested subtask.
+  const clear=all.filter(x=>x.fit.confidence>=confidenceThreshold && x.fit.score>=1.25);
+  const ranked=clear.length ? clear : all;
+  return {action:'start',profile:ranked[0].profile,clearMatch:clear.length>0,ranking:ranked.map(x=>({id:x.profile.id,score:x.fit.score,confidence:x.fit.confidence,weightedScore:x.weight}))};
 }
 
 export function contextQuestions(history, owners) {
