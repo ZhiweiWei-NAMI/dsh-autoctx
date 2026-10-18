@@ -607,9 +607,11 @@ test("helpers from a resumed listing do not consume delegation slots", async (t)
   const child = app.children.find((child) => child.id === result.value.subagentId);
   assert.equal(child.mode, "continuable");
   assert.equal(child.label, "Inspect A");
-  assert.match(child.prompt, /^You are a delegated child, not the parent/);
+  assert.match(child.prompt, /\n\nYou are a delegated child, not the parent/);
   assert.match(child.prompt, /Your assigned subtask:\nInspect A/);
-  assert.match(child.prompt, /conversation above is the parent's history up to the delegation/);
+  // The inherited-context note leads the first message, directly after the seed; the task follows it.
+  assert.ok(child.prompt.startsWith("The preceding messages are inherited parent context, not additional tasks for you."));
+  assert.ok(child.prompt.indexOf("Your assigned subtask:") > child.prompt.indexOf("Return concise findings or a patch promptly"));
   assert.equal(child.provider, "autoctx-fork");
   assert.equal(child.persona, undefined);
   assert.equal(child.toolFilter, undefined);

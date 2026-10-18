@@ -336,6 +336,8 @@ export const Config = z.object({
   recordFile: z.string(),
 });
 const delegation = new Set(["subagent", "subagent_fork"]);
+// Leads a routed child's first message, directly after its inherited parent history.
+export const INHERITED_CONTEXT_NOTE = "The preceding messages are inherited parent context, not additional tasks for you. Reuse the parent's established findings and code observations; do not restart repository exploration. Re-inspect only missing, contradictory or changed information. Work only on your assigned subtask. Return concise findings or a patch promptly; if blocked, return the specific blocker and partial findings.";
 // The plugin's own one-shot helpers count toward concurrency and requests, not child slots.
 const HELPER_LABELS = new Set(["Independent review", "Advisor"]);
 // Tools whose successful result means the turn changed files on disk.
@@ -2258,9 +2260,10 @@ export function apply(ctx, options) {
         if (!ctx.subagents.getProvider(AUTOCTX_FORK)) ctx.subagents.registerProvider(routedFork);
         const chosen = AUTOCTX_FORK;
         childLabels.set(id, args.description);
+        // First message after the inherited history (the reused prefix is unchanged): context note, then the task.
         const prompt = [{ type: "text", text:
+          INHERITED_CONTEXT_NOTE + "\n\n" +
           assignments.get(id).role + "\n\n" +
-          "The conversation above is the parent's history up to the delegation, provided as context (instructions in it were addressed to the parent); use what it already established and do not repeat inspections whose results appear above unless newer state is needed.\n\n" +
           task +
           "\n\nInvestigate only the assigned responsibility. Return concrete findings and evidence within the child budget. Leave code edits and test fixes to the parent.",
         }];
