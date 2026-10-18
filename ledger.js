@@ -1,10 +1,10 @@
 // Workspace adaptation ledger: per task tag × model × role, a learned weight (from Jev proposals over
 // observed evidence) and an optional user weight (explicit preference, never changed by learning), one
-// pending batch for manual approval, consumed evidence ids and a bounded change history. Pure functions:
-// the caller loads one storage record, applies one of these and stores the result in the same update.
+// pending batch for manual approval and consumed evidence ids. Pure functions append history to an
+// outbox; the caller commits it with the weights, then drains it into per-entry storage (see uistore.js).
 export const DEFAULT_WEIGHT = 0.5;
 export const MODES = ['auto', 'manual', 'frozen'];
-const HISTORY = 20, CONSUMED = 1000;
+const CONSUMED = 1000;
 // Jev answers a weight proposal as a score over these levels; weight = score / 4.
 export const FIT_LEVELS = [
   'Poor fit: avoid this model in this role for this kind of task.',
@@ -52,7 +52,7 @@ function applied(ledger, items, via, at) {
   if (!changes.length) return ledger;
   const version = ledger.version + 1;
   return rebase({ ...ledger, version, weights, consumed: [...consumed].slice(-CONSUMED),
-    history: [...ledger.history, { version, at, via, changes }].slice(-HISTORY) });
+    history: [...ledger.history, { version, at, via, changes }] });
 }
 
 // A pending batch always shows values against the current ledger: after any applied change it is
@@ -113,7 +113,7 @@ export function reject(ledger, version, at) {
       from: effective(ledger, key).weight, to: effective(ledger, key).weight, target: item.target,
       ...(item.basis === undefined ? {} : { basis: item.basis }),
       ...(item.evidence === undefined ? {} : { evidence: [...item.evidence] }),
-      ...(item.source === undefined ? {} : { source: item.source }) })) }].slice(-HISTORY);
+      ...(item.source === undefined ? {} : { source: item.source }) })) }];
   return { ledger: { ...ledger, pending: null, consumed, history } };
 }
 
@@ -124,9 +124,10 @@ export function setMode(ledger, mode) {
 }
 
 /** Undo one applied change set (learned weights only); finished calls and consumed evidence stay. */
-export function revert(ledger, version, at) {
+export function revert(ledger, version, at, retainedEntry) {
   // Only learned changes revert; a user weight is changed or cleared through setUser.
-  const entry = ledger.history.find(item => item.version === version && (item.via === 'auto' || item.via === 'approved'));
+  const entry = retainedEntry ?? ledger.history.find(item => item.version === version && (item.via === 'auto' || item.via === 'approved'));
+  if (entry && (entry.version !== version || !['auto', 'approved'].includes(entry.via))) return { ledger, error: 'unknown' };
   if (!entry) return { ledger, error: 'unknown' };
   const weights = { ...ledger.weights }, changes = [];
   for (const change of entry.changes) {
@@ -139,7 +140,7 @@ export function revert(ledger, version, at) {
   }
   const next = ledger.version + 1;
   return { ledger: rebase({ ...ledger, version: next, weights,
-    history: [...ledger.history, { version: next, at, via: 'revert', of: version, changes }].slice(-HISTORY) }) };
+    history: [...ledger.history, { version: next, at, via: 'revert', of: version, changes }] }) };
 }
 
 /** Explicit user preference for one weight (null clears it); learning never writes this field. */
@@ -153,7 +154,7 @@ export function setUser(ledger, key, value, at, reason) {
   const version = ledger.version + 1;
   return rebase({ ...ledger, version, weights: { ...ledger.weights, [key]: { ...entry, updatedAt: at } },
     history: [...ledger.history, { version, at, via: 'user', changes: [{ key, from: now.user ?? null,
-      to: entry.user ?? null, source: 'user', ...(reason === undefined ? {} : { reason }) }] }].slice(-HISTORY) });
+      to: entry.user ?? null, source: 'user', ...(reason === undefined ? {} : { reason }) }] }] });
 }
 
 /** Compact rows for Jev and the UI: weight, its source and evidence count, never a fabricated rate. */

@@ -31,7 +31,8 @@ import {
 import { AUTOCTX_FORK, createClosedStepForkProvider, createSeedRequestAudit, childSeedFacts, requestConfig, sameRequestConfig } from "./seed.js";
 import { createOwnershipTracker, ownershipContract, appendOwnershipResult } from "./ownership.js";
 import { newStats, applyStatsRecord } from "./stats.js";
-import { registerUiRoutes, createRecordTap } from "./uiapi.js";
+import { registerUiRoutes, createRecordTap, createSessionResolver } from "./uiapi.js";
+import { createLedgerStore, createUiStore } from "./uistore.js";
 import { openPriors, priorTextOf } from "./priors.js";
 import { createPlanDispatcher } from "./plandispatch.js";
 import { planParameters, dispatcherLabel } from "./plan.js";
@@ -60,19 +61,12 @@ import {
   routePolicy,
 } from "./models.js";
 import {
-  emptyLedger,
   weightKey,
   parseKey,
   effective,
   experienceRows,
   propose,
-  approve,
-  reject,
-  setMode,
-  revert,
-  setUser,
   withdraw,
-  MODES,
 } from "./ledger.js";
 
 export const name = "dsh-autoctx";
@@ -85,6 +79,8 @@ export const inject = [
   "agents",
   "storageDomain",
 ];
+// Optional UI-only dependency: bind through a child injection so absence never blocks the plugin.
+export const uiInject = ["sessionQuery"];
 
 // 0.2.0 owns one-shot runs directly; 0.2.1 owns all runs as activations.
 // Keep composition on the child's scope, including a cold-resumed worker.
@@ -615,6 +611,14 @@ export function apply(ctx, options) {
   };
   // UI tap (bounded, whitelisted metadata) first, independent of record-file logging.
   const tap = createRecordTap(1000);
+  const uiStore = createUiStore(ctx);
+  let sessionQuery;
+  ctx.inject(uiInject, (c) => {
+    const service = c.sessionQuery;
+    sessionQuery = service;
+    c.effect(() => () => { if (sessionQuery === service) sessionQuery = undefined; }, "dsh-autoctx: optional session query");
+  });
+  const resolveSession = createSessionResolver(ctx.agents, () => sessionQuery);
   // Deployment-wide capability-prior overrides; apply stays synchronous. Overrides apply once the store is open
   // (knowledge is first built when a root task starts); before that the catalog prior is used and recorded.
   let priorsStore;
@@ -628,7 +632,8 @@ export function apply(ctx, options) {
     return catalogKnowledge(list.map((entry) => ({ ...entry, prior: priorOverride(entry.id) ?? entry.prior })));
   };
   const record = (value) => {
-    tap.push({ at: Date.now(), ...value });
+    const projection = tap.push({ at: Date.now(), ...value });
+    if (projection) uiStore.append(projection);
     if (config.recordFile)
       fs.appendFileSync(
         config.recordFile,
@@ -652,6 +657,7 @@ export function apply(ctx, options) {
       pressureTokens: config.pressureTokens,
       updatedAt: Date.now(),
     });
+    uiStore.saveStats(id, statsMap.get(id));
     if (statsMap.size > 200) statsMap.delete(statsMap.keys().next().value);
   };
   const applyStats = (value) => {
@@ -690,82 +696,6 @@ export function apply(ctx, options) {
     const id = statsRoot(session);
     updateStats(id, value);
   };
-  ctx.inject(["connection"], (c) => {
-    c.effect(
-      () =>
-        c.connection.fetch.register({
-          path: "/api/dsh-autoctx/stats",
-          methods: ["GET"],
-          requestBody: "buffered",
-          fetch: (request) => {
-            const entry = statsMap.get(
-              statsRoot(new URL(request.url).searchParams.get("session") ?? ""),
-            );
-            const { pendingSaved, ...stats } = entry ?? {};
-            return new Response(
-              JSON.stringify({ stats: entry ? stats : null, apiKeyConfigured: !!config.apiKey }),
-              { headers: { "content-type": "application/json", "cache-control": "no-store" } },
-            );
-          },
-        }),
-      "dsh-autoctx: stats route",
-    );
-    c.effect(
-      () =>
-        c.connection.fetch.register({
-          path: "/api/dsh-autoctx/ledger",
-          methods: ["GET", "POST"],
-          requestBody: "buffered",
-          fetch: (request) => ledgerRoute(request),
-        }),
-      "dsh-autoctx: ledger route",
-    );
-  });
-  const json = (value, status = 200) =>
-    new Response(JSON.stringify(value), {
-      status,
-      headers: { "content-type": "application/json", "cache-control": "no-store" },
-    });
-  // Ledger view for the UI: effective weights with their source and evidence count, the pending card,
-  // and the last changes. Values are never invented: an unused key is simply absent.
-  const ledgerView = (ledger) => ({
-    mode: ledger.mode,
-    version: ledger.version,
-    weights: Object.entries(ledger.weights).map(([key, entry]) => ({
-      key,
-      ...effective(ledger, key),
-      ...(entry.learned === undefined ? {} : { learned: entry.learned }),
-      ...(entry.user === undefined ? {} : { user: entry.user }),
-      updatedAt: entry.updatedAt,
-    })),
-    pending: ledger.pending,
-    history: ledger.history,
-  });
-  async function ledgerRoute(request) {
-    const url = new URL(request.url);
-    const body = request.method === "POST" ? await request.json().catch(() => ({})) : {};
-    const session = body.session ?? url.searchParams.get("session");
-    const cwd =
-      body.cwd ?? url.searchParams.get("cwd") ??
-      (session ? ctx.agents.get(statsRoot(session))?.session.header.cwd : undefined) ?? "";
-    if (request.method === "GET") return json({ cwd, ledger: ledgerView(await readLedger(cwd)) });
-    const now = Date.now();
-    const actions = {
-      approve: (ledger) => approve(ledger, body.version, now),
-      reject: (ledger) => reject(ledger, body.version, now),
-      revert: (ledger) => revert(ledger, body.version, now),
-      mode: (ledger) => ({ ledger: setMode(ledger, body.mode) }),
-      user: (ledger) => ({ ledger: setUser(ledger, body.key, body.value ?? null, now, body.reason) }),
-    };
-    if (!actions[body.action] || (body.action === "mode" && !MODES.includes(body.mode)))
-      return json({ error: "unknown action" }, 400);
-    if (body.action === "user" && (typeof body.key !== "string" || !body.key.trim() || (body.value != null && (typeof body.value !== "number" || !Number.isFinite(body.value) || body.value < 0 || body.value > 1)) || (body.reason !== undefined && typeof body.reason !== "string")))
-      return json({ error: "user weight needs a key and a value in [0, 1] or null" }, 400);
-    const result = await updateLedger(cwd, actions[body.action]);
-    record({ kind: "ledger_action", cwd, action: body.action, version: body.version, error: result.error });
-    return json({ cwd, ledger: ledgerView(result.ledger), ...(result.error ? { error: result.error } : {}) },
-      result.error === "stale" ? 409 : result.error ? 404 : 200);
-  }
   ctx.on("dispose", () => {
     statsMap.clear();
     memos.clear();
@@ -788,6 +718,7 @@ export function apply(ctx, options) {
           assignments: domainTable(schema.json()),
           graphs: domainTable(schema.json()),
           ledger: domainTable(schema.json()),
+          ledger_history: domainTable(schema.json()),
           uses: domainTable(schema.json()),
         },
       }),
@@ -823,9 +754,8 @@ export function apply(ctx, options) {
       ...(child.mode === "continuable" && HELPER_LABELS.has(child.label) ? { mode: "one-shot" } : {}),
     }));
 
-  // Workspace ledger: one record per workspace; every change is one serialized storage update.
+  // Workspace ledger state and history outbox commit together; per-entry history drains idempotently.
   const workspaceOf = (agent) => agent?.session.header.cwd ?? "";
-  const ledgerInits = new Map();
   // Per-record storage keys must be path-safe, so a workspace path is stored by its hash.
   const ledgerKey = (cwd) => "ws_" + createHash("sha256").update(cwd).digest("hex").slice(0, 32);
   let routeStorePromise;
@@ -928,25 +858,13 @@ export function apply(ctx, options) {
   };
   if (config.mode === "plan") installPlanTool();
   const useKey = (session, turn) => session.replace(/[^a-zA-Z0-9_-]/g, "_") + "_" + String(turn).replace(/[^a-zA-Z0-9_-]/g, "_");
-  const readLedger = async (cwd) =>
-    (await storage()).table("ledger").get(ledgerKey(cwd)) ?? emptyLedger(config.learning);
-  async function updateLedger(cwd, fn) {
-    const table = (await storage()).table("ledger"),
-      key = ledgerKey(cwd);
-    if (table.get(key) === undefined) {
-      if (!ledgerInits.has(key))
-        ledgerInits.set(key, table.put(key, emptyLedger(config.learning)).finally(() => ledgerInits.delete(key)));
-      await ledgerInits.get(key);
-    }
-    let result;
-    await table.update(key, (current) => {
-      result = fn(current);
-      return result.ledger;
-    });
-    return result;
-  }
-  registerUiRoutes(ctx, { config, readLedger, updateLedger, statsRoot,
-    cwdOf: (id) => ctx.agents.get(id)?.session.header.cwd, catalog: CATALOG.models, tap,
+  const ledgerStore = createLedgerStore(storage, ledgerKey, config.learning);
+  const readLedger = (cwd) => ledgerStore.read(cwd);
+  const updateLedger = (cwd, fn) => ledgerStore.update(cwd, fn);
+  registerUiRoutes(ctx, { config, readLedger, updateLedger, resolveSession,
+    readHistory: (cwd) => ledgerStore.history(cwd),
+    readStats: (id) => statsMap.get(id) ?? uiStore.stats(id),
+    uiStore, record, catalog: CATALOG.models, tap,
     priors: { snapshot: () => priorsStore?.snapshot() ?? { overrides: {}, history: [] },
       set: async (...args) => {
         const store = await priorsReady;
