@@ -2,7 +2,7 @@
 
 Context and subagent decision plugin for dsh, version **1.2.3**. Jev scores options and makes structured choices; the plugin implements them through native dsh sessions, tools, subagents and compaction. The executor model still does all the coding.
 
-[中文](README.md) · [Source](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
+[中文](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/README.md) · [Source](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
 
 ## Environment and accounts
 
@@ -139,7 +139,7 @@ Limits are identical for every arm: **600 seconds per task, 64 model requests pe
 | H | Native heterogeneous subagents; one native subagent tool per (model, effort) over the executor plus 3 extra models, chosen by the executor |
 | AutoCTX frozen / auto | 1.2.3; reviewer `auto`, advisor `auto`, the same 3 extra models, `jev-1.13`; frozen and auto learning respectively; auto carries the ledger across cases within a run |
 
-The 3 extra models are `glm-5.3-flash` (use `deepseek-v4.1-flash` when the executor is glm), `deepseek-v4-pro` and `claude-haiku-5-5`. B/C/H do not load the plugin; these baselines were run earlier with the same harness entry, tasks and limits.
+The 3 extra models are `glm-5.3-flash` (use `deepseek-v4.1-flash` when the executor is glm), `deepseek-v4-pro` and `claude-haiku-5-5`. B/C/H do not load the plugin and were run before 1.2.3. B/C used the same harness entry as 1.2.3; H run 1 used an earlier harness snapshot (its `run.py` differs) with the same tasks and the limits above.
 
 | Metric (72 cases per arm) | AutoCTX frozen | AutoCTX auto | B | C | H |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -163,7 +163,7 @@ Only these 12 pytest tasks and 3 flash executors were measured; between repeats,
 
 ## Reproduce
 
-From the repository, prepare the prerequisites in [bench/README.md](bench/README.md), including Docker and SWE-bench images, a model gateway and `JEV_API_KEY`, then run:
+From the repository, prepare the prerequisites in [bench/README.md](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/bench/README.md), including Docker and SWE-bench images, a model gateway and `JEV_API_KEY`, then run:
 
 ```sh
 python3 bench/run.py --model deepseek-v4.1-flash --arms A --tasks bench/tasks.json --out <dir> --plugin . --parallel 3 \

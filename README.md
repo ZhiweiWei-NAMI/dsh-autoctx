@@ -2,7 +2,7 @@
 
 面向 dsh 的上下文与子代理决策插件，版本 **1.2.3**。Jev 负责评分和结构化选择，插件通过 dsh 原生会话、工具、子代理和压缩执行决策；编码仍由执行模型完成。
 
-[English](README.en.md) · [源码](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
+[English](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/README.en.md) · [源码](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
 
 ## 环境与所需账号
 
@@ -139,7 +139,7 @@ Jev 调用、reviewer/advisor 子代理及其执行模型调用、回合结束�
 | H | 原生异构子代理；在执行模型及额外 3 个模型的每个（模型，effort）组合上提供一个原生子代理工具，由执行模型选择 |
 | AutoCTX frozen / auto | 1.2.3；reviewer `auto`、advisor `auto`、相同的额外 3 个模型、`jev-1.13`；分别使用 frozen 和 auto 学习；auto 在同一次运行的案例间沿用账本 |
 
-额外 3 个模型为 `glm-5.3-flash`（执行模型为它时改用 `deepseek-v4.1-flash`）、`deepseek-v4-pro`、`claude-haiku-5-5`。B/C/H 不加载插件；这些基线较早运行，使用相同 harness 入口、任务与限制。
+额外 3 个模型为 `glm-5.3-flash`（执行模型为它时改用 `deepseek-v4.1-flash`）、`deepseek-v4-pro`、`claude-haiku-5-5`。B/C/H 不加载插件，均早于 1.2.3 运行。B/C 与 1.2.3 使用同一 harness 入口；H 第 1 轮使用更早的 harness 快照（`run.py` 有差异），任务和上述限制相同。
 
 | 指标（每组 72 个案例） | AutoCTX frozen | AutoCTX auto | B | C | H |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -163,7 +163,7 @@ Auto 运行中，49 个已完成回合进入学习：35/49 个被判无法评估
 
 ## 复现
 
-在仓库目录中准备 [bench/README.md](bench/README.md) 所列前置条件，包括 Docker 与 SWE-bench 镜像、模型网关和 `JEV_API_KEY`，然后运行：
+在仓库目录中准备 [bench/README.md](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/bench/README.md) 所列前置条件，包括 Docker 与 SWE-bench 镜像、模型网关和 `JEV_API_KEY`，然后运行：
 
 ```sh
 python3 bench/run.py --model deepseek-v4.1-flash --arms A --tasks bench/tasks.json --out <dir> --plugin . --parallel 3 \

@@ -9,8 +9,9 @@ compaction, and no reviewer/advisor/extra models. H uses native heterogeneous
 subagents: one native subagent tool per (model, effort) over the executor plus
 3 extra models, selected by the executor. A and H use the same 3 extra models:
 `glm-5.3-flash` (or `deepseek-v4.1-flash` for a glm executor), `deepseek-v4-pro`,
-and `claude-haiku-5-5`. B/C/H never load the plugin under test; these baselines
-were run earlier with the same harness entry, tasks and limits.
+and `claude-haiku-5-5`. B/C/H never load the plugin under test and were run before 1.2.3. B/C used
+the same harness entry as 1.2.3; H run 1 used an earlier harness snapshot (its
+`run.py` differs) with the same tasks and limits.
 
 ## Prerequisites
 
