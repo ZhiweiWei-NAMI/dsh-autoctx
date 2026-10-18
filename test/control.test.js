@@ -560,6 +560,7 @@ function autoComposition(options = {}) {
         children.push(child);
         agents.set(child.id, { session: { id: child.id, header: { parentSession: "root" } } });
         handlers.get("subagent/start")({ id: child.id, runId: child.id + "-run" });
+        return { childId: child.id, messageId: child.id + "-message" };
       },
     },
   };

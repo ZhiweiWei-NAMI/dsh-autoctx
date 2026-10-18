@@ -73,6 +73,67 @@ export const inject = [
   "agents",
   "storageDomain",
 ];
+
+// 0.2.0 owns one-shot runs directly; 0.2.1 owns all runs as activations.
+// Keep composition on the child's scope, including a cold-resumed worker.
+export function createChildStarter(ctx, restoreComposition) {
+  const pending = new Map();
+  ctx.on("agent/created", async ({ agent }) => {
+    const id = agent.session.id;
+    if (agent.session.header.parentSession === undefined) return;
+    if (!pending.has(id) && typeof ctx.subagents.startContinuable === "function") return;
+    const composition = pending.get(id) ?? await restoreComposition?.(agent);
+    if (!composition) return;
+    // Historical descriptors already restore these fields in the host.
+    const descriptor = agent.session.snapshotEvents().find((event) => event.type === "subagent/descriptor")?.data;
+    if (composition.persona !== undefined && descriptor?.persona === undefined) agent.ctx.systemPrompt.section({
+      name: "deployment:persona-prefix",
+      order: agent.ctx.systemPrompt.getSectionOrder("DEPLOYMENT_PERSONA_PREFIX"),
+      text: composition.persona,
+    });
+    if (composition.toolFilter !== undefined && descriptor?.toolFilter === undefined)
+      agent.ctx.tools.restrict(composition.toolFilter);
+  });
+  return async (provider, request, { childId, continuable = false } = {}) => {
+    const runtime = ctx.subagents;
+    if (!continuable && typeof runtime.start === "function") return runtime.start(provider, request);
+    const { label, signal, ...options } = request;
+    if (continuable && typeof runtime.startContinuable === "function")
+      return runtime.startContinuable({ childId, provider, label, request: options, signal });
+    const { persona, toolFilter, ...activationRequest } = options;
+    const id = childId ?? randomUUID();
+    pending.set(id, { persona, toolFilter });
+    let activation;
+    try {
+      activation = await runtime.startActivation({
+        childId: id, provider, label, request: activationRequest, signal,
+        delivery: continuable ? "parent" : "caller",
+      });
+    } finally {
+      pending.delete(id);
+    }
+    if (continuable) return activation;
+    // Activation signals stop owning cancellation after acceptance. The old
+    // one-shot contract keeps the caller's signal connected until collection.
+    let abortDisposal;
+    const abort = () => {
+      abortDisposal ??= activation.dispose();
+      // Disposal errors remain observable through the returned dispose().
+      abortDisposal.catch(() => {});
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    return {
+      id: activation.childId,
+      result: activation.result.finally(() => signal.removeEventListener("abort", abort)),
+      dispose: async () => {
+        signal.removeEventListener("abort", abort);
+        await (abortDisposal ?? activation.dispose());
+      },
+    };
+  };
+}
+
 export const Config = z.object({
   mode: z
     .union(["auto", "single", "native"])
@@ -659,6 +720,21 @@ export function apply(ctx, options) {
   ctx.on("dispose", async () => {
     if (storePromise) await (await storePromise).close();
   });
+  const startChild = createChildStarter(ctx, async (agent) => {
+    if (config.mode !== "auto") return;
+    const assignment = assignments.get(agent.session.id) ??
+      (await storage()).table("assignments").get(agent.session.id);
+    return assignment?.composition;
+  });
+  const listChildren = async (id, signal) =>
+    (await ctx.subagents.listChildren(id, signal)).map((child) => ({
+      ...child,
+      // Direct catalogs have no recursive-list discriminator on either host.
+      ...(child.kind === undefined ? { kind: "child" } : {}),
+      // Caller-delivered helpers remain one-shot to the routing layer even
+      // though 0.2.1 catalogs every native activation as continuable.
+      ...(child.mode === "continuable" && HELPER_LABELS.has(child.label) ? { mode: "one-shot" } : {}),
+    }));
 
   // Workspace ledger: one record per workspace; every change is one serialized storage update.
   const workspaceOf = (agent) => agent?.session.header.cwd ?? "";
@@ -1405,7 +1481,7 @@ export function apply(ctx, options) {
       record({ kind: "brief", session: id, role: "reviewer", chars: prompt.length, diffChars: change.diff.length,
         files: change.files.length, ...(change.error ? { error: change.error } : {}) });
       reviewPending.add(id);
-      run = await ctx.subagents.start(provider, {
+      run = await startChild(provider, {
         label: "Independent review",
         parent: agent,
         prompt: [{ type: "text", text: prompt }],
@@ -1494,7 +1570,7 @@ export function apply(ctx, options) {
     const parent = exec.agent,
       state = roots.get(parent.session.id),
       resources = budget(parent.session.id);
-    const listing = await ctx.subagents.listChildren(parent.session.id, exec.signal);
+    const listing = await listChildren(parent.session.id, exec.signal);
     const persistedAssignments = (await storage()).table("assignments");
     const knownChildren = listing
       .filter((x) => x.kind === "child")
@@ -1644,6 +1720,14 @@ export function apply(ctx, options) {
           proposal: args.prompt,
           profile: selected.profile,
           callId: exec.callId,
+          composition: {
+            persona:
+              "You are a delegated child, not the parent. Perform only your assigned investigation. The quoted root request is background; do not carry out its instructions for other agents. Do not delegate. " +
+              selected.profile.label +
+              ": " +
+              selected.profile.capability,
+            toolFilter: { deny: ["subagent", "subagent_fork"] },
+          },
         });
         await persistedAssignments.put(id, assignments.get(id));
         const chosen =
@@ -1651,31 +1735,26 @@ export function apply(ctx, options) {
             ? "fork"
             : provider;
         childLabels.set(id, args.description);
-        await ctx.subagents.startContinuable({
-          childId: id,
-          provider: chosen,
+        const activation = await startChild(chosen, {
           label: args.description,
-          request: {
-            parent,
-            prompt: [
-              {
-                type: "text",
-                text:
-                  task +
-                  "\n\nInvestigate only the assigned responsibility. Return concrete findings and evidence within the child budget. Leave code edits and test fixes to the parent.",
-              },
-            ],
-            agentOptions: selected.profile.options,
-            persona:
-              "You are a delegated child, not the parent. Perform only your assigned investigation. The quoted root request is background; do not carry out its instructions for other agents. Do not delegate. " +
-              selected.profile.label +
-              ": " +
-              selected.profile.capability,
-            toolFilter: { deny: ["subagent", "subagent_fork"] },
-            maxDepth: 1,
-          },
+          parent,
+          prompt: [
+            {
+              type: "text",
+              text:
+                task +
+                "\n\nInvestigate only the assigned responsibility. Return concrete findings and evidence within the child budget. Leave code edits and test fixes to the parent.",
+            },
+          ],
+          agentOptions: selected.profile.options,
+          ...assignments.get(id).composition,
+          maxDepth: 1,
           signal: exec.signal,
-        });
+        }, { childId: id, continuable: true });
+        // The old receipt has no result; the new activation can reject on an
+        // infrastructure failure even though worker collection uses events.
+        activation.result?.catch((error) =>
+          record({ kind: "child_activation_failed", parent: parent.session.id, id, error: String(error) }));
         started = true;
       }
     } finally {
@@ -1760,7 +1839,10 @@ export function apply(ctx, options) {
                     text: `Started subagent ${value.subagentId} in the background; its result arrives as a message.`,
                   },
                 ];
-          return { isError: false, value, content };
+          // 0.2.1 validates wrapper-authored values against an activation-only
+          // tool output schema. Keep the internal routing/collection contract.
+          const activationOutput = ctx.tools.get(exec.name, agent).output?.schema?.properties?.kind?.const === "activation";
+          return { isError: false, value: activationOutput ? { kind: "activation", subagentId: value.subagentId } : value, content };
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           return { isError: true, error: { message }, content: [{ type: "text", text: message }] };
@@ -1905,7 +1987,7 @@ export function apply(ctx, options) {
       record({ kind: "brief", session: id, role: "advisor", chars: prompt.length, diffChars: change.diff.length,
         files: change.files.length, failureChars: raw?.length ?? 0, ...(change.error ? { error: change.error } : {}) });
       advisorPending.add(id);
-      run = await ctx.subagents.start("spawn", {
+      run = await startChild("spawn", {
         label: "Advisor",
         parent: agent,
         prompt: [{ type: "text", text: prompt }],
@@ -2074,7 +2156,7 @@ export function apply(ctx, options) {
       (!roots.has(id) || roots.get(id).configuredMode !== (config.apiKey ? config.mode : "native"))
     ) {
       if (config.mode !== "single") {
-        const children = await ctx.subagents.listChildren(id, signal),
+        const children = await listChildren(id, signal),
           resources = budget(id);
         for (const child of children)
           if (child.kind === "child") {
@@ -2619,7 +2701,7 @@ export function apply(ctx, options) {
     };
     let selection;
     try {
-      const children = await ctx.subagents.listChildren(rootOf(agent), signal);
+      const children = await listChildren(rootOf(agent), signal);
       const owners = Object.fromEntries(
         children
           .filter((x) => x.kind === "child" && x.id !== id)

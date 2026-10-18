@@ -1,11 +1,89 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { apply } from "../index.js";
+import { apply, createChildStarter } from "../index.js";
 import { createGraph, observe, editsAfter } from "../graph.js";
 import { newStats, applyStatsRecord } from "../stats.js";
 // Review and advisor briefs await the workspace diff before the child starts.
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("child starter keeps the 0.2.0 start and continuable contracts", async () => {
+  const calls = [], run = { id: "review", result: Promise.resolve({ stopReason: "completed", output: [] }), dispose: async () => {} };
+  const receipt = { childId: "worker", messageId: "message" };
+  const runtime = {
+    start(provider, request) { assert.equal(this, runtime); calls.push([provider, request]); return run; },
+    startContinuable(spec) { assert.equal(this, runtime); calls.push(spec); return receipt; },
+    startActivation() { throw new Error("legacy APIs must win when present"); },
+  };
+  const start = createChildStarter({ subagents: runtime, on() {} });
+  const request = {
+    label: "Inspect", parent: {}, prompt: [{ type: "text", text: "Inspect the change" }],
+    agentOptions: { provider: "native", model: "main" }, toolFilter: { allow: [] },
+    persona: "Investigator", maxDepth: 1, signal: new AbortController().signal,
+  };
+  assert.equal(await start("fork", request), run);
+  assert.equal(await start("spawn", request, { childId: "worker", continuable: true }), receipt);
+  assert.deepEqual(calls[0], ["fork", request]);
+  const { label, signal, ...options } = request;
+  assert.deepEqual(calls[1], { childId: "worker", provider: "spawn", label, request: options, signal });
+});
+
+test("child starter adapts 0.2.1 activation delivery, composition, resume and cancellation", async () => {
+  const handlers = new Map(), specs = [], applied = [], restored = new Map();
+  let resolveResult, disposed = 0;
+  const outcome = { stopReason: "aborted", output: [{ type: "text", text: "partial" }], diagnostic: "cancelled" };
+  const makeAgent = (id, descriptor = {}) => ({
+    session: { id, header: { parentSession: "root" }, snapshotEvents: () => [{ type: "subagent/descriptor", data: descriptor }] },
+    ctx: {
+      tools: { restrict: (filter) => applied.push(filter) },
+      systemPrompt: { getSectionOrder: () => 7, section: (section) => applied.push(section) },
+    },
+  });
+  const runtime = {
+    async startActivation(spec) {
+      specs.push(spec);
+      await handlers.get("agent/created")({ agent: makeAgent(spec.childId) });
+      return {
+        childId: spec.childId, messageId: "accepted",
+        result: new Promise((resolve) => { resolveResult = resolve; }),
+        dispose: async () => { disposed++; resolveResult(outcome); },
+      };
+    },
+  };
+  const start = createChildStarter({ subagents: runtime, on: (name, fn) => handlers.set(name, fn) },
+    (agent) => restored.get(agent.session.id));
+  const controller = new AbortController();
+  const request = {
+    label: "Inspect", parent: {}, prompt: [{ type: "text", text: "Inspect the change" }],
+    agentOptions: { provider: "native", model: "main" }, toolFilter: { allow: [] },
+    persona: "Investigator", maxDepth: 1, signal: controller.signal,
+  };
+  const run = await start("spawn", request);
+  const { label, signal, persona, toolFilter, ...options } = request;
+  assert.deepEqual(specs[0], { childId: run.id, provider: "spawn", label, request: options, signal, delivery: "caller" });
+  assert.deepEqual(applied, [{ name: "deployment:persona-prefix", order: 7, text: persona }, toolFilter]);
+  controller.abort();
+  assert.equal(await run.result, outcome);
+  await run.dispose();
+  assert.equal(disposed, 1);
+
+  const workerController = new AbortController();
+  const workerRequest = { ...request, signal: workerController.signal };
+  const worker = await start("fork", workerRequest, { childId: "worker", continuable: true });
+  assert.equal(worker.childId, "worker");
+  assert.equal(worker.messageId, "accepted");
+  assert.equal(specs[1].delivery, "parent");
+  workerController.abort();
+  assert.equal(disposed, 1); // acceptance ends the worker startup signal's ownership
+  restored.set("worker", { persona, toolFilter });
+  applied.length = 0;
+  await handlers.get("agent/created")({ agent: makeAgent("worker") });
+  assert.deepEqual(applied, [{ name: "deployment:persona-prefix", order: 7, text: persona }, toolFilter]);
+  applied.length = 0;
+  await handlers.get("agent/created")({ agent: makeAgent("worker", { persona, toolFilter }) });
+  assert.deepEqual(applied, []); // historical host overrides are already installed
+  await worker.dispose();
+});
 
 function childSession(id) {
   return {

@@ -40,12 +40,12 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-compaction-basic": "^0.1.5-rc.1 || ^0.2.0-rc.1",
-    "@deepseek-ai/dsh-llm": "^0.1.5-rc.1 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-compaction-basic": "^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1",
     "@deepseek-ai/schemastery": "^3.18.2",
-    "@deepseek-ai/dsh-compaction": "^0.1.5-rc.1 || ^0.2.0-rc.1",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1 || ^0.2.0-rc.1",
-    "@deepseek-ai/dsh-storage-domain": "^0.1.5-rc.1 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-compaction": "^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1",
+    "@deepseek-ai/dsh-storage-domain": "^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1",
     "zod": "^4.0.0"
   },
   "repository": {

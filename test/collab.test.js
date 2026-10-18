@@ -77,11 +77,26 @@ function collab(options = {}) {
     steer: (message) => steered.push(message),
   };
   agents.set("root", root);
-  async function startChild(provider, request) {
+  async function registerChild(child, parent = "root") {
+    const agent = {
+      session: childSession(child.id, parent), steer() {},
+      ctx: {
+        tools: { restrict: (filter) => { child.toolFilter = filter; } },
+        systemPrompt: {
+          getSectionOrder: () => 0,
+          section: ({ text }) => { child.persona = text; },
+        },
+      },
+    };
+    agents.set(child.id, agent);
+    await handlers.get("agent/created")({ agent });
+    handlers.get("subagent/start")({ id: child.id, runId: child.id + "-run" });
+  }
+  async function startChild(provider, request, childId) {
     if (startError) throw startError;
     started++;
     const child = {
-      id: "child-" + started,
+      id: childId ?? "child-" + started,
       kind: "child",
       mode: "one-shot",
       provider,
@@ -92,8 +107,7 @@ function collab(options = {}) {
       maxDepth: request.maxDepth,
     };
     children.push(child);
-    agents.set(child.id, { session: childSession(child.id), steer() {} });
-    handlers.get("subagent/start")({ id: child.id, runId: child.id + "-run" });
+    await registerChild(child);
     const result = new Promise((resolve) => {
       const finish = async (reason = "completed", output) => {
         const blocks =
@@ -115,7 +129,12 @@ function collab(options = {}) {
   const ctx = {
     tools: {
       guard: (fn) => handlers.set("tools/guard", fn),
-      get: () => ({ parameters: { type: "object" } }),
+      get: () => ({
+        parameters: { type: "object" },
+        ...(options.activationAPI ? { output: { schema: {
+          type: "object", properties: { kind: { const: "activation" } },
+        } } } : {}),
+      }),
     },
     on(name, fn) {
       handlers.set(name, fn);
@@ -149,20 +168,37 @@ function collab(options = {}) {
       }),
     },
     subagents: {
-      listChildren: async () => children,
+      listChildren: async () => children.map(({ kind, ...entry }) => entry),
       getProvider: () => ({}),
       start: startChild,
       startContinuable: async ({ childId, provider, label, request }) => {
         started++;
-        children.push({
+        const child = {
           id: childId, kind: "child", mode: "continuable", provider, label,
           prompt: request.prompt[0].text,
-        });
-        agents.set(childId, { session: childSession(childId, request.parent.session.id), steer() {} });
-        handlers.get("subagent/start")({ id: childId, runId: childId + "-run" });
+        };
+        children.push(child);
+        await registerChild(child, request.parent.session.id);
+        return { childId, messageId: childId + "-message" };
       },
     },
   };
+  if (options.activationAPI) {
+    const { startContinuable } = ctx.subagents;
+    delete ctx.subagents.start;
+    delete ctx.subagents.startContinuable;
+    ctx.subagents.startActivation = async ({ childId, provider, label, request, signal, delivery }) => {
+      assert.equal(request.toolFilter, undefined);
+      assert.equal(request.persona, undefined);
+      if (delivery === "parent") {
+        const receipt = await startContinuable({ childId, provider, label, request });
+        return { ...receipt, result: new Promise(() => {}), dispose: async () => {} };
+      }
+      assert.equal(delivery, "caller");
+      const run = await startChild(provider, { ...request, label, signal }, childId);
+      return { childId: run.id, result: run.result, dispose: run.dispose };
+    };
+  }
   apply(ctx, config);
   return {
     config,
@@ -369,7 +405,7 @@ test("repeated failure uses own event order and resets the stall baseline", asyn
 
 test("the advisor fires once on a stall and passes the chosen model", async (t) => {
   const records = recordAll(t);
-  const app = collab({ advisorModel: "deepseek-v4.1-flash", advisorStallSteps: 3 });
+  const app = collab({ activationAPI: true, advisorModel: "deepseek-v4.1-flash", advisorStallSteps: 3 });
   await app.preStep(app.root, [userMessage("Fix the widget.")]);
   let consulted = "";
   for (let i = 0; i < 6; i++) {
@@ -497,10 +533,10 @@ test("helpers from a resumed listing do not consume delegation slots", async (t)
         }),
     };
   });
-  const app = collab({ maxChildren: 2 });
+  const app = collab({ activationAPI: true, maxChildren: 2 });
   app.children.push(
-    { id: "old-advisor", kind: "child", mode: "one-shot", label: "Advisor" },
-    { id: "old-review", kind: "child", mode: "one-shot", label: "Independent review" },
+    { id: "old-advisor", kind: "child", mode: "continuable", label: "Advisor" },
+    { id: "old-review", kind: "child", mode: "continuable", label: "Independent review" },
   );
   await app.preStep(app.root, [userMessage("Fix the widget.")]);
   const exec = {
@@ -518,12 +554,15 @@ test("helpers from a resumed listing do not consume delegation slots", async (t)
     },
   );
   assert.equal(result.isError, false);
-  assert.equal(result.value.kind, "continuable");
+  assert.equal(result.value.kind, "activation");
   assert.equal(app.started, 1);
   const child = app.children.find((child) => child.id === result.value.subagentId);
   assert.equal(child.mode, "continuable");
   assert.equal(child.label, "Inspect A");
   assert.match(child.prompt, /Your assigned subtask:\nInspect A/);
+  assert.match(child.persona, /You are a delegated child, not the parent/);
+  assert.deepEqual(child.toolFilter, { deny: ["subagent", "subagent_fork"] });
+  assert.equal(app.tables.get("assignments").get(child.id).composition.persona, child.persona);
   assert.ok(records.some((record) => record.kind === "child_start" && record.id === child.id));
   assert.equal(states.length, 1);
   assert.equal(states[0].observation.childrenRemaining, 2);
@@ -563,7 +602,7 @@ test("maxConcurrent still counts a running helper", async (t) => {
 
 test("a configured cross-model reviewer uses spawn, agentOptions and the ledger", async (t) => {
   recordAll(t);
-  const app = collab({ reviewBeforeFinish: true, reviewerModel: "glm-5.3-flash" });
+  const app = collab({ activationAPI: true, reviewBeforeFinish: true, reviewerModel: "glm-5.3-flash" });
   await app.preStep(app.root, [userMessage("Fix the widget.")]);
   app.read(app.root, "src/a.js");
   app.edit(app.root, "src/a.js");
