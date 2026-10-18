@@ -39,7 +39,28 @@ function boundedDiff(diff, maxChars) {
   return { diff: kept + (maxChars >= marker.length ? marker : ''), truncated: true };
 }
 
-export async function workspaceDiff(cwd, { maxChars = 12000, timeoutMs = 5000 } = {}) {
+// Rank complete hunks against the failure before truncating; later files can be the relevant ones.
+function effortDiff(diff, focus, maxChars = 1500) {
+  const files = diff.split(/(?=^diff --git )/m).filter(Boolean), candidates = [];
+  let added = 0, removed = 0;
+  const terms = focus.filter(term => typeof term === 'string' && term.length > 2).slice(0, 40);
+  for (const file of files) {
+    for (const line of file.split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++')) added++;
+      if (line.startsWith('-') && !line.startsWith('---')) removed++;
+    }
+    const parts = file.split(/(?=^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@)/m);
+    for (const hunk of parts.length > 1 ? parts.slice(1) : ['']) {
+      const value = parts[0] + hunk;
+      candidates.push({ value, score: terms.reduce((sum, term) => sum + Number(value.includes(term)), 0) });
+    }
+  }
+  const stat = `${files.length} files changed, ${added} insertions(+), ${removed} deletions(-)`;
+  const relevant = candidates.sort((a, b) => b.score - a.score)[0]?.value ?? '(no diff)';
+  return (stat + '\n' + relevant).slice(0, maxChars);
+}
+
+export async function workspaceDiff(cwd, { maxChars = 12000, timeoutMs = 5000, focus } = {}) {
   // Without a workspace, git would diff whatever directory the host process runs in.
   if (!cwd) return { diff: '', files: [], untracked: [], truncated: false, error: 'no workspace' };
   try {
@@ -89,7 +110,8 @@ export async function workspaceDiff(cwd, { maxChars = 12000, timeoutMs = 5000 } 
       }
     }
     const bounded = boundedDiff(combined, budget(maxChars, 12000));
-    return { ...bounded, files, untracked, truncated: bounded.truncated || omitted };
+    return { ...bounded, files, untracked, truncated: bounded.truncated || omitted,
+      ...(focus ? { evidence: effortDiff(combined, focus) } : {}) };
   } catch (error) {
     return { diff: '', files: [], untracked: [], truncated: false, error: errorText(error) };
   }

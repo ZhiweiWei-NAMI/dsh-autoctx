@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { apply, buildDefaultRoute, Config } from "../index.js";
 import BasicCompactionEngine from "@deepseek-ai/dsh-compaction-basic";
+import { newStats, applyStatsRecord } from "../stats.js";
 import {
   STATE_BYTES,
   PREVIEW_CHARS,
@@ -614,56 +615,242 @@ function jevReply(body) {
   return { ok: true, status: 200, text: async () => JSON.stringify({ model: "jev", answers }) };
 }
 
-test("decision-point effort asks Jev once for an expensive pulse and skips it; cheap pulses stay local", async (t) => {
-  const records = [], thinkingRequests = [];
+// Exercise the installed request/stream/tool listeners with host-shaped messages; no executor calls.
+async function effortHarness(t, options = {}, choices = ["skip"]) {
+  const records = [], requests = [];
   t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
   t.mock.method(globalThis, "fetch", async (url, { body }) => {
-    const request = JSON.parse(body);
-    const response = jevReply(body);
-    const result = JSON.parse(await response.text());
+    const request = JSON.parse(body), state = JSON.parse(request.state);
+    requests.push({ ...request, state });
+    const response = jevReply(body), result = JSON.parse(await response.text());
     if (request.questions.task_tag)
-      result.answers.task_tag = { type: "choice", choice: "implementation", confidence: 0.9 };
-    if (request.questions.thinking)
-      result.answers.thinking = { type: "choice", choice: "decision_points", confidence: 0.9 };
-    if (request.questions.think_now) {
-      assert.deepEqual(Object.keys(request.questions), ["think_now"]);
-      assert.ok(Buffer.byteLength(request.state) <= 3000);
-      thinkingRequests.push(JSON.parse(request.state));
-      result.answers.think_now = { type: "noul", noul: 0.2 };
+      result.answers.task_tag = { type: "choice", choice: "debugging", confidence: 0.9 };
+    if (request.questions.thinking) {
+      const choice = state.trigger === "effort_decision" ? choices.shift() : "decision_points";
+      result.answers.thinking = { type: "choice", choice, confidence: 0.9 };
     }
+    if (state.trigger === "effort_decision") result.state = request.state; // gateway echoes must not reach records
+    result.usage = { input_tokens: 200, output_tokens: 10 };
     return { ...response, text: async () => JSON.stringify(result) };
   });
-  const setup = async (content) => {
-    const app = autoComposition({ adaptiveEffort: "high", effortSwitchFreeTokens: 4096,
-      cacheTtlSeconds: 300, recordFile: "context-decisions.jsonl" });
-    app.agent.options.model = "deepseek-v4.1-flash";
-    const scoped = new Map();
-    app.agent.ctx = { on: (name, handler) => scoped.set(name, handler) };
-    // Populate the real stream listener's off-space history before the turn-start decision.
-    const stream = app.handlers.get("llm/stream")({ ...app.agent.options, sessionId: "root", tools: [],
-      messages: [{ role: "user", content: [{ type: "text", text: content }] }] }, async function* () {});
-    await stream.next();
-    await app.step();
-    return { app, request: () => scoped.get("agent/request")({ step: 1 }, async () => ({ ...app.agent.options })) };
+  const app = autoComposition({ adaptiveEffort: "high", effortSwitchFreeTokens: 4096,
+    maxEffortDecisions: 6, effortPhaseRequests: 4, cacheTtlSeconds: 300,
+    jevModel: "jev-1.13", pressureTokens: 1000000, economyGuidance: false,
+    recordFile: "context-decisions.jsonl", ...options });
+  app.agent.options.model = "deepseek-v4.1-flash";
+  const scoped = new Map(), signal = new AbortController().signal;
+  let step = 0, liveMessages = [{ role: "user", source: { kind: "user" },
+    content: [{ type: "text", text: options.prefix ?? "x".repeat(40000) }] }];
+  app.agent.ctx = { on: (name, handler) => scoped.set(name, handler) };
+  app.agent.session.surface.contentGeneration = 0;
+  app.agent.session.deriveMessages = () => liveMessages;
+  app.agent.session.requestHeader = () => ({ config: { ...app.agent.options }, tools: [] });
+  if (options.task)
+    app.agent.session.snapshotEvents().find(event => event.type === "user/message").data.message.content =
+      [{ type: "text", text: options.task }];
+  const stream = async (effort, usage) => {
+    const result = app.handlers.get("llm/stream")({ ...app.agent.options, reasoningEffort: effort,
+      sessionId: "root", tools: [], messages: liveMessages }, async function* () {
+        if (usage) yield { type: "usage", usage };
+      });
+    for await (const _chunk of result) { /* consume this fake provider stream */ }
   };
+  await stream();
+  await app.step();
+  const request = (extra = {}) => scoped.get("agent/request")({ step: ++step, signal, ...extra },
+    async () => ({ ...app.agent.options }));
+  const tool = (outcome, output, command = "pytest -q tests/test_fix.py") => app.handlers.get("tools/result")(
+    { agent: app.agent, name: "bash", arguments: { command } },
+    { isError: outcome !== "pass", content: [{ type: "text", text: output ??
+      (outcome === "pass" ? "1 passed in 0.01s" : "E AssertionError: cache result is stale\n1 failed in 0.01s") }] });
+  return { ...app, records, requests, request, stream, tool,
+    effortCalls: () => requests.filter(request => request.state.trigger === "effort_decision"),
+    setMessages: messages => { liveMessages = messages; } };
+}
 
-  const expensive = await setup("x".repeat(40000));
+test("a Jev skip leaves effort unchanged; cheap pulses stay local", async (t) => {
+  const expensive = await effortHarness(t);
   assert.equal((await expensive.request()).reasoningEffort, undefined);
   assert.equal((await expensive.request()).reasoningEffort, undefined);
-  assert.equal(thinkingRequests.length, 1);
-  assert.equal(thinkingRequests[0].reason, "turn_start");
-  assert.ok(thinkingRequests[0].estimate.uncachedTokens > 4096);
-  assert.equal(thinkingRequests[0].estimate.label, "estimate, cache hit not guaranteed");
-  assert.deepEqual(thinkingRequests[0].pulses, { count: 0, reasons: {} });
-  assert.ok(records.some((record) => record.kind === "effort_decision" && record.decision === "jev_no" && record.noul === 0.2));
-  assert.equal(records.some((record) => record.kind === "effort_raised"), false);
+  const calls = expensive.effortCalls();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(Object.keys(calls[0].questions), ["thinking"]);
+  assert.equal(calls[0].questions.thinking.type, "choice");
+  assert.deepEqual(Object.keys(calls[0].questions.thinking.criteria), ["skip", "pulse", "phase"]);
+  assert.equal(calls[0].state.reason, "turn_start");
+  assert.ok(calls[0].state.estimate.uncachedTokens > 4096);
+  assert.equal(calls[0].state.estimate.source, "session.deriveMessages+admitted");
+  assert.equal(calls[0].state.estimate.label, "estimate, cache hit not guaranteed");
+  assert.ok(expensive.records.some(record => record.kind === "effort_decision" && record.decision === "skip"));
+  assert.equal(expensive.records.some(record => record.kind === "effort_raised"), false);
+  const stats = expensive.records.reduce((stats, record) => applyStatsRecord(stats, record), newStats("auto", 100, 1000000));
+  assert.equal(stats.effortDecisions.skip, 1);
+  assert.ok(stats.estUncachedTokensAvoided > 4096);
 
-  const cheap = await setup("Small prefix");
+  const cheap = await effortHarness(t, { prefix: "Small prefix" }, []);
   assert.equal((await cheap.request()).reasoningEffort, "high");
   assert.equal((await cheap.request()).reasoningEffort, undefined);
-  assert.equal(thinkingRequests.length, 1);
-  assert.ok(records.some((record) => record.kind === "effort_decision" && record.decision === "cheap" && record.uncachedTokens <= 4096));
-  assert.ok(records.some((record) => record.kind === "effort_raised" && record.reason === "turn_start"));
+  assert.equal(cheap.effortCalls().length, 0);
+  assert.ok(cheap.records.some(record => record.kind === "effort_decision" && record.decision === "cheap"));
+});
+
+test("effort questions leave maxDecisions available for delegation and still account Jev usage/cost", async (t) => {
+  const app = await effortHarness(t, { maxDecisions: 2 });
+  assert.equal((await app.request()).reasoningEffort, undefined);
+  const delegated = await app.execute("Inspect the independent failure");
+  assert.equal(delegated.isError, false);
+  assert.equal(app.children.length, 1);
+  assert.equal(app.requests.length, 3); // turn plan + effort + delegation; only two are budgeted
+  const billed = app.records.find(record => record.kind === "jev" && record.trigger === "effort_decision");
+  assert.deepEqual(billed.usage, { input_tokens: 200, output_tokens: 10 });
+  assert.ok(billed.usd > 0);
+});
+
+test("maxEffortDecisions exhaustion pulses with fallback_budget, independently of maxDecisions", async (t) => {
+  const app = await effortHarness(t, { maxDecisions: 1, maxEffortDecisions: 1 });
+  assert.equal((await app.request()).reasoningEffort, undefined); // plan spent maxDecisions already
+  assert.equal(app.effortCalls().length, 1);
+  app.tool("fail");
+  assert.equal((await app.request()).reasoningEffort, "high");
+  assert.equal(app.effortCalls().length, 1);
+  assert.ok(app.records.some(record => record.kind === "effort_decision" && record.decision === "fallback_budget"));
+
+  const zero = await effortHarness(t, { maxEffortDecisions: 0 }, []);
+  assert.equal((await zero.request()).reasoningEffort, "high");
+  assert.equal(zero.effortCalls().length, 0);
+  assert.ok(zero.records.some(record => record.kind === "effort_decision" && record.decision === "fallback_budget"));
+});
+
+test("replacement invalidates latest and every cache space, then pulses post_replacement without Jev", async (t) => {
+  for (const type of ["compaction/summary", "compaction/prune", "image/offload", "user/message"]) {
+    const app = await effortHarness(t, {}, []);
+    await app.stream("high");
+    await app.stream();
+    app.setMessages([{ role: "user", content: [{ type: "text", text: "new prefix".repeat(4000) }] }]);
+    app.agent.session.surface.contentGeneration++;
+    app.handlers.get("session/event")(app.agent.session, { type,
+      ...(type === "user/message" ? { surfaceOp: { op: "replace", startSeq: 0, endSeq: 1 } } : {}) });
+    assert.equal((await app.request()).reasoningEffort, "high");
+    assert.equal(app.effortCalls().length, 0);
+    const decision = app.records.find(record => record.kind === "effort_decision");
+    assert.equal(decision.decision, "post_replacement");
+    assert.equal(decision.uncachedTokens, 0);
+    assert.equal(decision.usd, 0);
+    assert.ok(app.records.some(record => record.kind === "cache_invalidated" && record.spaces === 2));
+    await app.stream("high");
+    const reuse = app.records.filter(record => record.kind === "execution_call").at(-1).prefixReuse;
+    assert.equal(reuse.sharedMessages, 0);
+    assert.equal(reuse.estReusedTokens, 0);
+  }
+});
+
+test("live messages and generation changes supersede the previous fingerprint", async (t) => {
+  const app = await effortHarness(t, {}, []);
+  app.setMessages([{ role: "user", content: [{ type: "text", text: "Entirely different input" }] }]);
+  assert.equal((await app.request()).reasoningEffort, "high");
+  assert.equal(app.effortCalls().length, 0);
+  assert.ok(app.records.some(record => record.kind === "effort_decision" && record.decision === "cheap" && record.totalTokens < 100));
+
+  const rewritten = await effortHarness(t, {}, []);
+  rewritten.agent.session.surface.contentGeneration++; // a projection not announced to this listener
+  assert.equal((await rewritten.request()).reasoningEffort, "high");
+  assert.ok(rewritten.records.some(record => record.kind === "effort_decision" && record.decision === "post_replacement"));
+});
+
+test("the plugin's own context_replaced path invalidates the effort estimate", async (t) => {
+  t.mock.method(BasicCompactionEngine.prototype, "compactRegion", async () => ({ shadowedSeqs: [2] }));
+  const app = await effortHarness(t, { pressure: true, pressureTokens: 3000, contextSelection: "summary" }, []);
+  assert.ok(app.records.some(record => record.kind === "context_replaced"));
+  assert.ok(app.records.some(record => record.kind === "cache_invalidated" && record.reason === "context_replaced:summary"));
+  assert.equal((await app.request()).reasoningEffort, "high");
+  assert.equal(app.effortCalls().length, 0);
+  assert.ok(app.records.some(record => record.kind === "effort_decision" && record.decision === "post_replacement"));
+});
+
+test("a phase survives several requests and new failures without Jev, then ends when its test passes", async (t) => {
+  const app = await effortHarness(t, {}, ["skip", "phase"]);
+  await app.request();
+  app.tool("fail");
+  assert.equal((await app.request()).reasoningEffort, "high");
+  assert.equal((await app.request()).reasoningEffort, "high");
+  app.tool("fail"); // renew the window without another decision
+  assert.equal((await app.request()).reasoningEffort, "high");
+  assert.equal(app.effortCalls().length, 2);
+  app.tool("pass");
+  assert.equal((await app.request()).reasoningEffort, undefined);
+  const end = app.records.find(record => record.kind === "effort_phase_end");
+  assert.deepEqual({ reason: end.reason, requests: end.requests, endedBy: end.endedBy },
+    { reason: "test_failure", requests: 3, endedBy: "test_passed" });
+  assert.equal(app.records.filter(record => record.kind === "effort_raised" && record.phase === true).length, 3);
+  const stats = app.records.reduce((stats, record) => applyStatsRecord(stats, record), newStats("auto", 100, 1000000));
+  assert.equal(stats.effortPhases, 1);
+  assert.equal(stats.effortPhaseRequests, 3);
+});
+
+test("phase request windows renew on a new trigger and stop at the window or turn end", async (t) => {
+  const app = await effortHarness(t, { effortPhaseRequests: 2 }, ["skip", "phase"]);
+  await app.request();
+  app.tool("fail");
+  assert.equal((await app.request()).reasoningEffort, "high");
+  assert.equal((await app.request()).reasoningEffort, "high");
+  app.tool("fail");
+  assert.equal((await app.request()).reasoningEffort, "high");
+  assert.equal((await app.request()).reasoningEffort, "high");
+  assert.equal((await app.request()).reasoningEffort, undefined);
+  assert.equal(app.effortCalls().length, 2);
+  assert.ok(app.records.some(record => record.kind === "effort_phase_end" && record.requests === 4 && record.endedBy === "request_limit"));
+
+  const ended = await effortHarness(t, {}, ["phase"]);
+  assert.equal((await ended.request()).reasoningEffort, "high");
+  ended.handlers.get("session/event")(ended.agent.session, { type: "turn/end", data: { turn: "turn", reason: { kind: "interrupted" } } });
+  assert.equal((await ended.request()).reasoningEffort, undefined);
+  assert.ok(ended.records.some(record => record.kind === "effort_phase_end" && record.endedBy === "turn_end"));
+});
+
+test("effort evidence stays within 8000 UTF-8 bytes and carries the raw failure excerpt and attempt history", async (t) => {
+  const marker = "AssertionError: cache result is stale";
+  const app = await effortHarness(t, { task: "修复缓存\u0000".repeat(300) }, ["skip", "skip"]);
+  await app.request();
+  app.tool("fail", "E " + marker + "\nE " + "观察到错误\u0000".repeat(2000) + "\n1 failed in 0.01s");
+  assert.equal((await app.request()).reasoningEffort, undefined);
+  const call = app.effortCalls().at(-1), state = call.state;
+  assert.equal(state.reason, "test_failure");
+  assert.ok(Buffer.byteLength(JSON.stringify(state)) <= 8000);
+  assert.ok(Buffer.byteLength(JSON.stringify({ ...state, questions: call.questions })) <= 8000);
+  assert.ok(state.evidence.task.length <= 800);
+  assert.match(state.evidence.failureExcerpt, /AssertionError: cache result is stale/);
+  assert.ok(state.evidence.failureExcerpt.length <= 1500);
+  assert.match(state.evidence.testKey, /tests\/test_fix.py/);
+  assert.equal(state.evidence.attempts.count, 1);
+  assert.deepEqual(state.evidence.attempts.outcomes, ["fail"]);
+  assert.match(state.evidence.attempts.summary, /Run 1.*fail/);
+  assert.ok(state.evidence.change.length <= 1500);
+  const record = app.records.filter(record => record.kind === "effort_decision").at(-1);
+  assert.equal(record.evidenceBytes, Buffer.byteLength(JSON.stringify(state.evidence)));
+  assert.match(record.evidenceHash, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(app.records).includes(marker), false);
+});
+
+test("option costs use observed high-effort output without double-counting reasoning, and report pulse churn", async (t) => {
+  const app = await effortHarness(t, {}, ["pulse", "phase"]);
+  assert.equal((await app.request()).reasoningEffort, "high");
+  await app.stream("high", { inputTokens: 100, outputTokens: 1000, reasoningTokens: 800 });
+  assert.equal((await app.request()).reasoningEffort, undefined);
+  // Invalidate the high-space exact prefix while keeping a warm current off prefix.
+  app.setMessages([{ role: "user", content: [{ type: "text", text: "updated".repeat(6000) }] }]);
+  await app.stream();
+  app.tool("fail");
+  assert.equal((await app.request()).reasoningEffort, "high");
+  const costs = app.effortCalls().at(-1).state.optionCosts;
+  assert.equal(costs.phase.label, "estimate, cache hit not guaranteed");
+  assert.equal(costs.phase.expectedRequests, 4);
+  assert.equal(costs.phase.extraOutput.averageTokens, 1000);
+  assert.equal(costs.phase.extraOutput.averageReasoningTokens, 800);
+  assert.equal(costs.phase.extraOutput.tokens, 4000);
+  assert.ok(costs.phase.extraOutput.usd > 0);
+  assert.equal(costs.pulse.churn.pulses, 1);
+  assert.equal(costs.pulse.churn.rePulsedWithin3, 0);
+  assert.ok(costs.pulse.churn.reentryIfTriggeredSoon.uncachedTokens > 4096);
 });
 
 test("a fresh root can use every child slot through the real guard, then declines locally", async (t) => {

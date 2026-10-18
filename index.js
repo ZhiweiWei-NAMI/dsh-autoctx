@@ -192,6 +192,10 @@ export const Config = z.object({
     ),
   effortSwitchFreeTokens: z.number().min(0).default(4096)
     .description("Decision-point pulses with at most this estimated uncached re-read proceed without asking Jev"),
+  maxEffortDecisions: z.number().min(0).default(6)
+    .description("Separate Jev effort decision calls per root task; never spends the routing/context budget"),
+  effortPhaseRequests: z.number().min(1).default(4)
+    .description("Maximum high-effort requests after a phase trigger; a new trigger renews this window"),
   cacheTtlSeconds: z.number().min(0).default(300)
     .description("Conservative assumed reuse lifetime in seconds; provider cache TTL is unverified"),
   learning: z
@@ -338,6 +342,14 @@ const THINKING_POLICIES = {
 // Measured in dsh-bench (12 SWE-bench Verified pytest tasks, 600 s, 64 calls incl. Jev; resolved tasks).
 const THINKING_MEASURED =
   "dsh-bench, 12 SWE-bench Verified tasks per run: deepseek-v4.1-flash resolved 18/24 with decision_points and 15/24 with thinking off for the whole turn; glm-5.3-flash 18/24 with decision_points and 7/12 with off; always was not measured. Small samples.";
+const EFFORT_STATE_BYTES = 8000;
+const shortText = (value, chars) => String(value ?? "").slice(0, chars);
+const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value));
+const EFFORT_CHOICES = {
+  skip: "Keep the current effort/cache space; no effort change.",
+  pulse: "High effort for the next request only.",
+  phase: "High effort until the trigger is resolved or the request window/turn ends; new triggers renew the window.",
+};
 // Measured on deepseek-v4.1-flash through WorkBuddy (same affinity id): thinking on and off are separate
 // provider cache spaces. Other routes were not measured.
 const thinkingCacheFact = (model) =>
@@ -490,6 +502,14 @@ export function apply(ctx, options) {
     effortStall = new Map(),
     effortSkips = new Map(),
     effortPulses = new Map(),
+    effortPhases = new Map(),
+    effortRequests = new Map(),
+    effortOutputs = new Map(),
+    effortReports = new Map(),
+    effortTools = new Map(),
+    taskHeads = new Map(),
+    turnHeads = new Map(),
+    admittedMessages = new Map(),
     cacheSpaces = new Map(),
     userEffort = new Set(),
     childEffort = new Map(),
@@ -562,6 +582,7 @@ export function apply(ctx, options) {
         pending: new Set(),
         childRequests: 0,
         decisions: 0,
+        effortDecisions: 0,
       });
     return budgets.get(id);
   };
@@ -616,6 +637,7 @@ export function apply(ctx, options) {
         "effort_checkpoint",
         "effort_raised",
         "effort_decision",
+        "effort_phase_end",
         "context_deferred",
         "learning",
       ].includes(value.kind)
@@ -824,7 +846,7 @@ export function apply(ctx, options) {
     record({ kind: "jev_unavailable", session, model: config.jevModel, httpStatus: status, error: detail,
       ...(transient ? { pausedMs: JEV_PAUSE_MS } : {}) });
   }
-  // `unbudgeted` is for the turn-end learning call, which must not compete with the task's decisions.
+  // Learning and effort calls do not compete with routing/context decisions. Effort has its own cap.
   async function decide(agent, request, signal, { unbudgeted = false } = {}) {
     const root = rootOf(agent),
       state = budget(root);
@@ -842,6 +864,11 @@ export function apply(ctx, options) {
     return memoFor(root)(key, async () => {
       if (!unbudgeted && state.decisions >= config.maxDecisions)
         throw new Error("Jev task decision budget exhausted.");
+      if (unbudgeted && request.trigger === "effort_decision") {
+        if (state.effortDecisions >= (config.maxEffortDecisions ?? 6))
+          throw Object.assign(new Error("Jev effort decision budget exhausted."), { code: "EFFORT_BUDGET" });
+        state.effortDecisions++;
+      }
       if (!unbudgeted) state.decisions++;
       updateStats(root);
       const started = performance.now();
@@ -895,6 +922,11 @@ export function apply(ctx, options) {
       const usd = jevCostUSD(config.jevModel, result.usage);
       if (usd !== undefined) useOf(root).cost.jev += usd;
       else useOf(root).unpriced++;
+      // The effort state contains raw task/failure evidence. Keep only the validated choice and
+      // billing counters even if a gateway echoes state or adds free-text explanations.
+      const logged = request.trigger === "effort_decision" ? { model: result.model, usage: result.usage,
+        answers: { thinking: { type: "choice", choice: result.answers.thinking.choice,
+          confidence: result.answers.thinking.confidence } } } : result;
       record({
         kind: "jev",
         session: agent.session.id,
@@ -902,7 +934,7 @@ export function apply(ctx, options) {
         httpStatus: response.status,
         wallMs: performance.now() - started,
         ...(usd === undefined ? {} : { usd }),
-        ...result,
+        ...logged,
       });
       return result;
     });
@@ -1120,14 +1152,18 @@ export function apply(ctx, options) {
           .flatMap((test) => test.runs)
           .filter((run) => run.via === undefined && run.event > since)
           .at(-1);
+        const recent = effortTools.get(id) ?? [];
+        recent.push({ name: shortText(exec.name, 80), outcome: latest?.outcome ?? (result.isError ? "error" : "success") });
+        effortTools.set(id, recent.slice(-6));
+        resolveEffortPhase(exec, result, latest);
         if (latest && (latest.outcome === "fail" || latest.outcome === "error")) {
-          wantEffort(exec.agent, "test_failure");
           const key = Object.entries(graphFor(id).tests).find(([, test]) => test.runs.includes(latest))?.[0];
           if (key) {
             if (!failureOutput.has(id)) failureOutput.set(id, new Map());
             const text = (result.content ?? []).filter((block) => block.type === "text").map((block) => block.text).join("\n");
             failureOutput.get(id).set(key, text.slice(-40000));
           }
+          wantEffort(exec.agent, "test_failure", { testKey: key });
         }
       }
     }
@@ -1178,6 +1214,12 @@ export function apply(ctx, options) {
     active.delete(info.id);
     advisorChildren.delete(info.id);
     settled.set(info.id, info);
+    const role = childRoles.get(info.id);
+    if (role === "reviewer" || role === "advisor") {
+      if (!effortReports.has(running.parent)) effortReports.set(running.parent, new Map());
+      effortReports.get(running.parent).set(role === "reviewer" ? "review_report" : "advisor_report",
+        shortText((info.lastAssistantMessage ?? []).filter(block => block.type === "text").map(block => block.text).join("\n"), 1500));
+    }
     if (childRoles.get(info.id) === "worker" && childModels.has(info.id)) {
       const use = roleUse(running.parent, "worker", childModels.get(info.id));
       if (info.stopReason === "completed") use.completed++;
@@ -1279,75 +1321,213 @@ export function apply(ctx, options) {
     return plan;
   }
 
-  // Under the decision-points policy, the root's next request thinks after one of these events.
-  function wantEffort(agent, reason) {
-    if (agent.session.header.parentSession !== undefined) return;
-    if (turnPlans.get(agent.session.id)?.thinking !== "decision_points") return;
-    if (!effortDue.has(agent.session.id)) effortDue.set(agent.session.id, reason);
+  const phaseWindow = () => Math.max(1, Math.floor(config.effortPhaseRequests ?? 4));
+  const failingTest = (id) => Object.entries(graphFor(id).tests)
+    .map(([key, test]) => ({ key, run: test.runs.filter(run => run.via === undefined).at(-1) }))
+    .filter(({ run }) => ["fail", "error"].includes(run?.outcome))
+    .sort((a, b) => b.run.event - a.run.event)[0];
+  function phaseTrigger(id, reason, details = {}) {
+    return { reason, testKey: details.testKey ?? (reason === "test_failure" ? failingTest(id)?.key : undefined),
+      progress: progressKey(graphFor(id)), event: graphFor(id).sequence };
+  }
+  function extendEffortPhase(id, phase, trigger) {
+    phase.triggers.set(trigger.reason + "|" + (trigger.testKey ?? ""), trigger);
+    phase.until = (effortRequests.get(id) ?? 0) + phaseWindow();
+  }
+  function endEffortPhase(id, endedBy) {
+    const phase = effortPhases.get(id);
+    if (!phase) return;
+    effortPhases.delete(id);
+    record({ kind: "effort_phase_end", session: id, reason: phase.reason, requests: phase.requests, endedBy });
+  }
+  function resolveEffortPhase(exec, result, latest) {
+    const id = exec.agent.session.id, phase = effortPhases.get(id);
+    if (!phase) return;
+    const successful = !result.isError && !["fail", "error", "unknown"].includes(latest?.outcome);
+    let endedBy;
+    for (const [key, trigger] of phase.triggers) {
+      if (graphFor(id).sequence <= trigger.event) continue;
+      if (trigger.reason === "test_failure") {
+        const test = graphFor(id).tests[trigger.testKey];
+        const run = test?.runs.filter(run => run.via === undefined).at(-1);
+        if (!successful || run?.outcome !== "pass" || run.event <= trigger.event) continue;
+        endedBy = "test_passed";
+      } else if (["review_report", "advisor_report"].includes(trigger.reason)) {
+        if (!successful || !(latest?.outcome === "pass" || changesFilesCall(exec.name, exec.arguments))) continue;
+        endedBy = "report_acted_on";
+      } else {
+        if (!successful || progressKey(graphFor(id)) === trigger.progress) continue;
+        endedBy = "progress";
+      }
+      phase.triggers.delete(key);
+    }
+    if (!phase.triggers.size) endEffortPhase(id, endedBy);
   }
 
-  async function decisionPointEffort(agent, resolved, reason) {
+  // A fresh trigger renews an active phase locally, without spending another Jev decision.
+  function wantEffort(agent, reason, details = {}) {
+    if (agent.session.header.parentSession !== undefined) return;
     const id = agent.session.id;
+    if (turnPlans.get(id)?.thinking !== "decision_points") return;
+    const trigger = phaseTrigger(id, reason, details), phase = effortPhases.get(id);
+    if (phase) extendEffortPhase(id, phase, trigger);
+    else if (!effortDue.has(id) || ["turn_start", "stall"].includes(effortDue.get(id).reason))
+      effortDue.set(id, trigger);
+  }
+
+  function invalidateCache(id, reason) {
+    const cache = cacheSpaces.get(id);
+    record({ kind: "cache_invalidated", session: id, reason,
+      spaces: cache?.spaces.size ?? 0, hadLatest: !!cache?.latest });
+    cacheSpaces.set(id, { spaces: new Map(), latest: undefined, invalidated: reason, failed: false });
+  }
+  function checkCacheGeneration(agent) {
+    const cache = cacheSpaces.get(agent.session.id), generation = agent.session.surface?.contentGeneration;
+    if (cache?.generation !== undefined && generation !== undefined && cache.generation !== generation)
+      invalidateCache(agent.session.id, "surface_generation_changed");
+  }
+
+  // Use the live projected messages, never an old request plus a token-count delta when available.
+  function effortEstimate(agent, resolved, payload) {
+    checkCacheGeneration(agent);
+    const id = agent.session.id, cache = cacheSpaces.get(id), price = modelInfo(resolved.model)?.price;
+    const projected = agent.session.deriveMessages?.();
+    const messages = payload.messages ?? resolved.messages ?? (projected === undefined ? undefined :
+      [...projected, ...(admittedMessages.get(id) ?? [])]);
+    let current = cache?.latest, source = "latest_plus_pending", pendingTokens = 0;
+    if (messages !== undefined) {
+      current = fingerprint({ ...resolved, tools: payload.tools ?? resolved.tools ?? agent.session.requestHeader?.()?.tools,
+        messages }, message => ctx.tokenMeter.estimateMessage(message));
+      source = payload.messages !== undefined || resolved.messages !== undefined ? "request_messages" : "session.deriveMessages+admitted";
+    } else if (current) {
+      pendingTokens = Math.max(0, ctx.tokenMeter.measure(agent.session).totalTokens -
+        current.tokens.reduce((sum, value) => sum + value, 0));
+    }
+    const totalTokens = current ? current.tokens.reduce((sum, value) => sum + value, 0) + pendingTokens : null;
+    if (cache?.invalidated && !cache.latest)
+      return { totalTokens, reusableTokens: 0, uncachedTokens: 0, usd: 0, source,
+        postReplacement: true };
+    if (!current || !price)
+      return { totalTokens, reusableTokens: null, uncachedTokens: null, usd: null, source };
+    const target = cache?.spaces.get(`${resolved.provider}|${resolved.model}|${config.adaptiveEffort}`);
+    const estimate = switchEstimate({ latest: current, target: target?.fingerprint, at: target?.at,
+      now: Date.now(), ttlMs: (config.cacheTtlSeconds ?? 300) * 1000, pendingTokens, price });
+    // Reuse in the current space is the baseline: entering high cannot lose tokens the baseline also
+    // has to read. After a replacement both spaces must read the new prefix, so the premium is zero.
+    const baseline = cache?.spaces.get(`${resolved.provider}|${resolved.model}|${effortSet.get(id) ?? resolved.reasoningEffort ?? "default"}`);
+    const baselineReuse = reusableTokens(baseline?.fingerprint, current, { now: Date.now(), at: baseline?.at,
+      ttlMs: (config.cacheTtlSeconds ?? 300) * 1000 });
+    estimate.uncachedTokens = Math.max(0, baselineReuse - estimate.reusableTokens);
+    estimate.usd = round(estimate.uncachedTokens * (price.input - (price.cacheRead ?? price.input)) / 1e6);
+    return { ...estimate, source };
+  }
+
+  function effortOptionCosts(id, resolved, estimate) {
+    const price = modelInfo(resolved.model)?.price;
+    const measured = effortOutputs.get(id)?.get(`${resolved.provider}|${resolved.model}`);
+    const pulses = effortPulses.get(id) ?? { count: 0, reasons: {}, rePulsedWithin3: 0 };
+    const average = measured?.calls ? measured.outputTokens / measured.calls : null;
+    const reasoning = measured?.reasoningCalls ? measured.reasoningTokens / measured.reasoningCalls : null;
+    const churn = { pulses: pulses.count, rePulsedWithin3: pulses.rePulsedWithin3,
+      reentryIfTriggeredSoon: { uncachedTokens: estimate.uncachedTokens, usd: estimate.usd,
+        basis: "Same prefix/target-space reuse as now; future growth and cache hits are unknown." },
+      observed: "1.2.3: 58% of switches reverted within 3 requests" };
+    const option = (requests) => ({ label: "estimate, cache hit not guaranteed", expectedRequests: requests,
+      enter: { uncachedTokens: estimate.uncachedTokens, usd: estimate.usd },
+      extraOutput: { averageTokens: average, averageReasoningTokens: reasoning, reasoningIncludedInOutput: true,
+        tokens: average === null ? null : round(average * requests),
+        usd: average === null || !price ? null : round(average * requests * price.output / 1e6),
+        basis: average === null ? THINKING_MEASURED : "session high-effort output (including reasoning); upper estimate, no off-output subtraction" },
+      churn, requestsPotentiallySaved: "Not measured; consider whether deliberate reasoning avoids later failed attempts/requests." });
+    return { skip: { label: "estimate, cache hit not guaranteed", expectedRequests: 0,
+      enter: { uncachedTokens: 0, usd: 0 }, extraOutput: { tokens: 0, usd: 0 } },
+      pulse: option(1), phase: option(phaseWindow()) };
+  }
+
+  async function effortEvidence(agent, trigger) {
+    const id = agent.session.id, graph = graphFor(id), reason = trigger.reason;
+    const evidence = { task: shortText(taskHeads.get(id), 800) };
+    if (reason === "test_failure") {
+      const key = trigger.testKey ?? failingTest(id)?.key;
+      const runs = graph.tests[key]?.runs.filter(run => run.via === undefined) ?? [];
+      const raw = failureOutput.get(id)?.get(key);
+      const excerpt = raw === undefined ? "(no raw failure output captured)" : failureExcerpt(raw, { maxChars: 1500 });
+      const focus = focusTerms({ failingTests: key ? [key] : [],
+        errors: excerpt.match(/\b[A-Za-z_$][\w$]*(?:Error|Exception)\b/g) ?? [],
+        symbols: [...(key?.match(/\btest_\w+|[\w./-]+\.(?:py|js|ts|go|rs)\b/g) ?? []),
+          ...(excerpt.match(/[\w./-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|c|cpp)\b/g) ?? [])] });
+      const change = await workspaceDiff(workspaceOf(agent), { maxChars: 1500, focus });
+      evidence.testKey = shortText(key, 400);
+      evidence.failureExcerpt = shortText(excerpt, 1500);
+      evidence.attempts = { count: runs.length, outcomes: runs.map(run => run.outcome),
+        summary: shortText(attemptsFrom(graph, key), 1000) };
+      evidence.change = shortText(change.evidence ?? (change.error ? "Diff unavailable: " + change.error : change.diff), 1500);
+    } else if (["review_report", "advisor_report"].includes(reason)) {
+      evidence.report = shortText(effortReports.get(id)?.get(reason), 1500);
+    } else if (reason === "stall") {
+      evidence.stepsWithoutProgress = graphStep(id) - (effortStall.get(id)?.step ?? graphStep(id));
+      evidence.tools = (effortTools.get(id) ?? []).slice(-6);
+    } else evidence.request = shortText(turnHeads.get(id), 800);
+    return evidence;
+  }
+
+  // Bound the entire serialized state (and question) in UTF-8 bytes, including JSON escaping. Preserve
+  // the observed failure ahead of background/diff text when non-ASCII evidence needs more space.
+  function boundEffortRequest(request) {
+    const evidence = request.evidence;
+    const fields = [[evidence, "task"], [evidence, "request"], [evidence, "change"],
+      [evidence.attempts, "summary"], [evidence, "testKey"], [evidence, "report"], [evidence, "failureExcerpt"]];
+    while (jsonBytes(request) > EFFORT_STATE_BYTES) {
+      const field = fields.find(([object, key]) => typeof object?.[key] === "string" && object[key].length > 64);
+      if (field) {
+        const [object, key] = field;
+        object[key] = object[key].slice(0, Math.max(64, Math.floor(object[key].length / 2)));
+      } else if (evidence.tools?.length) evidence.tools.pop();
+      else throw new Error("Effort state metadata exceeds byte budget");
+    }
+  }
+
+  async function decisionPointEffort(agent, resolved, trigger, payload) {
+    const id = agent.session.id, reason = trigger.reason;
     let estimate = { totalTokens: null, reusableTokens: null, uncachedTokens: null, usd: null },
-      decision = "cheap", noul;
+      decision = "fallback", optionCosts = effortOptionCosts(id, resolved, estimate), evidenceBytes = 0, evidenceKey;
     try {
-      const cache = cacheSpaces.get(id), latest = cache?.latest,
-        price = modelInfo(resolved.model)?.price;
-      if (latest && price) {
-        const target = cache.spaces.get(`${resolved.provider}|${resolved.model}|${config.adaptiveEffort}`);
-        estimate = switchEstimate({ latest, target: target?.fingerprint, at: target?.at,
-          now: Date.now(), ttlMs: (config.cacheTtlSeconds ?? 300) * 1000,
-          pendingTokens: Math.max(0, ctx.tokenMeter.measure(agent.session).totalTokens -
-            latest.tokens.reduce((sum, value) => sum + value, 0)), price });
-      }
-      if (latest && price && estimate.uncachedTokens > (config.effortSwitchFreeTokens ?? 4096)) {
-        const graph = graphFor(id);
-        const failure = Object.entries(graph.tests)
-          .map(([key, test]) => ({ key, run: test.runs.at(-1) }))
-          .filter(({ run }) => run?.via === undefined && ["fail", "error"].includes(run?.outcome))
-          .sort((a, b) => b.run.event - a.run.event)[0];
-        // progressKey tracks outcomes; a fresh failing run with the same outcome is new evidence too.
-        const evidenceKey = createHash("sha256").update(JSON.stringify([
-          progressKey(graph), reason === "test_failure" ? failure : null,
-        ])).digest("hex");
+      estimate = effortEstimate(agent, resolved, payload);
+      optionCosts = effortOptionCosts(id, resolved, estimate);
+      if (estimate.postReplacement) decision = "post_replacement";
+      else if (estimate.uncachedTokens !== null && estimate.uncachedTokens <= (config.effortSwitchFreeTokens ?? 4096))
+        decision = "cheap";
+      else if (budget(id).effortDecisions >= (config.maxEffortDecisions ?? 6)) decision = "fallback_budget";
+      else {
+        const evidence = await effortEvidence(agent, trigger);
+        const request = { trigger: "effort_decision", reason, evidence,
+          estimate: { ...estimate, label: "estimate, cache hit not guaranteed" }, optionCosts,
+          preference: roots.get(id)?.policy?.weights,
+          questions: { thinking: { type: "choice", criteria: EFFORT_CHOICES, instructions:
+            "Choose the effort justified by this evidence. Quality comes first; skip is right for a mechanical fix. Weigh entry, output, churn and requests a phase may save." } } };
+        boundEffortRequest(request);
+        evidenceBytes = jsonBytes(evidence);
+        evidenceKey = createHash("sha256").update(JSON.stringify([reason, evidence, progressKey(graphFor(id))])).digest("hex");
         const skipped = effortSkips.get(id)?.get(reason);
-        if (skipped?.key === evidenceKey) {
-          decision = "jev_no";
-          noul = skipped.noul;
-        } else {
-          const short = (value) => Array.from(String(value)).slice(0, 80).join("");
-          const evidence = reason === "test_failure" && failure
-            ? `${short(failure.key)}: ${short(failure.run.summary)}`
-            : reason === "review_report" || reason === "advisor_report" ? "report received"
-              : reason === "stall" ? `${graphStep(id) - (effortStall.get(id)?.step ?? graphStep(id))} steps without progress`
-                : "start of turn";
-          const weights = roots.get(id)?.policy?.weights;
-          const request = {
-            trigger: "effort_decision", reason, evidence, evidenceKey,
-            pulses: effortPulses.get(id) ?? { count: 0, reasons: {} },
-            estimate: { ...estimate, label: "estimate, cache hit not guaranteed" },
-            measured: THINKING_MEASURED,
-            preference: Object.fromEntries(["quality", "latency", "usage", "cache"].map((key) => [key, weights?.[key]])),
-            questions: { think_now: { type: "noul", instructions:
-              `Should the executor's next request use extended thinking at this decision point? It re-reads about ${estimate.uncachedTokens} tokens uncached (~$${estimate.usd} extra) because the thinking cache space has not seen the recent context; skipping keeps the current cache. Quality of the result comes first; weigh whether this point plausibly needs deliberate reasoning (a new failure, a defect report, a stall) against the cost.` } },
-          };
-          if (!config.apiKey || Buffer.byteLength(JSON.stringify(request)) > 3000)
-            throw new Error("Effort decision unavailable");
-          noul = (await decide(agent, request, AbortSignal.timeout(15000))).answers.think_now.noul;
-          decision = noul >= 0.5 ? "jev_yes" : "jev_no";
-          if (decision === "jev_no") {
+        if (skipped === evidenceKey) decision = "skip";
+        else {
+          if (!config.apiKey) throw new Error("Effort decision unavailable");
+          const timeout = AbortSignal.timeout(15000);
+          const signal = payload.signal ? AbortSignal.any([payload.signal, timeout]) : timeout;
+          decision = (await decide(agent, request, signal, { unbudgeted: true })).answers.thinking.choice;
+          if (decision === "skip") {
             if (!effortSkips.has(id)) effortSkips.set(id, new Map());
-            effortSkips.get(id).set(reason, { key: evidenceKey, noul });
+            effortSkips.get(id).set(reason, evidenceKey);
           }
         }
       }
-    } catch {
-      // The measured decision-point policy remains the fallback, including when Jev's budget is spent.
-      decision = "fallback";
+    } catch (error) {
+      if (payload.signal?.aborted) throw error;
+      decision = error.code === "EFFORT_BUDGET" ? "fallback_budget" : "fallback";
     }
     record({ kind: "effort_decision", session: id, reason, decision, ...estimate,
-      ...(noul === undefined ? {} : { noul }) });
-    return decision !== "jev_no";
+      optionCosts, evidenceBytes, ...(evidenceKey ? { evidenceHash: evidenceKey } : {}) });
+    return decision;
   }
 
   // The root's sticky effort through dsh's request-config waterfall on the agent's own scoped context, as
@@ -1371,19 +1551,53 @@ export function apply(ctx, options) {
       const root = rootOf(agent);
       let effort;
       if (id === root) {
+        const requestNumber = (effortRequests.get(id) ?? 0) + 1;
+        effortRequests.set(id, requestNumber);
+        checkCacheGeneration(agent);
         const plan = effortSupported.get(root) === true ? turnPlans.get(root) : undefined;
-        if (plan?.thinking === "always") effort = plan.effort;
-        else if (plan?.thinking === "decision_points" && effortDue.has(id)) {
-          const reason = effortDue.get(id);
-          if (await decisionPointEffort(agent, resolved, reason)) {
-            effort = config.adaptiveEffort;
-            const pulses = effortPulses.get(id) ?? { count: 0, reasons: {} };
-            pulses.count++;
-            pulses.reasons[reason] = (pulses.reasons[reason] ?? 0) + 1;
-            effortPulses.set(id, pulses);
-            record({ kind: "effort_raised", session: id, effort, reason, step: payload.step });
+        if (effortPhases.has(id) && plan?.thinking !== "decision_points") endEffortPhase(id, "policy_changed");
+        if (plan?.thinking === "always") {
+          effort = plan.effort;
+          if (effort !== undefined)
+            record({ kind: "effort_raised", session: id, effort, reason: "always", step: payload.step });
+        }
+        else if (plan?.thinking === "decision_points") {
+          let phase = effortPhases.get(id);
+          if (phase && requestNumber > phase.until) {
+            endEffortPhase(id, "request_limit");
+            phase = undefined;
           }
-          effortDue.delete(id);
+          const trigger = effortDue.get(id);
+          let decision;
+          if (!phase && trigger) {
+            decision = await decisionPointEffort(agent, resolved, trigger, payload);
+            if (decision === "phase") {
+              phase = { reason: trigger.reason, requests: 0, triggers: new Map(),
+                until: requestNumber + phaseWindow() - 1 };
+              phase.triggers.set(trigger.reason + "|" + (trigger.testKey ?? ""), trigger);
+              effortPhases.set(id, phase);
+            }
+            effortDue.delete(id);
+          }
+          if (phase) {
+            effort = config.adaptiveEffort;
+            phase.requests++;
+            record({ kind: "effort_raised", session: id, effort, reason: phase.reason, step: payload.step, phase: true });
+          } else if (decision === "skip") {
+            // A skip leaves the currently selected space intact, even if the previous pulse was high.
+            effort = effortSet.get(id) ?? resolved.reasoningEffort;
+            if (effort === config.adaptiveEffort)
+              record({ kind: "effort_raised", session: id, effort, reason: trigger.reason, step: payload.step });
+          } else if (decision !== undefined) {
+            effort = config.adaptiveEffort;
+            const pulses = effortPulses.get(id) ?? { count: 0, reasons: {}, rePulsedWithin3: 0 };
+            if (pulses.lastRequest !== undefined && requestNumber - pulses.lastRequest <= 3) pulses.rePulsedWithin3++;
+            pulses.count++;
+            pulses.lastRequest = requestNumber;
+            pulses.reasons[trigger.reason] = (pulses.reasons[trigger.reason] ?? 0) + 1;
+            effortPulses.set(id, pulses);
+            record({ kind: "effort_raised", session: id, effort, reason: trigger.reason, step: payload.step });
+          }
         }
       } else {
         // A same-model child keeps the effort its branch started with (only an always-thinking parent
@@ -1613,6 +1827,10 @@ export function apply(ctx, options) {
       // LGTM ends the turn as is: steering the report back reopened it, and flash executors chased
       // the reviewer's caveats until the request cap.
       if (!lgtm) {
+        if (!effortReports.has(id)) effortReports.set(id, new Map());
+        const received = (settled.get(run.id)?.lastAssistantMessage ?? [])
+          .filter(block => block.type === "text").map(block => block.text).join("\n");
+        effortReports.get(id).set("review_report", shortText(received || report, 1500));
         agent.steer(note(reviewMessage(report)));
         wantEffort(agent, "review_report");
         return true;
@@ -1641,6 +1859,7 @@ export function apply(ctx, options) {
       if (!steered && modeOf(agent) === "auto")
         await settleTurn(agent.session, turn).catch((error) =>
           record({ kind: "learning_failed", session: agent.session.id, error: String(error) }));
+      if (!steered) endEffortPhase(agent.session.id, "turn_end");
     } finally {
       await saved;
     }
@@ -2095,6 +2314,10 @@ export function apply(ctx, options) {
         .join("\n")
         .trim();
       if (!reply) throw new Error("Advisor returned no text.");
+      if (!effortReports.has(id)) effortReports.set(id, new Map());
+      const received = (settled.get(run.id)?.lastAssistantMessage ?? [])
+        .filter(block => block.type === "text").map(block => block.text).join("\n");
+      effortReports.get(id).set("advisor_report", shortText(received || reply, 1500));
       record({ kind: "advisor_end", session: id, model: model.id, chars: reply.length });
       const use = roleUse(id, "advisor", model.id);
       use.completed++;
@@ -2159,9 +2382,12 @@ export function apply(ctx, options) {
     graphFor(id);
     const newTurn = !isChild && turnStartSteps.get(id)?.turn !== payload.turn;
     if (newTurn) {
+      endEffortPhase(id, "turn_end");
       turnStartSteps.set(id, { turn: payload.turn, step: graphStep(id) });
       effortPulses.delete(id);
       effortSkips.delete(id);
+      effortRequests.delete(id);
+      effortDue.delete(id);
       if (turnUses.get(id)?.turn !== payload.turn) turnUses.set(id, newUse(payload.turn));
     }
     const reopened = !isChild && turnUses.get(id);
@@ -2232,6 +2458,16 @@ export function apply(ctx, options) {
             message.source.senderSessionId === rootOf(agent)
           )
             tasks.set(id, tasks.get(id) + "\n\nFollow-up assignment:\n" + text(message));
+    }
+    if (!isChild && (!taskHeads.has(id) || newTurn)) {
+      const previous = agent.session.snapshotEvents()
+        .filter(event => event.type === "user/message")
+        .map(event => agent.session.deriveEventMessage(event))
+        .filter(message => message?.source.kind === "user");
+      const pending = messages.filter(message => message.source.kind === "user");
+      const first = previous[0] ?? pending[0], current = pending.at(-1) ?? previous.at(-1);
+      if (first && !taskHeads.has(id)) taskHeads.set(id, shortText(text(first), 800));
+      if (current && newTurn) turnHeads.set(id, shortText(text(current), 800));
     }
     if (
       !isChild &&
@@ -2314,7 +2550,9 @@ export function apply(ctx, options) {
     const admitted = await next();
     if (admitted.kind === "reject") return admitted;
     graphSteps.set(id, graphStep(id) + 1);
-    return appendNotes(agent, admitted, { advisor, finalRequest, staleNotes });
+    const withNotes = appendNotes(agent, admitted, { advisor, finalRequest, staleNotes });
+    if (!isChild) admittedMessages.set(id, withNotes.messages ?? []);
+    return withNotes;
   });
   ctx.on("llm/stream", async function* (options, next) {
     const agent = options.sessionId ? ctx.agents.get(options.sessionId) : undefined;
@@ -2342,6 +2580,9 @@ export function apply(ctx, options) {
       }
     };
     if (rootExecution) {
+      // The host has now committed these messages. Retries derive them from the surface itself.
+      admittedMessages.delete(agent.session.id);
+      checkCacheGeneration(agent);
       if (!cacheSpaces.has(agent.session.id))
         cacheSpaces.set(agent.session.id, { spaces: new Map(), latest: undefined, failed: false });
       try {
@@ -2368,6 +2609,8 @@ export function apply(ctx, options) {
         try {
           const cache = cacheSpaces.get(agent.session.id);
           cache.latest = cacheFingerprint;
+          delete cache.invalidated;
+          cache.generation = agent.session.surface?.contentGeneration;
           cache.spaces.delete(cacheFingerprint.space);
           cache.spaces.set(cacheFingerprint.space, { fingerprint: cacheFingerprint, at: Date.now() });
           if (cache.spaces.size > 4) cache.spaces.delete(cache.spaces.keys().next().value);
@@ -2378,6 +2621,18 @@ export function apply(ctx, options) {
     } finally {
       const wallMs = performance.now() - started;
       const spent = agent ? account(agent, options, usage, wallMs) : undefined;
+      if (rootExecution && options.reasoningEffort === config.adaptiveEffort && Number.isFinite(usage?.outputTokens)) {
+        const id = agent.session.id, route = `${options.provider}|${options.model}`;
+        if (!effortOutputs.has(id)) effortOutputs.set(id, new Map());
+        const sample = effortOutputs.get(id).get(route) ?? { calls: 0, outputTokens: 0, reasoningTokens: 0, reasoningCalls: 0 };
+        sample.calls++;
+        sample.outputTokens += usage.outputTokens;
+        if (Number.isFinite(usage.reasoningTokens)) {
+          sample.reasoningTokens += usage.reasoningTokens;
+          sample.reasoningCalls++;
+        }
+        effortOutputs.get(id).set(route, sample);
+      }
       if (agent && options.purpose === undefined && usage) lastCached.set(agent.session.id, usage.cacheReadTokens ?? 0);
       if (agent && options.purpose === undefined) {
         if (Number.isFinite(usage?.totalTokens) && Number.isFinite(usage?.outputTokens))
@@ -2406,6 +2661,13 @@ export function apply(ctx, options) {
       pendingLedgers.add(session.id);
     }
     if (session.header.parentSession !== undefined) return;
+    if (event.type === "compaction/summary" || event.type === "compaction/prune" ||
+        event.type === "image/offload" || event.surfaceOp?.op === "replace")
+      invalidateCache(session.id, event.surfaceOp?.op === "replace" ? "surface_replaced" : event.type);
+    if (event.type === "turn/end") {
+      endEffortPhase(session.id, "turn_end");
+      effortDue.delete(session.id);
+    }
     // Learning settles once per completed root turn, outside the turn: it never delays the user.
     if (event.type === "turn/end" && event.data?.reason?.kind === "completed")
       settleTurn(session, event.data.turn).catch((error) =>
@@ -2633,6 +2895,7 @@ export function apply(ctx, options) {
           agent,
           signal,
         );
+        if (agent.session.header.parentSession === undefined) invalidateCache(id, "context_replaced:" + reason);
         record({
           kind: "context_replaced",
           session: id,
