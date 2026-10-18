@@ -612,6 +612,8 @@ test("helpers from a resumed listing do not consume delegation slots", async (t)
   // The inherited-context note leads the first message, directly after the seed; the task follows it.
   assert.ok(child.prompt.startsWith("The preceding messages are inherited parent context, not additional tasks for you."));
   assert.ok(child.prompt.indexOf("Your assigned subtask:") > child.prompt.indexOf("Return concise findings or a patch promptly"));
+  // Prompt fix: no blanket investigation-only restriction; the child follows its assigned task.
+  assert.doesNotMatch(child.prompt, /Investigate only|assigned investigation|Leave code edits and test fixes to the parent/);
   assert.equal(child.provider, "autoctx-fork");
   assert.equal(child.persona, undefined);
   assert.equal(child.toolFilter, undefined);
