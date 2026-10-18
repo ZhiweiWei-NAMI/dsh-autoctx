@@ -149,8 +149,6 @@ export const Config = z.object({
     ),
   planRouting: z.union(["jev", "fixed"]).default("jev").volatile(),
   planMaxChildren: z.number().step(1).min(0).default(3).volatile(),
-  planMinDelegated: z.number().step(1).min(0).default(0).volatile()
-    .description("Mechanism smoke only: delegated subtasks a root task's plans must contain in total; 0 keeps the main agent's choice"),
   planMaxJevCalls: z.number().step(1).min(0).default(6).volatile(),
   planChildRequests: z.number().step(1).min(1).default(16).volatile(),
   apiKey: z.string().role("secret").volatile().description("Jev API key; unset keeps native mode, or fixed routing in plan mode"),

@@ -82,7 +82,7 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
     if (!agent || agent.session.header.parentSession !== undefined) return errorResult("plan is available only to the root agent.");
     if (config.mode !== "plan") return errorResult("plan requires mode=plan.");
     const state = stateFor(agent);
-    const problem = validatePlan(input, (config.planMaxChildren ?? 3) - state.used, Math.max(0, (config.planMinDelegated ?? 0) - state.used));
+    const problem = validatePlan(input, (config.planMaxChildren ?? 3) - state.used);
     if (problem) return errorResult(problem);
     if (state.accepting) return errorResult("Another plan is being recorded; wait for its result.");
     state.accepting = true;

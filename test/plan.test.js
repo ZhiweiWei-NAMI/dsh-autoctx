@@ -174,10 +174,3 @@ test("child results parse from the closing message's last json block without hos
   assert.equal(resultBlock("```json\nnot json\n```"), undefined);
   assert.match(childPrompt({ session: "root", task: task(), brief: "b", dependencies: [] }), /```json block/);
 });
-
-test("planMinDelegated is a labelled smoke-only floor; the default keeps the main agent's choice", () => {
-  const solo = { subtasks: [task("a", { owner: "main" })] };
-  assert.equal(validatePlan(solo, 3), null);
-  assert.match(validatePlan(solo, 3, 1), /at least 1 delegated/);
-  assert.equal(validatePlan({ subtasks: [task("a")] }, 3, 1), null);
-});
