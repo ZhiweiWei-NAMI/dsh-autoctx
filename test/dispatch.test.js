@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { apply } from "../index.js";
 import { fakePlan, task, completed, tick, resultText } from "./plan-fixture.js";
 
@@ -22,6 +23,8 @@ test("delegation concludes the tool turn and queues a notice synchronously at tu
   assert.notEqual(queued.children[0], queued.children[1]);
   for (const child of queued.children) assert.ok(notice.content[0].text.includes(child));
   assert.match(notice.content[0].text, /Continue only your own subtasks/);
+  const injection = app.records.find((record) => record.kind === "message_appended");
+  assert.equal(injection.contentSha256, createHash("sha256").update(notice.content[0].text, "utf8").digest("hex"));
 });
 
 test("the next pre-step awaits establishment with reserved fork ids and unchanged composition", async () => {
@@ -109,9 +112,14 @@ test("mediation appends a labelled summary to each running sibling", async () =>
   assert.equal(app.messages[0].content[0].text.split("\n")[0],
     `[from child ${app.starts[0].childId} · deepseek-v4.1-flash/high · subtask a · via dsh-autoctx]`);
   assert.match(app.messages[0].content[0].text, /Observed a shared interface mismatch/);
+  const committed = [{ type: "text", text: "Agent root sent a message: " }, ...app.messages[0].content];
+  app.dispatcher.onEvent({ id: app.messages[0].targetId, header: { parentSession: "root" } },
+    { type: "user/message", data: { content: committed } });
   const record = app.records.find((record) => record.kind === "message_appended" && record.messageKind === "relay");
   assert.equal(record.label, true);
-  assert.equal(record.chars, app.messages[0].content[0].text.length);
+  const committedText = committed.map((block) => block.text).join("\n\n");
+  assert.equal(record.chars, committedText.length);
+  assert.equal(record.contentSha256, createHash("sha256").update(committedText, "utf8").digest("hex"));
   app.starts[1].settle();
   await tick();
 });
@@ -289,6 +297,8 @@ test("plan child requests have their own cap and receive the final-request note"
   await consume();
   const admitted = await app.preStep(child, 1);
   assert.match(admitted.messages[0].content[0].text, /final model request under the plan child budget/);
+  const injection = app.records.find((record) => record.kind === "message_appended" && record.to === child.session.id && record.messageKind === "budget");
+  assert.equal(injection.contentSha256, createHash("sha256").update(admitted.messages[0].content[0].text, "utf8").digest("hex"));
   await consume();
   await assert.rejects(() => app.preStep(child, 2), /Plan child request budget exhausted/);
   await assert.rejects(consume, /Plan child model-call budget exhausted/);

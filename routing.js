@@ -1,3 +1,60 @@
+import { createHash } from "node:crypto";
+
+// Hash the exact injected text, including framing and whitespace. Block callers
+// use the same two-newline join as the UI contract.
+export function messageAppended(to, from, messageKind, sourceLabel, content) {
+  const text = typeof content === "string" ? content : content.filter((block) => block.type === "text")
+    .map((block) => block.text).join("\n\n");
+  return { kind: "message_appended", to, from, messageKind, sourceLabel, label: true,
+    ...(messageKind === "relay" ? { relay: true } : {}),
+    contentSha256: createHash("sha256").update(text, "utf8").digest("hex"), chars: text.length };
+}
+
+// Native inbox delivery adds its own text blocks (sender attribution and, for
+// initial continuable prompts, return guidance). Audit the committed message
+// so the hash matches what the session actually contains, including that text.
+export function createMessageAudit(record) {
+  const pending = new Map();
+  const texts = (content) => typeof content === "string" ? [content] :
+    content.filter((block) => block.type === "text").map((block) => block.text);
+  const onEvent = (session, event) => {
+    const entries = pending.get(session.id);
+    if (!entries || event.type !== "user/message") return;
+    const actual = texts(event.data.content);
+    const index = entries.findIndex((entry) => actual.some((_text, start) =>
+      entry.texts.every((text, offset) => actual[start + offset] === text)));
+    if (index < 0) return;
+    const [entry] = entries.splice(index, 1);
+    if (!entries.length) pending.delete(session.id);
+    record(messageAppended(session.id, entry.from, entry.kind, entry.label, event.data.content));
+  };
+  const expect = (to, from, kind, label, content, session) => {
+    const entry = { from, kind, label, texts: texts(content) };
+    if (!pending.has(to)) pending.set(to, []);
+    pending.get(to).push(entry);
+    // One-shot start APIs return the generated child id after inbox acceptance.
+    // Its first prompt may already be committed; inspect only its own suffix.
+    if (session) for (const event of session.snapshotEvents().slice(session.inheritedEventCount)) onEvent(session, event);
+    return () => {
+      const entries = pending.get(to);
+      if (!entries) return;
+      const index = entries.indexOf(entry);
+      if (index >= 0) entries.splice(index, 1);
+      if (!entries.length) pending.delete(to);
+    };
+  };
+  return { expect, onEvent, clear: (id) => id === undefined ? pending.clear() : pending.delete(id),
+    async deliver(to, from, kind, label, content, send) {
+      const cancel = expect(to, from, kind, label, content);
+      try { return await send(); } catch (error) { cancel(); throw error; }
+    },
+  };
+}
+
+export const profileCandidates = (profiles) => profiles.map((profile) => ({ id: profile.id,
+  model: profile.options.model, provider: profile.options.provider,
+  efforts: profile.options.reasoningEffort === undefined ? [] : [profile.options.reasoningEffort] }));
+
 // Jev evaluates independent facts. These rules compose them with explicit
 // deployment limits; neither a preference score nor confidence is a quality guarantee.
 export const RELEVANCE = ['Adds little: unrelated, superseded, or repeated in retained content or another candidate.', 'Adds potentially useful evidence for the next step, but is not necessary.', 'Adds concrete evidence needed to resolve openQuestion, including a definition or source needed to interpret retained evidence.'];

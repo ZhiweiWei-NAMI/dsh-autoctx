@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { createClosedStepForkProvider } from "../seed.js";
 
 test("the host fork seeds only the completed plan turn and Session accepts it", {
   skip: !process.env.DSH_HOST_MODULES,
@@ -37,6 +38,14 @@ test("the host fork seeds only the completed plan turn and Session accepts it", 
   assert.equal(seed.at(-1).seq, end.seq);
   assert.equal(seed.some((event) => event.seq === notice.seq), false);
   assert.equal(seed.some((event) => event.type === "tool/call" && event.data.name === "plan"), true);
+  // No closed step in turn 2: AutoCTX calls the real native fallback and
+  // leaves that registered provider's completed-turn behavior untouched.
+  const prepared = [];
+  const routed = createClosedStepForkProvider({ getProvider: (name) => name === "fork" ? provider : undefined },
+    (_request, facts) => prepared.push(facts));
+  assert.deepEqual(await routed.prepareContinuable({ parent: { session: parent } }), { seed });
+  assert.deepEqual(prepared, [{ seeded: true, seedEvents: seed.length, seedBoundary: "completed-turn" }]);
+  assert.deepEqual(await provider.prepareContinuable({ parent: { session: parent } }), { seed });
   const child = Session.create("plan-child", seed);
   assert.equal(child.snapshotEvents().filter((event) => event.type === "tool/result").length, 1);
 });

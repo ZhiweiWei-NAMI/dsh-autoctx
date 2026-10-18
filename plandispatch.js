@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { fileState, emptyRouteLedger, routeKey, verifiedRouteFacts } from "./routeledger.js";
 import { STATE_BYTES } from "./decisions.js";
+import { messageAppended, createMessageAudit } from "./routing.js";
+import { childSeedFacts, sameRequestConfig } from "./seed.js";
 import {
   validatePlan, sameModelEffort, contextOptions, suitabilityQuestions, contextQuestions, childPrompt,
   planGuard, changedPaths, changesPlanFiles, workspacePath, assertWorkspaceFiles, sourceLabel, dispatcherLabel,
@@ -18,6 +20,7 @@ const describe = (assignment) => ({ subtask: assignment.task.id, model: assignme
 export function createPlanDispatcher({ ctx, config, record, note, decide, currentRoute, profilesFor,
   tokensOf, prefixOf, briefFor, graphFor, readLedger, learn, diffFiles, changesFilesCall }) {
   const roots = new Map(), children = new Map();
+  const messageAudit = createMessageAudit(record);
   const stateFor = (agent) => {
     const id = agent.session.header.parentSession ?? agent.session.id;
     if (!roots.has(id)) roots.set(id, { agent, planned: false, used: 0, jevCalls: 0, dispatches: [],
@@ -26,8 +29,7 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
   };
   const assignmentsOf = (state) => state.dispatches.flatMap((dispatch) => dispatch.assignments);
   const runningOf = (state) => assignmentsOf(state).filter((assignment) => ["starting", "running", "settling"].includes(assignment.status));
-  const appendRecord = (to, from, kind, content, label) => record({ kind: "message_appended", to, from,
-    messageKind: kind, ...(kind === "relay" ? { relay: true } : {}), label: true, sourceLabel: label, chars: content.length });
+  const appendRecord = (to, from, kind, content, label) => record(messageAppended(to, from, kind, label, content));
 
   async function ask(state, request, signal) {
     if (config.planRouting === "fixed") return null;
@@ -170,6 +172,7 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
   }
 
   function onEvent(session, event) {
+    messageAudit.onEvent(session, event);
     if (session.header.parentSession !== undefined || event.type !== "turn/end") return;
     const state = roots.get(session.id);
     if (!state) return;
@@ -215,8 +218,8 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
         outcome.structured ? JSON.stringify(outcome.structured) : outputText(outcome.output);
       const content = label + "\n" + body;
       try {
-        await ctx.subagents.sendMessage(state.agent, target.child, [{ type: "text", text: content }], { signal: state.signal });
-        appendRecord(target.child, finished.child, "relay", content, label);
+        await messageAudit.deliver(target.child, finished.child, "relay", label, content,
+          () => ctx.subagents.sendMessage(state.agent, target.child, [{ type: "text", text: content }], { signal: state.signal }));
       } catch (error) {
         record({ kind: "plan_relay_failed", to: target.child, from: finished.child, error: String(error) });
       }
@@ -281,9 +284,12 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
         assignment.status = "starting";
         assignment.startSequence = graphFor(assignment.child).sequence;
         if (!reuse) assignment.prefix = prefixOf(state.agent);
+        else assignment.childAgent = ctx.agents.get(assignment.child) ?? children.get(assignment.child)?.childAgent;
         children.set(assignment.child, assignment);
         const deps = dependencies(dispatch, assignment).map((dep) => ({ id: dep.task.id, ...dep.outcome }));
         const content = childPrompt({ session: state.agent.session.id, task: assignment.task, brief: assignment.brief, dependencies: deps });
+        const cancelMessage = messageAudit.expect(assignment.child, state.agent.session.id, "brief",
+          briefLabel(state.agent.session.id), content);
         try {
           if (reuse) {
             await ctx.subagents.sendMessage(state.agent, assignment.child, [{ type: "text", text: content }], { signal });
@@ -302,8 +308,10 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
               collect(state, assignment, { stopReason: "error", output: [{ type: "text", text: String(error) }] }))
               .catch(() => {});
           }
-          appendRecord(assignment.child, state.agent.session.id, "brief", content, briefLabel(state.agent.session.id));
           record({ kind: "child_start", id: assignment.child, parent: state.agent.session.id,
+            ...childSeedFacts(assignment.childAgent),
+            sameConfigAsParent: sameRequestConfig(reuse ? currentRoute(assignment.childAgent) : assignment.childAgent.options,
+              currentRoute(state.agent)),
             active: runningOf(state).length });
           const option = assignment.option;
           record({ kind: "child_assignment", session: state.agent.session.id, child: assignment.child,
@@ -312,6 +320,7 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
             estPrefixTokens: option.estPrefixTokens, estCachedTokens: option.estCachedTokens,
             estBriefTokens: option.estBriefTokens, sameSpace: option.sameSpace });
         } catch (error) {
+          cancelMessage();
           await collect(state, assignment, { stopReason: "error", output: [{ type: "text", text: String(error) }] });
           record({ kind: "plan_start_failed", child: assignment.child, subtask: assignment.task.id, error: String(error) });
         }
