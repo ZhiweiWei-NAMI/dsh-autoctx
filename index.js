@@ -50,6 +50,7 @@ import {
   knowledge,
   costUSD,
   jevCostUSD,
+  preferRoutes,
 } from "./models.js";
 import {
   emptyLedger,
@@ -171,6 +172,11 @@ export const Config = z.object({
       }),
     )
     .default([]),
+  preferredProviders: z
+    .array(z.string())
+    .default([])
+    .volatile()
+    .description("Providers whose models are used for executor-side roles whenever one fits; others are fallbacks. Jev keeps its own route"),
   modelRoutes: z
     .dict(z.string())
     .default({})
@@ -795,7 +801,11 @@ export function apply(ctx, options) {
   };
   const planProfiles = async (agent, signal) => {
     const profiles = [];
-    for (const route of config.routes?.length ? config.routes : [buildDefaultRoute(planRoute(agent))]) {
+    const configured = config.routes?.length ? config.routes : [buildDefaultRoute(planRoute(agent))];
+    const preference = preferRoutes(configured, (route) => route.provider ?? planRoute(agent).provider, config.preferredProviders);
+    if (preference.dropped.length)
+      record({ kind: "route_policy", session: agent.session.id, role: "worker", dropped: preference.dropped.map((route) => route.id) });
+    for (const route of preference.kept) {
       for (const effort of route.efforts?.length ? route.efforts : [undefined]) {
         const options = { provider: route.provider ?? planRoute(agent).provider, model: route.model,
           ...(effort === undefined ? {} : { reasoningEffort: effort }) };
@@ -1768,11 +1778,17 @@ export function apply(ctx, options) {
     // Hard capability only: the brief must fit the context window. Route availability was checked natively.
     const briefTokens = ctx.tokenMeter.estimateMessage(note(tasks.get(root) ?? "")) + 4000;
     const filtered = [...(filteredByRoot.get(root) ?? [])],
-      candidates = [];
+      fitting = [];
     for (const entry of available)
       if (Number.isFinite(entry.context) && entry.context < 2 * briefTokens)
         filtered.push({ model: entry.id, reason: "context window " + entry.context + " is below twice the brief" });
-      else candidates.push(entry);
+      else fitting.push(entry);
+    const preference = preferRoutes(fitting, (entry) => providerOf(agent, entry.id), config.preferredProviders);
+    for (const entry of preference.dropped)
+      filtered.push({ model: entry.id, reason: "a preferred-provider model fits this role (preferredProviders)" });
+    if (preference.dropped.length)
+      record({ kind: "route_policy", session: root, role, dropped: preference.dropped.map((entry) => entry.id) });
+    const candidates = preference.kept;
     const rowsNow = () => candidates.map((entry) => ({ model: entry.id, ...weight(entry.id) }));
     const rows = rowsNow();
     const fallback = () =>

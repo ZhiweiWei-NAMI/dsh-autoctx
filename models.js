@@ -62,6 +62,15 @@ export function availableModels(modelRoutes, { allowPaid = false } = {}) {
   });
 }
 
+// Route preference: when a model on a preferred provider meets the role's hard requirements, the others step aside.
+export function preferRoutes(items, providerOf, preferred = []) {
+  const list = Array.isArray(items) ? items : [];
+  const wanted = new Set(Array.isArray(preferred) ? preferred : []);
+  const kept = list.filter(item => wanted.has(providerOf(item)));
+  if (!wanted.size || !kept.length) return { kept: list, dropped: [] };
+  return { kept, dropped: list.filter(item => !wanted.has(providerOf(item))) };
+}
+
 // Fallback without a Jev answer: the highest effective ledger weight for this role, then the cheapest brief.
 // Family is information for Jev, not a ranking rule.
 export function pickModel(role, { available, exclude = [], weightOf } = {}) {

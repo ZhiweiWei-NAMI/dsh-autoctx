@@ -85,3 +85,16 @@ test('malformed entries are skipped by selection and knowledge stays lenient',()
     unmeasured+' | measured as executor: 3 resolved, 0 hit call cap');
   assert.equal(briefCost({id:'broken'}),Infinity);
 });
+
+test("preferRoutes keeps preferred-provider models when one fits and falls back otherwise", async () => {
+  const { preferRoutes } = await import("../models.js");
+  const routes = { "deepseek-v4-pro": "workbuddy", "glm-5.3": "workbuddy", "claude-haiku-5-5": "opencode-go-anthropic" };
+  const items = Object.keys(routes).map((id) => ({ id }));
+  const by = (item) => routes[item.id];
+  const preferred = preferRoutes(items, by, ["workbuddy"]);
+  assert.deepEqual(preferred.kept.map((item) => item.id), ["deepseek-v4-pro", "glm-5.3"]);
+  assert.deepEqual(preferred.dropped.map((item) => item.id), ["claude-haiku-5-5"]);
+  const only = preferRoutes([{ id: "claude-haiku-5-5" }], by, ["workbuddy"]);
+  assert.deepEqual(only, { kept: [{ id: "claude-haiku-5-5" }], dropped: [] });
+  assert.deepEqual(preferRoutes(items, by, []), { kept: items, dropped: [] });
+});
