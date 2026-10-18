@@ -39,7 +39,7 @@ def run_root_file(case, name):
 def prompt_hash(case):
     """sha256 of the exact harness prompt for this case (harness prompt_for, recorded task); the text is never written."""
     import importlib.util
-    harness = os.environ.get('BENCH_HARNESS_RUN', 'harness-plan/run.py')
+    harness = os.environ.get('BENCH_HARNESS_RUN', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eval-021', 'plan', 'run.py'))
     spec = importlib.util.spec_from_file_location('bench_run', harness)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
