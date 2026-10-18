@@ -1,12 +1,14 @@
 # dsh-autoctx
 
-Context and subagent decision plugin for dsh, version **1.2.5**. Jev scores options and makes structured choices; the plugin implements them through native dsh sessions, tools, subagents and compaction. The executor model still does all the coding.
+Context and subagent decision plugin for dsh, version **1.2.6**. Jev scores options and makes structured choices; the plugin implements them through native dsh sessions, tools, subagents and compaction. The executor model still does all the coding.
 
 [中文](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/README.md) · [Source](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
 
+1.2.6 adds explicit plan dispatch (`mode: plan`) with separately stored route learning; DSH GPT-family models on `openai-codex` as allowed alternatives with theoretical list-price cost; closed-step seeds from the parent's current turn and an inherited-context note for newly routed delegation children in `auto` mode; routed delegation ownership and parent result-consumption tracking; and prior overrides for configured-route capability text.
+
 ## Environment and accounts
 
-Unit tests pass on **dsh `0.2.0-rc.2` and `0.2.1-rc.2`**, using Node 22; the benchmark below ran on `0.2.0-rc.2`, and real smoke runs were verified on `0.2.1-rc.2`. Peer dependencies for the `@deepseek-ai/dsh-*` packages accept `^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1`. 1.2.5 decides thinking/effort at decision points per trigger, using evidence and a cost estimate per option, as detailed under “How it works”; compatibility with dsh 0.2.1's subagent start API (`startActivation`) and 0.2.0 is kept. The npm package is `dsh-autoctx`, its entry is `index.js`, and its web client is `./client.js`.
+Unit tests pass on **dsh `0.2.0-rc.2` and `0.2.1-rc.2`**, using Node 22; the new 1.2.6 benchmark below ran on **dsh `0.2.1-rc.2`**, the earlier 1.2.5 benchmark on `0.2.0-rc.2`, and real smoke runs were verified on `0.2.1-rc.2`. Peer dependencies for the `@deepseek-ai/dsh-*` packages accept `^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1`. The plugin decides thinking/effort at decision points per trigger, using evidence and a cost estimate per option, as detailed under “How it works”; compatibility with dsh 0.2.1's subagent start API (`startActivation`) and 0.2.0 is kept. The npm package is `dsh-autoctx`, its entry is `index.js`, and its web client is `./client.js`.
 
 You must provide:
 
@@ -14,7 +16,7 @@ You must provide:
 - **A Jev API key**: obtain a workspace key from [opencode.ai](https://opencode.ai) and set `apiKey`. This key is sent to `jevEndpoint`, which defaults to `https://opencode.ai/inference/v1/systemone`.
 - **Optional extra model routes**: if reviewer/advisor roles use other models, configure `modelRoutes` as model id → dsh provider name. Paid routes also require `allowPaidModels: true`.
 
-Without `apiKey`, the plugin makes no network call, the session runs in native mode, and it records `reason: 'no-api-key'`.
+Without `apiKey`, the plugin makes no Jev call; `auto` sessions run in native mode and record `reason: 'no-api-key'`, while `plan` uses fixed routing.
 
 ## Install and configure
 
@@ -29,9 +31,9 @@ Without `apiKey`, the plugin makes no network call, the session runs in native m
 2. Install from npm, or choose the GitHub release tag source.
 
    ```sh
-   dsh plugin --profile autoctx add dsh-autoctx
+   dsh plugin --profile autoctx add dsh-autoctx@1.2.6
    # Or use the release tag
-   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.5
+   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.6
    ```
 
    `dsh plugin --profile <name> <pnpm-args...>` passes arguments to pnpm. Profiles live in `$DSH_HOME/profiles/<name>`. The package's declared dsh bundle patch (`cordis.patch.yml`) mounts the plugin and disables native `compaction-basic`; no duplicate manual mount is needed.
@@ -61,7 +63,7 @@ Upgrade to the latest version, or pin this version:
 ```sh
 dsh plugin --profile autoctx add dsh-autoctx@latest
 # Or pin the version
-dsh plugin --profile autoctx add dsh-autoctx@1.2.5
+dsh plugin --profile autoctx add dsh-autoctx@1.2.6
 ```
 
 Before uninstalling, delete any `- id: dsh-autoctx` override you added to the profile's `cordis.patch.yml`, then run:
@@ -86,8 +88,8 @@ The composer card also lists the latest stored candidate pool per root-session r
 
 | Key | Default and meaning |
 | --- | --- |
-| `mode` | `auto`; choices: `auto`, `single`, `native` |
-| `apiKey` | Unset; native mode when unset |
+| `mode` | `auto`; choices: `auto`, `single`, `native`, `plan` |
+| `apiKey` | Unset; native mode in `auto` when unset, fixed routing in `plan` |
 | `jevModel` | `jev-1.13`, billed; `jev-1.13-free` is available but rate limited |
 | `jevEndpoint` | `https://opencode.ai/inference/v1/systemone` |
 | `modelRoutes` | `{}`; model id → dsh provider name |
@@ -118,7 +120,7 @@ The composer card also lists the latest stored candidate pool per root-session r
 
 **Decisions.** A plain single agent keeps one growing context; native subagents are chosen by the executor through spawn/fork, and native compaction summarizes old context. AutoCTX asks Jev for structured decisions at specific points. Jev is a scoring/choice model; it does not write plans or code. It decides whether a proposed delegation is worth a child and which route to use; gives a task tag and thinking policy at turn start; selects evidence under context pressure and chooses whether to replace context now or later, weighing the cost of re-reading uncached content against smaller later requests; and selects reviewer/advisor models when those roles are set to `auto`.
 
-Thinking policies are `off`, `decision_points`, or `always`; decision points are turn start, test failure, review/advisor report and stall. In 1.2.5, each trigger supplies evidence such as a failing-test output excerpt, diff hunk, review/advisor report text or task head, with an estimated cost per option at catalog prices: `skip` stays in the current cache space; `pulse` makes one high-effort request; `phase` keeps high effort until the trigger is resolved (test passes, report acted on, progress) or `effortPhaseRequests` requests. Cheap switches (estimated uncached re-read ≤ `effortSwitchFreeTokens`) and switches right after a context replacement proceed without asking Jev. Effort questions use their own `maxEffortDecisions` budget and never spend the 12 routing/context decisions in `maxDecisions`. Cache reuse is estimated from exact request prefixes, with no rewriting, reordering or dropping of context for cache; these runtime estimates are theoretical, not actual bills.
+Thinking policies are `off`, `decision_points`, or `always`; decision points are turn start, test failure, review/advisor report and stall. Since 1.2.5, each trigger supplies evidence such as a failing-test output excerpt, diff hunk, review/advisor report text or task head, with an estimated cost per option at catalog prices: `skip` stays in the current cache space; `pulse` makes one high-effort request; `phase` keeps high effort until the trigger is resolved (test passes, report acted on, progress) or `effortPhaseRequests` requests. Cheap switches (estimated uncached re-read ≤ `effortSwitchFreeTokens`) and switches right after a context replacement proceed without asking Jev. Effort questions use their own `maxEffortDecisions` budget and never spend the 12 routing/context decisions in `maxDecisions`. Cache reuse is estimated from exact request prefixes, with no rewriting, reordering or dropping of context for cache; these runtime estimates are theoretical, not actual bills.
 
 A transient Jev gateway/network failure is retried once, then Jev pauses for 60 seconds. Authentication, billing or HTTP 429 stops Jev for the task, and local fallbacks take over: native compaction and no delegation.
 
@@ -134,13 +136,71 @@ A transient Jev gateway/network failure is retried once, then Jev pauses for 60 
 - `auto` (BETA, off by default): applies bounded updates automatically.
 - `manual`: collects proposals into one approval card.
 
-Automatic learning is expected to maintain quality while lowering cost over time, but that has not been demonstrated; auto did not outperform frozen in this benchmark.
+Automatic learning is expected to maintain quality while lowering cost over time, but that has not been demonstrated; auto did not outperform frozen in the earlier 1.2.5 evaluation below.
 
 ## Extra calls and cost
 
-Jev calls, reviewer/advisor children and their executor-model calls, and the turn-end learning call all cost money on your own API accounts. These are not free services. The model table in `models.json` lists catalog prices for `jev-1.13` at **$0.042 per 1 million input tokens, $0 for output tokens**; `jev-1.13-free` is rate limited. Benchmark costs below are theoretical estimates at catalog prices, not actual bills (defined in the benchmark section). Over the 72 cases, 1.2.5 makes 368 Jev calls versus 233 for 1.2.3 frozen; these calls also count toward a task's request limit.
+Jev calls, reviewer/advisor children and their executor-model calls, and the turn-end learning call all cost money on your own API accounts. These are not free services. The model table in `models.json` lists catalog prices for `jev-1.13` at **$0.042 per 1 million input tokens, $0 for output tokens**; `jev-1.13-free` is rate limited. Benchmark costs below are theoretical estimates at catalog prices, not actual bills (defined in the benchmark section). In the new 1.2.6 evaluation, DeepSeek A averages 12.1 Jev requests per case and GPT A 5.9; Jev is excluded from the 256 execution-request cap and has its own allowance of 32. In the earlier 1.2.5 evaluation, 72 cases made 368 Jev calls versus 233 for 1.2.3 frozen; those calls counted toward the old 64-request cap.
 
 ## Benchmark results and limitations
+
+**Theoretical cost basis.** All cost and cache figures below are **theoretical estimates at catalog prices, not actual bills**. Provider-reported cache hits vary with routing, accounts and eviction, so all arms are compared on the prompt cache they could reuse given exactly what they sent, with identical assumptions and prices: a request reuses the longest prefix it shares with an earlier request of the same task in the same cache space (model + thinking/effort config [+ tools]); no expiry within a task. Uncached input uses the catalog input price (cache-write price where listed), reused input the cache-read price, and output the output price; Jev is $0.042/M input, output free; executor, child and Jev costs are all included. This benchmark's no-expiry-within-task assumption differs from the runtime lifetime assumption in `cacheTtlSeconds`.
+
+### 1.2.6 on dsh 0.2.1-rc.2, execution request cap 256 excluding Jev
+
+The same **12 fixed SWE-bench Verified pytest tasks × 2 executors × 2 repeats** give 24 cases per executor per arm, **144 graded cases** in total. The official SWE-bench harness **v4.1.0** decides resolved; a finished run or HTTP 200 is not a pass. See [bench/eval-021/README.md](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/bench/eval-021/README.md) for the harness and `bench/full_report.py` for the report.
+
+| Arm | Configuration |
+| --- | --- |
+| B | Single agent, plugin off; explicitly told not to delegate |
+| C | Native spawn/fork subagents with the executor model, plugin off |
+| A | AutoCTX 1.2.6 (the release differs from the evaluated build, commit `5679358`, only in two UI hint strings and the version number), `mode: auto`, learning frozen, reviewer before finish off, advisor off |
+
+C and A receive the same one-sentence delegation instruction: “Split the task into subtasks and delegate suitable subtasks to subagents with the subagent or subagent_fork tools, then integrate their results and verify the final change yourself.”
+
+| Executor | Harness | AutoCTX extra models |
+| --- | --- | --- |
+| `deepseek-v4.1-flash` | Container harness, 3 cases in parallel | `deepseek-v4-flash`, `glm-5.3-flash`, `deepseek-v4-pro`, `glm-5.3` |
+| `gpt-6.1-sol` | DSH `openai-codex` route, host-native harness; shell commands run in the task container | `gpt-6-sol`, `gpt-5.6-luna`, `gpt-6-luna`, `deepseek-v4.1-flash`, `glm-5.3-flash` |
+
+Jev is `jev-1.13`. Common limits for every arm: **600 seconds per case, 256 execution requests (Jev excluded; its separate allowance is 32), at most 2 children / 2 concurrent children**. Only 3 cases, all DeepSeek C, reached the 256 cap. Every arm uses `exact` theoretical cost with the catalog prices, exact-prefix reuse and identical assumptions above, not actual bills.
+
+Transport errors through the network proxy, provider 402 quota responses, and arm-A Jev calls that failed again after the plugin's own retry (`jev_unavailable`) make a case infra-affected. Such attempts were archived, never deleted, and rerun fresh, up to 3 rounds plus a final sweep. Final: **144/144 valid**. Cases rerun (archived attempts): DeepSeek A **11 (16)**, GPT C **3 (8)**, GPT A **5 (9)**, all others 0; early DeepSeek A used a stricter rule that archived any failed Jev attempt. Longer runs are more likely to hit a transient error, so a sensitivity table also excludes any pair where either arm was rerun.
+
+All costs below are theoretical estimates. Non-finished counts solver timeouts/errors; resolved is decided independently by the harness from the exported patch, so the two counts can overlap.
+
+| Executor | Arm | Resolved /24 | Non-finished (timeouts etc.) | Mean wall s | Mean USD/case | Total USD | USD per resolved | Mean exec req | Mean children |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| deepseek-v4.1-flash | B | 14 | 12 | 367 | 0.034 | 0.83 | 0.059 | 78 | 0 |
+| deepseek-v4.1-flash | C | 13 | 13 (10 timeouts, 3 agent errors at the request cap) | 452 | 0.076 | 1.83 | 0.141 | 139 | 1.46 |
+| deepseek-v4.1-flash | A | 18 | 9 | 416 | 0.095 | 2.27 | 0.126 | 107 (+12.1 Jev) | 1.38 |
+| gpt-6.1-sol | B | 18 | 1 | 460 | 0.163 | 3.91 | 0.217 | 25 | 0 |
+| gpt-6.1-sol | C | 18 | 4 | 492 | 0.363 | 8.71 | 0.484 | 57 | 1.58 |
+| gpt-6.1-sol | A | 18 | 3 | 490 | 0.229 | 5.50 | 0.306 | 77 (+5.9 Jev) | 1.29 |
+
+Pairs match the same task and repeat; differences are **A minus the other arm**. The 95% intervals are percentile bootstrap intervals over the 12 task means; p is exact McNemar on discordant pairs. Resolved differences are proportions.
+
+| Executor / comparison | A-only / other-only / both / neither | Resolved diff [95% CI] | McNemar p | Wall diff s [95% CI] | USD/case diff [95% CI] | A cheaper |
+| --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek A vs B | 5 / 1 / 13 / 5 | +0.17 [0.00, 0.33] | 0.22 | +48 [−45, +141] | +0.060 [+0.037, +0.086] | 3/24 |
+| DeepSeek A vs C | 5 / 0 / 13 / 6 | +0.21 [0.08, 0.33] | 0.063 | −36 [−133, +51] | +0.019 [+0.001, +0.037] | 9/24 |
+| GPT A vs B | 0 / 0 / 18 / 6 | 0 (identical outcomes) | — | +30 [+1, +56] | +0.066 [+0.024, +0.126] | 3/24 |
+| GPT A vs C | 0 / 0 / 18 / 6 | 0 (identical outcomes) | — | −2 [−23, +18] | −0.134 [−0.175, −0.098] | 24/24 |
+
+GPT A was faster than B in 5/24 pairs. Sensitivity excluding any pair where either arm was rerun:
+
+| Comparison | Resolved diff [95% CI] | USD/case diff [95% CI] | Pair detail |
+| --- | --- | --- | --- |
+| DeepSeek A vs B | +0.11 [−0.11, 0.39] | +0.069 [+0.026, +0.121] | 13 pairs; A-only / B-only 2/1 |
+| DeepSeek A vs C | +0.22 [0.06, 0.44] | +0.032 [+0.005, +0.059] | 13 pairs; A-only / C-only 3/0, p=0.25 |
+| GPT A vs B | 0 | +0.037 [+0.014, +0.064] | Resolved outcomes remain identical |
+| GPT A vs C | 0 | −0.135 [−0.182, −0.093] | A cheaper in 16/16 pairs |
+
+With `deepseek-v4.1-flash`, AutoCTX resolved more cases (18 vs 14 and 13), but the paired differences are not statistically significant at 24 cases (p=0.22 and 0.063); without rerun pairs the difference against B shrinks (+0.11 over 13 pairs) and the one against C stays similar (+0.22, p=0.25). Theoretical cost per case is about 2.8× B and 1.25× C; per resolved case it is cheaper than C and about 2× B. Many DeepSeek cases hit the 600-second timeout in every arm.
+
+With `gpt-6.1-sol`, all three arms resolved the same 18 cases. AutoCTX costs about 37% less than native subagents C (cheaper in 24/24 pairs) at similar wall time; it costs about 40% more than single-agent B and is about 30 seconds slower on average. This is one set of 12 pytest tasks, 2 executors and 2 repeats, with the infra reruns above, not evidence of general superiority.
+
+### 1.2.5 on dsh 0.2.0-rc.2, request cap 64 including Jev (earlier evaluation)
 
 These results describe this run, not general superiority. Every arm uses the same **72 graded cases = 12 fixed SWE-bench Verified pytest tasks (`bench/tasks.json`) × 3 executor models × 2 runs per model**. Executors are `deepseek-v4.1-flash`, `glm-5.3-flash` and `deepseek-v4-flash`. The official SWE-bench harness **v4.1.0** decides resolved; a finished run or HTTP 200 is not a pass.
 
@@ -155,8 +215,6 @@ Shared limits are **600 seconds per task, 64 model requests per task (Jev includ
 | AutoCTX 1.2.3 frozen / auto | Previous release, same harness; reviewer `auto`, advisor `auto`, the same 3 extra models, `jev-1.13`; frozen and auto learning respectively; auto carries the ledger across cases within a run |
 
 The 3 extra models are `glm-5.3-flash` (use `deepseek-v4.1-flash` when the executor is glm), `deepseek-v4-pro` and `claude-haiku-5-5`. 1.2.5 ran on dsh `0.2.0-rc.2`, the same host version as 1.2.3/B/C/H. B/C/H do not load the plugin and were run before 1.2.3. B/C used the same harness entry as AutoCTX; H run 1 used an earlier harness snapshot (its `run.py` differs) with the same tasks and shared limits above.
-
-**Theoretical cost basis.** All cost and cache figures below are **theoretical estimates at catalog prices, not actual bills**. Provider-reported cache hits vary with routing, accounts and eviction, so all arms are compared on the prompt cache they could reuse given exactly what they sent, with identical assumptions and prices: a request reuses the longest prefix it shares with an earlier request of the same task in the same cache space (model + thinking/effort config [+ tools]); no expiry within a task. Uncached input uses the catalog input price (cache-write price where listed), reused input the cache-read price, and output the output price; Jev is $0.042/M input, output free; executor, child and Jev costs are all included. This benchmark's no-expiry-within-task assumption differs from the runtime lifetime assumption in `cacheTtlSeconds`.
 
 Two measurement methods: `exact` uses per-message prefix hashes recorded by the bench observer (AutoCTX 1.2.x runs). B/C/H were recorded before prefix hashes existed, so they use a `log` reconstruction (append-only growth per session; an input drop marks a context rewrite). Validation by re-running B and C on 12 tasks with `deepseek-v4.1-flash` and prefix hashes (24 cases): `log` gave 2.4% (B) and 3.1% (C) lower cost than `exact`; on AutoCTX it gives about 11% lower cost, because context replacement changes earlier prompt content without necessarily shrinking it. The baseline theoretical figures below are therefore probably ~3% low, and the AutoCTX premium is slightly overstated rather than understated.
 
@@ -187,9 +245,60 @@ AutoCTX resolves more cases than B, C and H on this sample and costs more; on th
 
 In the auto run, 49 completed turns reached learning: 35/49 were judged unassessable and left weights unchanged; 14/49 applied small updates. Auto did not outperform frozen here.
 
-Only these 12 pytest tasks and 3 flash executors were measured; between repeats, resolved counts vary by about ±2 cases per 12-task run. AutoCTX costs more than the baselines here on the theoretical cost basis; auto learning remains beta and off by default. There is also a host limitation: a fork created mid-turn is seeded only with completed turns, so the review brief must carry the current turn's evidence itself.
+Only these 12 pytest tasks and 3 flash executors were measured; between repeats, resolved counts vary by about ±2 cases per 12-task run. AutoCTX costs more than the baselines here on the theoretical cost basis; auto learning remains beta and off by default. The host's native fork still seeds only completed turns. In `mode: auto`, newly created delegation children intercepted and routed by AutoCTX also receive the parent's closed steps of the current turn via closed-step seed (excluding the delegating step), plus an inherited-context note. Reviewer/helper and plan children keep their existing seed paths; review briefs still carry current-turn evidence.
 
 ## Reproduce
+
+### 1.2.6
+
+Prepare dsh `0.2.1-rc.2`, containers and dataset, model connections and native host `openai-codex` authentication as described in [bench/eval-021/README.md](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/bench/eval-021/README.md). Set `DSH_BENCH_NODE` to the corresponding Node installation and `DSH_BENCH_ROOT` to the bench directory containing `evaluator/`. `$WITH_KEYS` is your own wrapper that supplies `JEV_API_KEY` to its command. Run from the repository root, without `--plan-routing` or `--plan-review`:
+
+```sh
+R=results/eval-1.2.6
+$WITH_KEYS sh -c 'OPENCODE_API_KEY=$JEV_API_KEY exec python3 bench/eval-021/plan/run.py "$@"' sh \
+  --model deepseek-v4.1-flash --arms A --tasks bench/eval-021/plan/tasks.json \
+  --out "$R/deepseek-v4.1-flash/A" --plugin . --parallel 3 --repeat 2 --request-limit 256 \
+  --extra-models deepseek-v4-flash,glm-5.3-flash,deepseek-v4-pro,glm-5.3 \
+  --max-usd 0.50 --jev-model jev-1.13 --learning frozen
+for arm in B C; do
+  $WITH_KEYS python3 bench/eval-021/plan/run.py --model deepseek-v4.1-flash --arms "$arm" \
+    --tasks bench/eval-021/plan/tasks.json --out "$R/deepseek-v4.1-flash/$arm" --plugin . \
+    --parallel 3 --repeat 2 --request-limit 256 --max-usd 0.50
+done
+for arm in B C A; do
+  for repeat in 1 2; do
+    for lane in 1 2; do
+      $WITH_KEYS python3 bench/eval-021/host/run_one.py --model gpt-6.1-sol --arm "$arm" \
+        --tasks "bench/eval-021/plan/task-full-lane$lane.json" --out "$R/gpt-6.1-sol/$arm-r$repeat-lane$lane" \
+        --plugin . --request-limit 256 --jev-model jev-1.13 \
+        --extra-models gpt-6-sol,gpt-5.6-luna,gpt-6-luna,deepseek-v4.1-flash,glm-5.3-flash
+    done
+  done
+done
+```
+
+Use `affected.py` on each output root to check and archive infra-affected cases; for example:
+
+```sh
+RUN="$R/gpt-6.1-sol/A-r1-lane1"
+python3 bench/eval-021/affected.py "$RUN" \
+  --archive "$R/_infra-archive/gpt-6.1-sol/A-r1-lane1" --tasks-out "$RUN/affected-tasks.json"
+```
+
+Rerun only when the printed affected-task count is nonzero. For DeepSeek, resume the original command after archiving. For GPT, use `--tasks "$RUN/affected-tasks.json"` and a fresh sibling `--out` directory such as `A-r1-lane1-retry1`, retaining the arm, repeat and lane markers. Recheck each round, up to 3 rounds plus a final sweep. Keep archives under `$R/_infra-archive/<executor>/...` so the report can count reruns. Then grade the original and rerun directories and generate the report:
+
+```sh
+for run in "$R/deepseek-v4.1-flash/"* "$R/gpt-6.1-sol/"*; do
+  python3 bench/eval-021/plan/grade.py "$run" --parallel 3
+done
+python3 bench/full_report.py "$R" --json "$R/report.json" --md "$R/report.md"
+```
+
+`bench/full_report.py` (i.e. `bench/eval-021/../full_report.py`) recursively collects results, excludes archives and reports task-paired comparisons and sensitivity without rerun pairs. Costs are theoretical estimates, not actual bills.
+
+### 1.2.5
+
+The earlier evaluation commands are retained below; use a 1.2.5 checkout.
 
 From the repository, prepare the prerequisites in [bench/README.md](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/bench/README.md), including Docker and SWE-bench images, a model gateway and `JEV_API_KEY`, then run:
 
@@ -208,4 +317,4 @@ Replace `<dir>` with an output directory. A is AutoCTX; use separate directories
 
 ## Upgrading from older versions
 
-Install 1.2.5 using the upgrade steps above and check profile overrides against the current configuration table. Do not carry over the old README's default model or installation tag: the current default is billed `jev-1.13`, and the release tag is `v1.2.5`.
+Install 1.2.6 using the upgrade steps above and check profile overrides against the current configuration table. Do not carry over the old README's default model or installation tag: the current default is billed `jev-1.13`, and the release tag is `v1.2.6`.

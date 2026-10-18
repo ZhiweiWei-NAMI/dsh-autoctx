@@ -1,12 +1,14 @@
 # dsh-autoctx
 
-面向 dsh 的上下文与子代理决策插件，版本 **1.2.5**。Jev 负责评分和结构化选择，插件通过 dsh 原生会话、工具、子代理和压缩执行决策；编码仍由执行模型完成。
+面向 dsh 的上下文与子代理决策插件，版本 **1.2.6**。Jev 负责评分和结构化选择，插件通过 dsh 原生会话、工具、子代理和压缩执行决策；编码仍由执行模型完成。
 
 [English](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/README.en.md) · [源码](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
 
+1.2.6 新增显式计划调度 `mode: plan`，路由学习独立存储；DSH `openai-codex` 路由的 GPT 系列可作为允许的备选模型，费用按目录价理论估算；`auto` 模式下新建的路由委派子代理继承父代理当前回合已闭合步骤并收到继承上下文说明；跟踪委派归属与父代理对结果的接收；先验覆盖也用于配置路由的能力文本。
+
 ## 环境与所需账号
 
-单元测试通过的宿主为 **dsh `0.2.0-rc.2` 与 `0.2.1-rc.2`**，使用 Node 22；下方基准运行于 `0.2.0-rc.2`，真实 smoke 运行已在 `0.2.1-rc.2` 验证。`@deepseek-ai/dsh-*` 包的 peer dependency 范围为 `^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1`。1.2.5 按每次触发的证据和各选项成本估算决定决策点的思考强度，细节见「工作方式」；保留对 dsh 0.2.1 子代理启动接口（`startActivation`）及 0.2.0 的兼容。npm 包名为 `dsh-autoctx`，入口为 `index.js`，Web 客户端为 `./client.js`。
+单元测试通过的宿主为 **dsh `0.2.0-rc.2` 与 `0.2.1-rc.2`**，使用 Node 22；下方新 1.2.6 基准运行于 **dsh `0.2.1-rc.2`**，旧 1.2.5 基准运行于 `0.2.0-rc.2`；真实 smoke 运行已在 `0.2.1-rc.2` 验证。`@deepseek-ai/dsh-*` 包的 peer dependency 范围为 `^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1`。插件按每次触发的证据和各选项成本估算决定决策点的思考强度，细节见「工作方式」；保留对 dsh 0.2.1 子代理启动接口（`startActivation`）及 0.2.0 的兼容。npm 包名为 `dsh-autoctx`，入口为 `index.js`，Web 客户端为 `./client.js`。
 
 你需要提供：
 
@@ -14,7 +16,7 @@
 - **Jev API key**：在 [opencode.ai](https://opencode.ai) 获取 workspace key，填写 `apiKey`。该 key 发送至 `jevEndpoint`，默认地址为 `https://opencode.ai/inference/v1/systemone`。
 - **可选的其他模型路由**：若 reviewer/advisor 使用其他模型，在 `modelRoutes` 中配置「模型 id → dsh provider 名称」；付费路由还需要 `allowPaidModels: true`。
 
-未配置 `apiKey` 时，插件不发起网络调用，会话按原生模式运行，并记录 `reason: 'no-api-key'`。
+未配置 `apiKey` 时，插件不发起 Jev 调用；`auto` 会话按原生模式运行，并记录 `reason: 'no-api-key'`，`plan` 模式使用固定路由。
 
 ## 安装与配置
 
@@ -29,9 +31,9 @@
 2. 从 npm 安装，或选择 GitHub 发布标签来源。
 
    ```sh
-   dsh plugin --profile autoctx add dsh-autoctx
+   dsh plugin --profile autoctx add dsh-autoctx@1.2.6
    # 或使用发布标签
-   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.5
+   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.6
    ```
 
    `dsh plugin --profile <name> <pnpm-args...>` 把参数传给 pnpm。Profile 位于 `$DSH_HOME/profiles/<name>`。包声明的 dsh bundle patch（`cordis.patch.yml`）会挂载插件并停用原生 `compaction-basic`，无需手工重复挂载。
@@ -61,7 +63,7 @@ dsh --profile autoctx --patch "$DSH_HOME/profiles/autoctx/node_modules/dsh-autoc
 ```sh
 dsh plugin --profile autoctx add dsh-autoctx@latest
 # 或固定版本
-dsh plugin --profile autoctx add dsh-autoctx@1.2.5
+dsh plugin --profile autoctx add dsh-autoctx@1.2.6
 ```
 
 卸载前，先删除自己在 profile 的 `cordis.patch.yml` 中添加的 `- id: dsh-autoctx` 覆盖项，再执行：
@@ -86,8 +88,8 @@ Web 界面：左下角 **更多 → 设置 → DSH AutoCTX**。表单覆盖当�
 
 | 配置键 | 默认值与含义 |
 | --- | --- |
-| `mode` | `auto`；可选 `auto`、`single`、`native` |
-| `apiKey` | 未设置；未设置时使用原生模式 |
+| `mode` | `auto`；可选 `auto`、`single`、`native`、`plan` |
+| `apiKey` | 未设置；`auto` 下未设置时使用原生模式，`plan` 使用固定路由 |
 | `jevModel` | `jev-1.13`，计费；`jev-1.13-free` 可用但有限流 |
 | `jevEndpoint` | `https://opencode.ai/inference/v1/systemone` |
 | `modelRoutes` | `{}`；模型 id → dsh provider 名称 |
@@ -118,7 +120,7 @@ Web 界面：左下角 **更多 → 设置 → DSH AutoCTX**。表单覆盖当�
 
 **决策。** 普通单代理持续累积一份上下文；原生子代理由执行模型自行选择 spawn/fork，原生压缩总结旧上下文。AutoCTX 在特定节点向 Jev 请求结构化决策。Jev 是评分/选择模型，不编写计划或代码。它判断拟议委派是否值得创建子代理及采用哪条路由；在回合开始给出任务标签与思考策略；在上下文压力下选择证据并判断现在还是稍后替换上下文，权衡重新读取未缓存内容的成本与后续请求缩小的收益；当角色设为 `auto` 时选择 reviewer/advisor 模型。
 
-思考策略为 `off`、`decision_points` 或 `always`；决策点包括回合开始、测试失败、审查/顾问报告和停滞。1.2.5 为每次触发提供失败测试输出摘录、diff hunk、审查/顾问报告文本或任务开头等证据，并按目录价给出各选项的估算成本：`skip` 留在当前缓存空间；`pulse` 仅一次高强度请求；`phase` 保持高强度，直到触发问题解决（测试通过、报告已处理、取得进展）或达到 `effortPhaseRequests` 次请求。预计未缓存重读量不超过 `effortSwitchFreeTokens` 的低成本切换，以及紧接上下文替换后的切换，不询问 Jev。思考决策使用独立的 `maxEffortDecisions`，不占用 `maxDecisions` 的 12 次路由/上下文决策。缓存复用按实际请求的精确前缀估算，不为缓存改写、重排或丢弃上下文；这些运行时估算均为理论值，非实际账单。
+思考策略为 `off`、`decision_points` 或 `always`；决策点包括回合开始、测试失败、审查/顾问报告和停滞。自 1.2.5 起，每次触发提供失败测试输出摘录、diff hunk、审查/顾问报告文本或任务开头等证据，并按目录价给出各选项的估算成本：`skip` 留在当前缓存空间；`pulse` 仅一次高强度请求；`phase` 保持高强度，直到触发问题解决（测试通过、报告已处理、取得进展）或达到 `effortPhaseRequests` 次请求。预计未缓存重读量不超过 `effortSwitchFreeTokens` 的低成本切换，以及紧接上下文替换后的切换，不询问 Jev。思考决策使用独立的 `maxEffortDecisions`，不占用 `maxDecisions` 的 12 次路由/上下文决策。缓存复用按实际请求的精确前缀估算，不为缓存改写、重排或丢弃上下文；这些运行时估算均为理论值，非实际账单。
 
 临时 Jev 网关/网络失败会重试一次，随后暂停 Jev 60 秒；认证、计费或 HTTP 429 会停止该任务的 Jev 调用，由本地回退接管：原生压缩、不委派。
 
@@ -134,13 +136,71 @@ Web 界面：左下角 **更多 → 设置 → DSH AutoCTX**。表单覆盖当�
 - `auto`（BETA，默认关闭）：自动应用有界更新。
 - `manual`：将提案汇集到一张审批卡片。
 
-自动学习有望随时间在保持质量的同时降低成本，但这只是预期，尚未展示；本次基准中 auto 未超过 frozen。
+自动学习有望随时间在保持质量的同时降低成本，但这只是预期，尚未展示；下方旧 1.2.5 评测中 auto 未超过 frozen。
 
 ## 额外调用与费用
 
-Jev 调用、reviewer/advisor 子代理及其执行模型调用、回合结束时的学习调用，均由用户自己的 API 账号承担费用，不是免费服务。`models.json` 模型表中 `jev-1.13` 的目录价为 **每 100 万输入 tokens $0.042，输出 tokens $0**；`jev-1.13-free` 有限流。下方基准费用均为按目录价的理论估算，非实际账单（定义见基准一节）。1.2.5 在 72 个案例中调用 Jev 368 次，1.2.3 frozen 为 233 次；这些调用也占用任务请求上限。
+Jev 调用、reviewer/advisor 子代理及其执行模型调用、回合结束时的学习调用，均由用户自己的 API 账号承担费用，不是免费服务。`models.json` 模型表中 `jev-1.13` 的目录价为 **每 100 万输入 tokens $0.042，输出 tokens $0**；`jev-1.13-free` 有限流。下方基准费用均为按目录价的理论估算，非实际账单（定义见基准一节）。新 1.2.6 评测中，DeepSeek A 每案例平均 12.1 次 Jev 请求，GPT A 为 5.9 次；Jev 不占用 256 次执行请求上限，单独最多 32 次。旧 1.2.5 在 72 个案例中调用 Jev 368 次，1.2.3 frozen 为 233 次；旧评测的 Jev 调用占用 64 次任务请求上限。
 
 ## 基准结果与限制
+
+**理论费用依据。** 下文所有费用与缓存数据均为**按目录价的理论估算，非实际账单**。提供方报告的缓存命中受路由、账号和驱逐影响，因此各组按实际发送的 prompt 可复用的缓存，以相同假设和价格比较：请求复用同任务、同缓存空间（模型 + thinking/effort 配置［+ tools］）内与此前请求共享的最长前缀；任务内不设过期。未缓存输入按目录输入价（列有缓存写入价时用写入价），复用输入按缓存读取价，输出按输出价；Jev 输入 $0.042/百万 tokens，输出免费；包含执行模型、子代理及 Jev 的全部费用。此基准的任务内不设过期假设与运行时 `cacheTtlSeconds` 的寿命假设不同。
+
+### 1.2.6：dsh 0.2.1-rc.2，执行请求上限 256（不含 Jev）
+
+同一组 **12 个固定 SWE-bench Verified pytest 任务 × 2 个执行模型 × 2 次重复**，每执行模型、每组 24 个案例，共 **144 个评分案例**。官方 SWE-bench harness **v4.1.0** 判定 resolved；运行完成或 HTTP 200 均不等于通过。Harness 见 [bench/eval-021/README.md](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/bench/eval-021/README.md)，报告脚本为 `bench/full_report.py`。
+
+| 组别 | 配置 |
+| --- | --- |
+| B | 单代理，插件关闭；明确要求不委派 |
+| C | 执行模型的原生 spawn/fork 子代理，插件关闭 |
+| A | AutoCTX 1.2.6（发布版与评测构建 `5679358` 仅相差两条 UI 提示文案和版本号），`mode: auto`、学习 frozen、结束前 reviewer 关闭、advisor 关闭 |
+
+C 与 A 收到相同的一句委派指令：“Split the task into subtasks and delegate suitable subtasks to subagents with the subagent or subagent_fork tools, then integrate their results and verify the final change yourself.”
+
+| 执行模型 | Harness | AutoCTX 额外模型 |
+| --- | --- | --- |
+| `deepseek-v4.1-flash` | 容器内运行，3 个案例并行 | `deepseek-v4-flash`、`glm-5.3-flash`、`deepseek-v4-pro`、`glm-5.3` |
+| `gpt-6.1-sol` | DSH `openai-codex` 路由，宿主原生运行；shell 命令在任务容器内执行 | `gpt-6-sol`、`gpt-5.6-luna`、`gpt-6-luna`、`deepseek-v4.1-flash`、`glm-5.3-flash` |
+
+Jev 为 `jev-1.13`。各组共同限制：**每案例 600 秒、256 次执行请求（不含 Jev；Jev 单独最多 32 次）、最多 2 个子代理 / 2 个并发子代理**。只有 DeepSeek C 的 3 个案例达到 256 次上限。所有组均用 `exact` 方法计算理论费用，采用上述目录价、精确前缀复用和相同假设，非实际账单。
+
+经网络代理的传输错误、提供方 402 配额响应，以及 A 中插件自身重试后仍失败的 Jev 调用（`jev_unavailable`），均记为基础设施影响案例，归档保留后重新运行，最多 3 轮，另做一次最终清扫。最终 **144/144 有效**。重跑案例数（归档尝试数）：DeepSeek A 为 **11（16）**，GPT C 为 **3（8）**，GPT A 为 **5（9）**，其余为 0；DeepSeek A 早期曾按更严格的「任何 Jev 失败尝试都归档」规则处理。较长运行更容易遇到临时错误，因此另列去除任何一方曾重跑的配对后的敏感性结果。
+
+下表费用均为理论估算。未完成计数指求解运行的超时或错误状态；resolved 则由 harness 对导出的补丁独立判定，两者可以重叠。
+
+| 执行模型 | 组别 | Resolved /24 | 未完成（超时等） | 平均墙钟秒 | 平均 USD/案例 | 总 USD | USD/resolved | 平均执行请求 | 平均子代理数 |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| deepseek-v4.1-flash | B | 14 | 12 | 367 | 0.034 | 0.83 | 0.059 | 78 | 0 |
+| deepseek-v4.1-flash | C | 13 | 13（10 次超时，3 次请求触顶后的代理错误） | 452 | 0.076 | 1.83 | 0.141 | 139 | 1.46 |
+| deepseek-v4.1-flash | A | 18 | 9 | 416 | 0.095 | 2.27 | 0.126 | 107（另加 12.1 Jev） | 1.38 |
+| gpt-6.1-sol | B | 18 | 1 | 460 | 0.163 | 3.91 | 0.217 | 25 | 0 |
+| gpt-6.1-sol | C | 18 | 4 | 492 | 0.363 | 8.71 | 0.484 | 57 | 1.58 |
+| gpt-6.1-sol | A | 18 | 3 | 490 | 0.229 | 5.50 | 0.306 | 77（另加 5.9 Jev） | 1.29 |
+
+按同任务、同重复配对，差值为 **A 减对照组**；95% 区间为对 12 个任务均值做 percentile bootstrap，p 为不一致配对的精确 McNemar 检验。Resolved 差为比例差。
+
+| 执行模型 / 对照 | 仅 A / 仅对照 / 均解决 / 均未解决 | Resolved 差 [95% CI] | McNemar p | 墙钟差秒 [95% CI] | USD/案例差 [95% CI] | A 更便宜 |
+| --- | --- | --- | --- | --- | --- | --- |
+| DeepSeek A vs B | 5 / 1 / 13 / 5 | +0.17 [0.00, 0.33] | 0.22 | +48 [−45, +141] | +0.060 [+0.037, +0.086] | 3/24 |
+| DeepSeek A vs C | 5 / 0 / 13 / 6 | +0.21 [0.08, 0.33] | 0.063 | −36 [−133, +51] | +0.019 [+0.001, +0.037] | 9/24 |
+| GPT A vs B | 0 / 0 / 18 / 6 | 0（结果相同） | — | +30 [+1, +56] | +0.066 [+0.024, +0.126] | 3/24 |
+| GPT A vs C | 0 / 0 / 18 / 6 | 0（结果相同） | — | −2 [−23, +18] | −0.134 [−0.175, −0.098] | 24/24 |
+
+GPT A vs B 中，A 在 5/24 个配对中更快。去除任何一方曾重跑的配对后：
+
+| 对照 | Resolved 差 [95% CI] | USD/案例差 [95% CI] | 配对说明 |
+| --- | --- | --- | --- |
+| DeepSeek A vs B | +0.11 [−0.11, 0.39] | +0.069 [+0.026, +0.121] | 13 对；仅 A / 仅 B 为 2/1 |
+| DeepSeek A vs C | +0.22 [0.06, 0.44] | +0.032 [+0.005, +0.059] | 13 对；仅 A / 仅 C 为 3/0，p=0.25 |
+| GPT A vs B | 0 | +0.037 [+0.014, +0.064] | 解决结果仍相同 |
+| GPT A vs C | 0 | −0.135 [−0.182, −0.093] | A 在 16/16 对中更便宜 |
+
+在 `deepseek-v4.1-flash` 上，AutoCTX 解决更多案例（18 对 14、13），但 24 个案例的配对差异未达统计显著性（p=0.22、0.063）；去除重跑配对后，对 B 的差异缩小（13 对，+0.11），对 C 的差异基本不变（+0.22，p=0.25）。每案例理论费用约为 B 的 2.8 倍、C 的 1.25 倍；每个 resolved 案例比 C 便宜，约为 B 的 2 倍。DeepSeek 各组都有较多案例达到 600 秒超时。
+
+在 `gpt-6.1-sol` 上，三组解决的是相同的 18 个案例。AutoCTX 比原生子代理 C 的理论费用约低 37%（24/24 配对均更便宜），墙钟时间相近；比单代理 B 约贵 40%，平均慢约 30 秒。范围仅为 12 个 pytest 任务、2 个执行模型、2 次重复，且存在上述基础设施重跑，不代表普遍优势。
+
+### 1.2.5：dsh 0.2.0-rc.2，请求上限 64（包含 Jev；较早评测）
 
 仅报告本次运行，不代表普遍优势。每组使用相同的 **72 个评分案例 = 12 个固定 SWE-bench Verified pytest 任务（`bench/tasks.json`）× 3 个执行模型 × 每模型 2 次运行**。执行模型为 `deepseek-v4.1-flash`、`glm-5.3-flash`、`deepseek-v4-flash`。官方 SWE-bench harness **v4.1.0** 判定 resolved；运行完成或 HTTP 200 均不等于通过。
 
@@ -155,8 +215,6 @@ Jev 调用、reviewer/advisor 子代理及其执行模型调用、回合结束�
 | AutoCTX 1.2.3 frozen / auto | 上一版本，相同 harness；reviewer `auto`、advisor `auto`、相同的额外 3 个模型、`jev-1.13`；分别使用 frozen 和 auto 学习；auto 在同一次运行的案例间沿用账本 |
 
 额外 3 个模型为 `glm-5.3-flash`（执行模型为它时改用 `deepseek-v4.1-flash`）、`deepseek-v4-pro`、`claude-haiku-5-5`。1.2.5 与 1.2.3/B/C/H 均运行于 dsh `0.2.0-rc.2`。B/C/H 不加载插件，均早于 1.2.3 运行。B/C 与 AutoCTX 使用同一 harness 入口；H 第 1 轮使用更早的 harness 快照（`run.py` 有差异），任务和上述共同限制相同。
-
-**理论费用依据。** 下文所有费用与缓存数据均为**按目录价的理论估算，非实际账单**。提供方报告的缓存命中受路由、账号和驱逐影响，因此各组按实际发送的 prompt 可复用的缓存，以相同假设和价格比较：请求复用同任务、同缓存空间（模型 + thinking/effort 配置［+ tools］）内与此前请求共享的最长前缀；任务内不设过期。未缓存输入按目录输入价（列有缓存写入价时用写入价），复用输入按缓存读取价，输出按输出价；Jev 输入 $0.042/百万 tokens，输出免费；包含执行模型、子代理及 Jev 的全部费用。此基准的任务内不设过期假设与运行时 `cacheTtlSeconds` 的寿命假设不同。
 
 两种测量方法：`exact` 使用 bench observer 记录的逐消息前缀哈希（AutoCTX 1.2.x）；B/C/H 运行时尚无前缀哈希，使用 `log` 重建（每个 session 按追加增长，输入量下降标记上下文改写）。在 12 个任务上用 `deepseek-v4.1-flash` 重跑 B/C、记录前缀哈希（24 个案例）验证：`log` 比 `exact` 的费用低 2.4%（B）和 3.1%（C）；在 AutoCTX 上约低 11%，因为上下文替换会改动较早的 prompt 内容却不一定缩短输入。因此下表基线理论费用可能低估约 3%，AutoCTX 溢价略被高估，而非低估。
 
@@ -187,9 +245,60 @@ AutoCTX 在此样本中比 B、C、H 解决更多案例，也更贵；按理论�
 
 Auto 运行中，49 个已完成回合进入学习：35/49 个被判无法评估，权重不变；14/49 个应用了小幅更新。此处 auto 未超过 frozen。
 
-测量范围仅为上述 12 个 pytest 任务和 3 个 flash 执行模型；重复运行之间，每次共 12 个任务的运行，resolved 数约波动 ±2 个。按理论费用，AutoCTX 在此处比基线更贵；auto learning 仍为 beta，默认关闭。宿主还存在限制：回合中途创建的 fork 只继承已完成回合，因此审查简报须自行携带当前回合证据。
+测量范围仅为上述 12 个 pytest 任务和 3 个 flash 执行模型；重复运行之间，每次共 12 个任务的运行，resolved 数约波动 ±2 个。按理论费用，AutoCTX 在此处比基线更贵；auto learning 仍为 beta，默认关闭。宿主原生 fork 仍只继承已完成回合；在 `mode: auto` 下，AutoCTX 拦截并路由的新建委派子代理通过 closed-step seed 额外继承当前回合已闭合的步骤（不含正在委派的步骤），并收到继承上下文说明。审查等辅助子代理和 plan 子代理保留原有 seed 路径，审查简报仍携带当前回合证据。
 
 ## 复现
+
+### 1.2.6
+
+先按 [bench/eval-021/README.md](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/bench/eval-021/README.md) 准备 dsh `0.2.1-rc.2`、容器与数据集、模型连接及宿主原生 `openai-codex` 认证；`DSH_BENCH_NODE` 指向对应 Node 安装，`DSH_BENCH_ROOT` 指向含 `evaluator/` 的基准目录。`$WITH_KEYS` 是自行提供的、为命令注入 `JEV_API_KEY` 的包装器。以下在仓库根目录运行，不启用 `--plan-routing` 或 `--plan-review`：
+
+```sh
+R=results/eval-1.2.6
+$WITH_KEYS sh -c 'OPENCODE_API_KEY=$JEV_API_KEY exec python3 bench/eval-021/plan/run.py "$@"' sh \
+  --model deepseek-v4.1-flash --arms A --tasks bench/eval-021/plan/tasks.json \
+  --out "$R/deepseek-v4.1-flash/A" --plugin . --parallel 3 --repeat 2 --request-limit 256 \
+  --extra-models deepseek-v4-flash,glm-5.3-flash,deepseek-v4-pro,glm-5.3 \
+  --max-usd 0.50 --jev-model jev-1.13 --learning frozen
+for arm in B C; do
+  $WITH_KEYS python3 bench/eval-021/plan/run.py --model deepseek-v4.1-flash --arms "$arm" \
+    --tasks bench/eval-021/plan/tasks.json --out "$R/deepseek-v4.1-flash/$arm" --plugin . \
+    --parallel 3 --repeat 2 --request-limit 256 --max-usd 0.50
+done
+for arm in B C A; do
+  for repeat in 1 2; do
+    for lane in 1 2; do
+      $WITH_KEYS python3 bench/eval-021/host/run_one.py --model gpt-6.1-sol --arm "$arm" \
+        --tasks "bench/eval-021/plan/task-full-lane$lane.json" --out "$R/gpt-6.1-sol/$arm-r$repeat-lane$lane" \
+        --plugin . --request-limit 256 --jev-model jev-1.13 \
+        --extra-models gpt-6-sol,gpt-5.6-luna,gpt-6-luna,deepseek-v4.1-flash,glm-5.3-flash
+    done
+  done
+done
+```
+
+每个输出目录分别用 `affected.py` 检查并归档受基础设施影响的案例；例如：
+
+```sh
+RUN="$R/gpt-6.1-sol/A-r1-lane1"
+python3 bench/eval-021/affected.py "$RUN" \
+  --archive "$R/_infra-archive/gpt-6.1-sol/A-r1-lane1" --tasks-out "$RUN/affected-tasks.json"
+```
+
+仅在输出的受影响任务数非零时重跑。DeepSeek 归档后续跑原命令；GPT 使用 `--tasks "$RUN/affected-tasks.json"`，并把 `--out` 改为同级新目录（如 `A-r1-lane1-retry1`），保留 arm、repeat、lane 标记。每轮重新检查，最多 3 轮，另做最终清扫。归档放在 `$R/_infra-archive/<执行模型>/...`，以便报告统计重跑；完成后对原始与重跑目录评分并生成报告：
+
+```sh
+for run in "$R/deepseek-v4.1-flash/"* "$R/gpt-6.1-sol/"*; do
+  python3 bench/eval-021/plan/grade.py "$run" --parallel 3
+done
+python3 bench/full_report.py "$R" --json "$R/report.json" --md "$R/report.md"
+```
+
+`bench/full_report.py`（即 `bench/eval-021/../full_report.py`）递归收集结果，排除归档，输出按任务配对与去除重跑配对后的敏感性表；费用均为理论估算，非实际账单。
+
+### 1.2.5
+
+以下保留旧评测命令，使用 1.2.5 checkout。
 
 在仓库目录中准备 [bench/README.md](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/bench/README.md) 所列前置条件，包括 Docker 与 SWE-bench 镜像、模型网关和 `JEV_API_KEY`，然后运行：
 
@@ -208,4 +317,4 @@ python3 bench/theoretical_cost.py "A=<dir>/*/A" "B=<dir>/*/B" "C=<dir>/*/C"
 
 ## 从旧版本升级
 
-按上面的升级步骤安装 1.2.5，并对照当前配置表检查 profile 覆盖项。不要沿用旧 README 中的默认模型或安装标签；当前默认是计费的 `jev-1.13`，发布标签为 `v1.2.5`。
+按上面的升级步骤安装 1.2.6，并对照当前配置表检查 profile 覆盖项。不要沿用旧 README 中的默认模型或安装标签；当前默认是计费的 `jev-1.13`，发布标签为 `v1.2.6`。
