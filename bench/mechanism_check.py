@@ -88,6 +88,40 @@ def inspection(name, args):
 
 
 EDIT_TOOLS = {'edit', 'write', 'apply_patch', 'multi_edit'}
+FULL = 10 ** 9
+
+
+def read_ranges(name, args):
+    """[(file, first, last)] line ranges a read-only call returns: `read` (offset/limit), `sed -n 'a,bp' f`,
+    `head -n N f`, `cat f` (whole file). Other inspections have no range."""
+    norm = lambda path: re.sub(r'^/testbed/', '', path)
+    if name == 'read' and isinstance(args.get('file_path'), str):
+        first = int(args.get('offset') or 1)
+        return [(norm(args['file_path']), first, first + int(args['limit']) - 1 if args.get('limit') else FULL)]
+    if name != 'bash':
+        return []
+    command, out = args.get('command') or '', []
+    for a, b, f in re.findall(r"sed\s+-n\s+['\"]?(\d+),(\d+)p['\"]?\s+(\S+)", command):
+        out.append((norm(f), int(a), int(b)))
+    for n, f in re.findall(r"head\s+-n\s*(\d+)\s+(\S+)", command):
+        out.append((norm(f), 1, int(n)))
+    for f in re.findall(r"(?:^|[;&|]\s*)cat\s+([\w./-]+\.\w+)\s*(?:$|[;&|])", command):
+        out.append((norm(f), 1, FULL))
+    return out
+
+
+def covered(rng, earlier):
+    """True if line range rng=(file, a, b) lies inside the union of earlier ranges of the same file."""
+    f, a, b = rng
+    spans = sorted((x, y) for g, x, y in earlier if g == f)
+    pos = a
+    for x, y in spans:
+        if x > pos:
+            break
+        pos = max(pos, y + 1)
+        if pos > b:
+            return True
+    return pos > b
 
 
 def editing(name, args):
@@ -116,7 +150,9 @@ def sessions(case):
                 is_inspect, files = inspection(d.get('name'), args)
                 edit, edit_files = editing(d.get('name'), args)
                 calls.append({'time': e.get('time'), 'name': d.get('name'), 'inspect': is_inspect, 'files': files,
-                              'edit': edit, 'editFiles': edit_files, 'text': json.dumps(args)})
+                              'edit': edit, 'editFiles': edit_files, 'text': json.dumps(args),
+                              'ranges': read_ranges(d.get('name'), args),
+                              'key': (d.get('name'), json.dumps(args, sort_keys=True)) if is_inspect and d.get('name') != 'read' else None})
             elif e.get('type') == 'user/message' and isinstance(d.get('source'), dict) and d['source'].get('senderSessionId'):
                 deliveries.append({'time': e.get('time'), 'from': d['source']['senderSessionId'], 'kind': d['source'].get('kind')})
             elif e.get('type') == 'assistant/message':
@@ -206,6 +242,28 @@ def ownership(sess, root, child, child_files, rows):
     }
 
 
+def redundancy(sess, root, child):
+    """Child re-reads of line ranges the parent had read before the child started (inherited in its seed), excluding
+    files edited by anyone after the parent's read and before the child's read; and exact repeats of the parent's
+    pre-start grep/bash inspection commands."""
+    if not root:
+        return {}
+    start = sess[child]['created'] or 0
+    parent_calls = [x for x in sess[root]['calls'] if (x['time'] or 0) < start]
+    inherited = [(r, x['time']) for x in parent_calls for r in x['ranges']]
+    keys = {x['key'] for x in parent_calls if x['key']}
+    edits = [(re.sub(r'^/testbed/', '', f), x['time']) for v in sess.values() for x in v['calls'] if x['edit'] for f in x['editFiles']]
+    reads = redundant = 0
+    for x in sess[child]['calls']:
+        for rng in x['ranges']:
+            reads += 1
+            valid = [r for r, t in inherited if not any(f == r[0] and t < te < (x['time'] or 0) for f, te in edits)]
+            redundant += covered(rng, valid)
+    repeats = sum(1 for x in sess[child]['calls'] if x['key'] and x['key'] in keys)
+    return {'childRangedReads': reads, 'childReadsCoveredByInheritedReads': redundant,
+            'childInspectionCommandsRepeatingParent': repeats, 'parentRangedReadsBeforeStart': len(inherited)}
+
+
 def check(case):
     base = singlecase_export.export(case, None)
     raw = json.load(open(os.path.join(case, 'requests.json')))
@@ -257,6 +315,7 @@ def check(case):
             'firstRequestInputTokens': first['request']['inputTokens'] if first else None,
             'firstRequestObservedProviderCachedTokens': (first['request'].get('cachedTokens') or 0) if first else None,
             **ownership(sess, root, c, files, rows),
+            **redundancy(sess, root, c),
             'toolCalls': len(v['calls']), 'inspectionCalls': len(inspects), 'filesInspected': len(files),
             'parentFilesKnownAtStart': len(known),
             'filesReInspectedFromParent': len(files & known),
