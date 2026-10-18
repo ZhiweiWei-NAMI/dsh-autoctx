@@ -852,7 +852,7 @@ export function apply(ctx, options) {
         try {
           await ctx.llm.prepareCall(options, signal);
           const info = modelInfo(route.model);
-          profiles.push({ id: route.id + "/" + (effort ?? "default"), options, capability: route.description,
+          profiles.push({ id: route.id + "/" + (effort ?? "default"), options, capability: priorOverride(route.model) ?? route.description,
             route: routeOf(route), preferredRoute: (config.preferredProviders ?? []).includes(routeOf(route)),
             ...(info ? { knowledge: knowledge([info]) } : {}) });
         } catch (error) {
@@ -1226,7 +1226,7 @@ export function apply(ctx, options) {
             id: route.id + "/" + (effort ?? "default"),
             routeId: route.id,
             label: route.label,
-            capability: route.description,
+            capability: priorOverride(route.model) ?? route.description,
             options,
             ...(info ? { knowledge: knowledge([info]) } : {}),
           });
