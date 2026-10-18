@@ -614,6 +614,58 @@ function jevReply(body) {
   return { ok: true, status: 200, text: async () => JSON.stringify({ model: "jev", answers }) };
 }
 
+test("decision-point effort asks Jev once for an expensive pulse and skips it; cheap pulses stay local", async (t) => {
+  const records = [], thinkingRequests = [];
+  t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
+  t.mock.method(globalThis, "fetch", async (url, { body }) => {
+    const request = JSON.parse(body);
+    const response = jevReply(body);
+    const result = JSON.parse(await response.text());
+    if (request.questions.task_tag)
+      result.answers.task_tag = { type: "choice", choice: "implementation", confidence: 0.9 };
+    if (request.questions.thinking)
+      result.answers.thinking = { type: "choice", choice: "decision_points", confidence: 0.9 };
+    if (request.questions.think_now) {
+      assert.deepEqual(Object.keys(request.questions), ["think_now"]);
+      assert.ok(Buffer.byteLength(request.state) <= 3000);
+      thinkingRequests.push(JSON.parse(request.state));
+      result.answers.think_now = { type: "noul", noul: 0.2 };
+    }
+    return { ...response, text: async () => JSON.stringify(result) };
+  });
+  const setup = async (content) => {
+    const app = autoComposition({ adaptiveEffort: "high", effortSwitchFreeTokens: 4096,
+      cacheTtlSeconds: 300, recordFile: "context-decisions.jsonl" });
+    app.agent.options.model = "deepseek-v4.1-flash";
+    const scoped = new Map();
+    app.agent.ctx = { on: (name, handler) => scoped.set(name, handler) };
+    // Populate the real stream listener's off-space history before the turn-start decision.
+    const stream = app.handlers.get("llm/stream")({ ...app.agent.options, sessionId: "root", tools: [],
+      messages: [{ role: "user", content: [{ type: "text", text: content }] }] }, async function* () {});
+    await stream.next();
+    await app.step();
+    return { app, request: () => scoped.get("agent/request")({ step: 1 }, async () => ({ ...app.agent.options })) };
+  };
+
+  const expensive = await setup("x".repeat(40000));
+  assert.equal((await expensive.request()).reasoningEffort, undefined);
+  assert.equal((await expensive.request()).reasoningEffort, undefined);
+  assert.equal(thinkingRequests.length, 1);
+  assert.equal(thinkingRequests[0].reason, "turn_start");
+  assert.ok(thinkingRequests[0].estimate.uncachedTokens > 4096);
+  assert.equal(thinkingRequests[0].estimate.label, "estimate, cache hit not guaranteed");
+  assert.deepEqual(thinkingRequests[0].pulses, { count: 0, reasons: {} });
+  assert.ok(records.some((record) => record.kind === "effort_decision" && record.decision === "jev_no" && record.noul === 0.2));
+  assert.equal(records.some((record) => record.kind === "effort_raised"), false);
+
+  const cheap = await setup("Small prefix");
+  assert.equal((await cheap.request()).reasoningEffort, "high");
+  assert.equal((await cheap.request()).reasoningEffort, undefined);
+  assert.equal(thinkingRequests.length, 1);
+  assert.ok(records.some((record) => record.kind === "effort_decision" && record.decision === "cheap" && record.uncachedTokens <= 4096));
+  assert.ok(records.some((record) => record.kind === "effort_raised" && record.reason === "turn_start"));
+});
+
 test("a fresh root can use every child slot through the real guard, then declines locally", async (t) => {
   const requests = [];
   t.mock.method(globalThis, "fetch", async (url, { body }) => {

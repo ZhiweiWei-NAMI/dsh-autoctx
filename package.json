@@ -12,6 +12,7 @@
     "index.js",
     "client.js",
     "stats.js",
+    "cachespace.js",
     "decisions.js",
     "routing.js",
     "graph.js",

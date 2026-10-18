@@ -26,6 +26,7 @@ import {
   DELEGATION_GUIDANCE,
 } from "./routing.js";
 import { newStats, applyStatsRecord } from "./stats.js";
+import { fingerprint, sharedPrefix, reusableTokens, switchEstimate } from "./cachespace.js";
 import { contributionFacts, learningQuestions, proposalsFrom } from "./learning.js";
 import { segmentUnits, focusTerms } from "./segments.js";
 import { workspaceDiff, hunkContext, failureExcerpt, adviceQuestion, advisorBrief, reviewBrief, attemptsFrom } from "./briefs.js";
@@ -189,6 +190,10 @@ export const Config = z.object({
     .description(
       "Reasoning effort used when Jev judges a phase needs it; it stays for the turn and changes only at a context checkpoint. off keeps the default",
     ),
+  effortSwitchFreeTokens: z.number().min(0).default(4096)
+    .description("Decision-point pulses with at most this estimated uncached re-read proceed without asking Jev"),
+  cacheTtlSeconds: z.number().min(0).default(300)
+    .description("Conservative assumed reuse lifetime in seconds; provider cache TTL is unverified"),
   learning: z
     .union(["auto", "manual", "frozen"])
     .default("frozen")
@@ -483,6 +488,9 @@ export function apply(ctx, options) {
     effortSet = new Map(),
     effortDue = new Map(),
     effortStall = new Map(),
+    effortSkips = new Map(),
+    effortPulses = new Map(),
+    cacheSpaces = new Map(),
     userEffort = new Set(),
     childEffort = new Map(),
     // Per-root accounting of the current turn: role use, cost and cache by category.
@@ -607,6 +615,7 @@ export function apply(ctx, options) {
         "turn_plan",
         "effort_checkpoint",
         "effort_raised",
+        "effort_decision",
         "context_deferred",
         "learning",
       ].includes(value.kind)
@@ -1277,6 +1286,70 @@ export function apply(ctx, options) {
     if (!effortDue.has(agent.session.id)) effortDue.set(agent.session.id, reason);
   }
 
+  async function decisionPointEffort(agent, resolved, reason) {
+    const id = agent.session.id;
+    let estimate = { totalTokens: null, reusableTokens: null, uncachedTokens: null, usd: null },
+      decision = "cheap", noul;
+    try {
+      const cache = cacheSpaces.get(id), latest = cache?.latest,
+        price = modelInfo(resolved.model)?.price;
+      if (latest && price) {
+        const target = cache.spaces.get(`${resolved.provider}|${resolved.model}|${config.adaptiveEffort}`);
+        estimate = switchEstimate({ latest, target: target?.fingerprint, at: target?.at,
+          now: Date.now(), ttlMs: (config.cacheTtlSeconds ?? 300) * 1000,
+          pendingTokens: Math.max(0, ctx.tokenMeter.measure(agent.session).totalTokens -
+            latest.tokens.reduce((sum, value) => sum + value, 0)), price });
+      }
+      if (latest && price && estimate.uncachedTokens > (config.effortSwitchFreeTokens ?? 4096)) {
+        const graph = graphFor(id);
+        const failure = Object.entries(graph.tests)
+          .map(([key, test]) => ({ key, run: test.runs.at(-1) }))
+          .filter(({ run }) => run?.via === undefined && ["fail", "error"].includes(run?.outcome))
+          .sort((a, b) => b.run.event - a.run.event)[0];
+        // progressKey tracks outcomes; a fresh failing run with the same outcome is new evidence too.
+        const evidenceKey = createHash("sha256").update(JSON.stringify([
+          progressKey(graph), reason === "test_failure" ? failure : null,
+        ])).digest("hex");
+        const skipped = effortSkips.get(id)?.get(reason);
+        if (skipped?.key === evidenceKey) {
+          decision = "jev_no";
+          noul = skipped.noul;
+        } else {
+          const short = (value) => Array.from(String(value)).slice(0, 80).join("");
+          const evidence = reason === "test_failure" && failure
+            ? `${short(failure.key)}: ${short(failure.run.summary)}`
+            : reason === "review_report" || reason === "advisor_report" ? "report received"
+              : reason === "stall" ? `${graphStep(id) - (effortStall.get(id)?.step ?? graphStep(id))} steps without progress`
+                : "start of turn";
+          const weights = roots.get(id)?.policy?.weights;
+          const request = {
+            trigger: "effort_decision", reason, evidence, evidenceKey,
+            pulses: effortPulses.get(id) ?? { count: 0, reasons: {} },
+            estimate: { ...estimate, label: "estimate, cache hit not guaranteed" },
+            measured: THINKING_MEASURED,
+            preference: Object.fromEntries(["quality", "latency", "usage", "cache"].map((key) => [key, weights?.[key]])),
+            questions: { think_now: { type: "noul", instructions:
+              `Should the executor's next request use extended thinking at this decision point? It re-reads about ${estimate.uncachedTokens} tokens uncached (~$${estimate.usd} extra) because the thinking cache space has not seen the recent context; skipping keeps the current cache. Quality of the result comes first; weigh whether this point plausibly needs deliberate reasoning (a new failure, a defect report, a stall) against the cost.` } },
+          };
+          if (!config.apiKey || Buffer.byteLength(JSON.stringify(request)) > 3000)
+            throw new Error("Effort decision unavailable");
+          noul = (await decide(agent, request, AbortSignal.timeout(15000))).answers.think_now.noul;
+          decision = noul >= 0.5 ? "jev_yes" : "jev_no";
+          if (decision === "jev_no") {
+            if (!effortSkips.has(id)) effortSkips.set(id, new Map());
+            effortSkips.get(id).set(reason, { key: evidenceKey, noul });
+          }
+        }
+      }
+    } catch {
+      // The measured decision-point policy remains the fallback, including when Jev's budget is spent.
+      decision = "fallback";
+    }
+    record({ kind: "effort_decision", session: id, reason, decision, ...estimate,
+      ...(noul === undefined ? {} : { noul }) });
+    return decision !== "jev_no";
+  }
+
   // The root's sticky effort through dsh's request-config waterfall on the agent's own scoped context, as
   // dsh's native model selection does. Same-model children inherit it, so a forked branch stays in the
   // parent's cache space. A user-configured effort on the agent always wins.
@@ -1301,8 +1374,15 @@ export function apply(ctx, options) {
         const plan = effortSupported.get(root) === true ? turnPlans.get(root) : undefined;
         if (plan?.thinking === "always") effort = plan.effort;
         else if (plan?.thinking === "decision_points" && effortDue.has(id)) {
-          effort = config.adaptiveEffort;
-          record({ kind: "effort_raised", session: id, effort, reason: effortDue.get(id), step: payload.step });
+          const reason = effortDue.get(id);
+          if (await decisionPointEffort(agent, resolved, reason)) {
+            effort = config.adaptiveEffort;
+            const pulses = effortPulses.get(id) ?? { count: 0, reasons: {} };
+            pulses.count++;
+            pulses.reasons[reason] = (pulses.reasons[reason] ?? 0) + 1;
+            effortPulses.set(id, pulses);
+            record({ kind: "effort_raised", session: id, effort, reason, step: payload.step });
+          }
           effortDue.delete(id);
         }
       } else {
@@ -2080,6 +2160,8 @@ export function apply(ctx, options) {
     const newTurn = !isChild && turnStartSteps.get(id)?.turn !== payload.turn;
     if (newTurn) {
       turnStartSteps.set(id, { turn: payload.turn, step: graphStep(id) });
+      effortPulses.delete(id);
+      effortSkips.delete(id);
       if (turnUses.get(id)?.turn !== payload.turn) turnUses.set(id, newUse(payload.turn));
     }
     const reopened = !isChild && turnUses.get(id);
@@ -2248,13 +2330,50 @@ export function apply(ctx, options) {
       state.childRequests++;
     }
     const started = performance.now();
-    let usage;
+    let usage, cacheFingerprint, prefixReuse;
+    const rootExecution = agent && agent.session.header.parentSession === undefined && options.purpose === undefined;
+    const fingerprintFailed = () => {
+      const cache = cacheSpaces.get(agent.session.id);
+      // The last successfully fingerprinted request may no longer describe the current prefix.
+      cache.latest = undefined;
+      if (!cache.failed) {
+        cache.failed = true;
+        record({ kind: "cache_fingerprint_failed", session: agent.session.id });
+      }
+    };
+    if (rootExecution) {
+      if (!cacheSpaces.has(agent.session.id))
+        cacheSpaces.set(agent.session.id, { spaces: new Map(), latest: undefined, failed: false });
+      try {
+        cacheFingerprint = fingerprint(options, (message) => ctx.tokenMeter.estimateMessage(message));
+        const previous = cacheSpaces.get(agent.session.id).spaces.get(cacheFingerprint.space);
+        prefixReuse = { space: cacheFingerprint.space,
+          sharedMessages: sharedPrefix(previous?.fingerprint, cacheFingerprint),
+          estReusedTokens: reusableTokens(previous?.fingerprint, cacheFingerprint, {
+            now: Date.now(), at: previous?.at, ttlMs: (config.cacheTtlSeconds ?? 300) * 1000,
+          }) };
+      } catch {
+        cacheFingerprint = undefined;
+        fingerprintFailed();
+      }
+    }
     const dispatchEstimate = agent ? ctx.tokenMeter.measure(agent.session).totalTokens : undefined;
     if (agent) updateStats(rootOf(agent), { nativeEstimate: dispatchEstimate });
     try {
       for await (const chunk of next()) {
         if (chunk.type === "usage") usage = chunk.usage;
         yield chunk;
+      }
+      if (cacheFingerprint) {
+        try {
+          const cache = cacheSpaces.get(agent.session.id);
+          cache.latest = cacheFingerprint;
+          cache.spaces.delete(cacheFingerprint.space);
+          cache.spaces.set(cacheFingerprint.space, { fingerprint: cacheFingerprint, at: Date.now() });
+          if (cache.spaces.size > 4) cache.spaces.delete(cache.spaces.keys().next().value);
+        } catch {
+          fingerprintFailed();
+        }
       }
     } finally {
       const wallMs = performance.now() - started;
@@ -2277,6 +2396,7 @@ export function apply(ctx, options) {
         wallMs,
         ...(spent ?? {}),
         ...(usage === undefined ? {} : { usage }),
+        ...(prefixReuse === undefined ? {} : { prefixReuse }),
       });
     }
   });

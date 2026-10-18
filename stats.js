@@ -6,7 +6,7 @@ export function newStats(mode,maxDecisions,pressureTokens) {
     // USD by category (unpriced counts calls without a catalog price) and provider-reported cache by role.
     cost:{executor:0,children:0,jev:0,compaction:0},unpriced:0,
     cache:{},historySeeded:0,forks:0,deferrals:0,
-    plan:null,choices:{},learning:null,
+    plan:null,choices:{},learning:null,effortDecisions:{},estUncachedTokensAvoided:0,
     updatedAt:0,pendingSaved:{}};
 }
 export function applyStatsRecord(stats,record,decisions=stats.decisions) {
@@ -52,6 +52,12 @@ export function applyStatsRecord(stats,record,decisions=stats.decisions) {
       probabilities:record.probabilities??null,raised:0}; break;
     case 'effort_checkpoint': next.plan={...(stats.plan??{}),thinking:record.to,via:'checkpoint'}; break;
     case 'effort_raised': if (stats.plan) next.plan={...stats.plan,raised:(stats.plan.raised??0)+1}; break;
+    case 'effort_decision':
+      next.effortDecisions={...stats.effortDecisions,
+        [record.decision]:(stats.effortDecisions?.[record.decision]??0)+1};
+      if (record.decision==='jev_no' && Number.isFinite(record.uncachedTokens))
+        next.estUncachedTokensAvoided=(stats.estUncachedTokensAvoided??0)+record.uncachedTokens;
+      break;
     case 'context_deferred': next.deferrals=stats.deferrals+1; break;
     case 'learning': next.learning={mode:record.mode,version:record.version??null,proposed:record.proposed,
       applied:record.applied??[],pending:record.pending??null,reason:record.reason??null}; break;
