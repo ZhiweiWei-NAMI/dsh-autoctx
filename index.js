@@ -26,6 +26,9 @@ import {
   DELEGATION_GUIDANCE,
 } from "./routing.js";
 import { newStats, applyStatsRecord } from "./stats.js";
+import { createPlanDispatcher } from "./plandispatch.js";
+import { planParameters, dispatcherLabel } from "./plan.js";
+import { emptyRouteLedger, applyRouteFacts } from "./routeledger.js";
 import { fingerprint, sharedPrefix, reusableTokens, switchEstimate } from "./cachespace.js";
 import { contributionFacts, learningQuestions, proposalsFrom } from "./learning.js";
 import { segmentUnits, focusTerms } from "./segments.js";
@@ -137,13 +140,17 @@ export function createChildStarter(ctx, restoreComposition) {
 
 export const Config = z.object({
   mode: z
-    .union(["auto", "single", "native"])
+    .union(["auto", "single", "native", "plan"])
     .default("auto")
     .volatile()
     .description(
-      "auto routes decisions through Jev, single keeps one agent, native keeps native compaction",
+      "auto routes decisions through Jev, single keeps one agent, native keeps native compaction, plan dispatches explicit subtasks",
     ),
-  apiKey: z.string().role("secret").volatile().description("Jev API key; unset runs native mode"),
+  planRouting: z.union(["jev", "fixed"]).default("jev").volatile(),
+  planMaxChildren: z.number().step(1).min(0).default(3).volatile(),
+  planMaxJevCalls: z.number().step(1).min(0).default(6).volatile(),
+  planChildRequests: z.number().step(1).min(1).default(16).volatile(),
+  apiKey: z.string().role("secret").volatile().description("Jev API key; unset keeps native mode, or fixed routing in plan mode"),
   jevModel: z
     .string()
     .default("jev-1.13")
@@ -249,7 +256,7 @@ export const Config = z.object({
   maxChildTurnRequests: z.number().step(1).min(2).default(8),
   reviewBeforeFinish: z
     .boolean()
-    .default(true)
+    .default(false)
     .volatile()
     .description(
       "Start one independent review child before a root turn that changed files finishes",
@@ -598,13 +605,15 @@ export function apply(ctx, options) {
   const statsMap = new Map();
   const statsRoot = (id) => ctx.agents.get(id)?.session.header.parentSession ?? id;
   const updateStats = (id, value = {}) => {
+    const maxDecisions = config.mode === "plan" ? config.planMaxJevCalls ?? 6 : config.maxDecisions;
+    const decisions = config.mode === "plan" ? planDispatcher.jevCalls(id) : budgets.get(id)?.decisions ?? 0;
     const current =
       statsMap.get(id) ??
-      newStats(config.apiKey ? config.mode : "native", config.maxDecisions, config.pressureTokens);
+      newStats(config.mode === "plan" ? "plan" : config.apiKey ? config.mode : "native", maxDecisions, config.pressureTokens);
     statsMap.delete(id);
     statsMap.set(id, {
-      ...applyStatsRecord(current, value, budgets.get(id)?.decisions ?? 0),
-      maxDecisions: config.maxDecisions,
+      ...applyStatsRecord(current, value, decisions),
+      maxDecisions,
       pressureTokens: config.pressureTokens,
       updatedAt: Date.now(),
     });
@@ -727,7 +736,7 @@ export function apply(ctx, options) {
     memos.clear();
   });
   const modeOf = (agent) =>
-    !config.apiKey
+    config.mode === "plan" ? "plan" : !config.apiKey
       ? "native"
       : config.mode === "auto"
         ? roots.get(rootOf(agent))?.mode
@@ -772,6 +781,93 @@ export function apply(ctx, options) {
   const ledgerInits = new Map();
   // Per-record storage keys must be path-safe, so a workspace path is stored by its hash.
   const ledgerKey = (cwd) => "ws_" + createHash("sha256").update(cwd).digest("hex").slice(0, 32);
+  let routeStorePromise;
+  const routeStorage = () => (routeStorePromise ??= ctx.storageDomain.open(defineDomain({
+    name: "dsh_auto_plan_routes", version: 1, layout: "per-record",
+    tables: { routes: domainTable(schema.json()) },
+  })));
+  const routeUpdates = new Map();
+  ctx.on("dispose", async () => { if (routeStorePromise) await (await routeStorePromise).close(); });
+  const planRoute = (agent) => {
+    const current = agent.session.requestHeader?.()?.config ?? agent.options;
+    return { provider: current.provider, model: current.model,
+      ...(current.reasoningEffort === undefined ? {} : { reasoningEffort: current.reasoningEffort }) };
+  };
+  const planProfiles = async (agent, signal) => {
+    const profiles = [];
+    for (const route of config.routes?.length ? config.routes : [buildDefaultRoute(planRoute(agent))]) {
+      for (const effort of route.efforts?.length ? route.efforts : [undefined]) {
+        const options = { provider: route.provider ?? planRoute(agent).provider, model: route.model,
+          ...(effort === undefined ? {} : { reasoningEffort: effort }) };
+        try {
+          await ctx.llm.prepareCall(options, signal);
+          const info = modelInfo(route.model);
+          profiles.push({ id: route.id + "/" + (effort ?? "default"), options, capability: route.description,
+            ...(info ? { knowledge: knowledge([info]) } : {}) });
+        } catch (error) {
+          if (signal.aborted) throw error;
+          record({ kind: "profile_unavailable", session: agent.session.id, profile: route.id, effort: effort ?? null });
+        }
+      }
+    }
+    if (!profiles.length) throw new Error("No supported plan route profiles.");
+    return profiles;
+  };
+  const planDispatcher = createPlanDispatcher({ ctx, config, record, note, changesFilesCall, graphFor,
+    currentRoute: planRoute, profilesFor: planProfiles,
+    decide: (agent, request, signal) => decide(agent, request, signal, { unbudgeted: true }),
+    tokensOf: (value) => ctx.tokenMeter.estimateMessage(note(value)),
+    prefixOf: (agent) => ({ tokens: ctx.tokenMeter.measure(agent.session).totalTokens,
+      end: agent.session.snapshotEvents().findLast((event) => event.type === "turn/end")?.seq ?? -1,
+      latest: cacheSpaces.get(agent.session.id)?.latest }),
+    briefFor: (agent) => agent.session.snapshotEvents().filter((event) => event.type === "user/message")
+      .map((event) => agent.session.deriveEventMessage(event)).filter((message) => message?.source.kind === "user")
+      .map(text).join("\n\n") + "\nObserved evidence:\n" + digest(graphFor(agent.session.id), 4000),
+    readLedger: async (cwd) => (await routeStorage()).table("routes").get(ledgerKey(cwd)) ?? emptyRouteLedger(),
+    learn: async (cwd, key, facts, mode) => {
+      const workspace = ledgerKey(cwd);
+      const previous = routeUpdates.get(workspace) ?? Promise.resolve();
+      const pending = previous.catch(() => {}).then(async () => {
+        const table = (await routeStorage()).table("routes");
+        const result = applyRouteFacts(table.get(workspace) ?? emptyRouteLedger(), key, facts, mode);
+        if (result.applied) await table.put(workspace, result.ledger);
+        return result;
+      });
+      routeUpdates.set(workspace, pending);
+      try { return await pending; } finally { if (routeUpdates.get(workspace) === pending) routeUpdates.delete(workspace); }
+    },
+    diffFiles: async (cwd) => {
+      const change = await workspaceDiff(cwd);
+      if (change.error) throw new Error(change.error);
+      return [...new Set([...change.files, ...change.untracked])];
+    },
+  });
+  let planToolInstalled = false;
+  const installPlanTool = () => {
+    if (planToolInstalled) return;
+    ctx.tools.register({
+      name: "plan", description: "Record subtasks before editing files. Delegated plans end this turn; children start at the completed-turn boundary. Release each main-owned dependency by send_message to the dependent child's reserved id with JSON {subtask,summary} reporting the actual result. Use dependsOn to order subtasks.",
+      parameters: planParameters,
+      output: {
+        schema: { type: "object", required: ["recorded", "assignments"], additionalProperties: false,
+          properties: { recorded: { type: "boolean", const: true }, assignments: { type: "array", items: {
+            type: "object", additionalProperties: false, required: ["subtask", "model", "effort", "contextOption"],
+            properties: Object.fromEntries(["subtask", "model", "effort", "contextOption"].map((key) => [key, { type: "string" }])),
+          } } } },
+        render: (_args, value) => [{ type: "text", text: JSON.stringify(value) }],
+      },
+      async execute(args, exec) {
+        const violations = validateJsonSchemaValue(planParameters, args, "");
+        if (violations.length) throw new ToolArgsError(violations);
+        const result = await planDispatcher.tool(args, { ...exec, turn: currentTurn.get(exec.agent?.session.id) });
+        if (result.isError) throw new Error(result.error.message);
+        if (result.concludesTurn) exec.concludeTurn();
+        return result.value;
+      },
+    });
+    planToolInstalled = true;
+  };
+  if (config.mode === "plan") installPlanTool();
   const useKey = (session, turn) => session.replace(/[^a-zA-Z0-9_-]/g, "_") + "_" + String(turn).replace(/[^a-zA-Z0-9_-]/g, "_");
   const readLedger = async (cwd) =>
     (await storage()).table("ledger").get(ledgerKey(cwd)) ?? emptyLedger(config.learning);
@@ -924,7 +1020,7 @@ export function apply(ctx, options) {
       else useOf(root).unpriced++;
       // The effort state contains raw task/failure evidence. Keep only the validated choice and
       // billing counters even if a gateway echoes state or adds free-text explanations.
-      const logged = request.trigger === "effort_decision" ? { model: result.model, usage: result.usage,
+      const logged = request.trigger?.startsWith("plan_") ? { model: result.model, usage: result.usage, answers: result.answers } : request.trigger === "effort_decision" ? { model: result.model, usage: result.usage,
         answers: { thinking: { type: "choice", choice: result.answers.thinking.choice,
           confidence: result.answers.thinking.confidence } } } : result;
       record({
@@ -1096,6 +1192,8 @@ export function apply(ctx, options) {
   }
 
   ctx.tools.guard((exec) => {
+    if (config.mode === "plan") return planDispatcher.guard(exec);
+    if (exec.name === "plan") return "plan requires mode=plan.";
     // Role limits for helper children are enforced here rather than by a tool filter, so a forked
     // child keeps the parent's exact tool block (and its cached prefix where the route shares it).
     const role = exec.agent ? childRoles.get(exec.agent.session.id) : undefined;
@@ -1122,6 +1220,7 @@ export function apply(ctx, options) {
     state.pending.add(exec.callId);
   });
   ctx.on("tools/result", (exec, result) => {
+    if (config.mode === "plan") planDispatcher.onResult(exec, result);
     if (exec.agent && !delegation.has(exec.name) && !result.isError)
       declinedDelegation.delete(exec.agent.session.id);
     if (exec.agent && changesFilesCall(exec.name, exec.arguments) && !result.isError) {
@@ -1155,7 +1254,7 @@ export function apply(ctx, options) {
         const recent = effortTools.get(id) ?? [];
         recent.push({ name: shortText(exec.name, 80), outcome: latest?.outcome ?? (result.isError ? "error" : "success") });
         effortTools.set(id, recent.slice(-6));
-        resolveEffortPhase(exec, result, latest);
+        if (config.mode !== "plan") resolveEffortPhase(exec, result, latest);
         if (latest && (latest.outcome === "fail" || latest.outcome === "error")) {
           const key = Object.entries(graphFor(id).tests).find(([, test]) => test.runs.includes(latest))?.[0];
           if (key) {
@@ -1163,7 +1262,7 @@ export function apply(ctx, options) {
             const text = (result.content ?? []).filter((block) => block.type === "text").map((block) => block.text).join("\n");
             failureOutput.get(id).set(key, text.slice(-40000));
           }
-          wantEffort(exec.agent, "test_failure", { testKey: key });
+          if (config.mode !== "plan") wantEffort(exec.agent, "test_failure", { testKey: key });
         }
       }
     }
@@ -1180,6 +1279,7 @@ export function apply(ctx, options) {
     });
   });
   ctx.on("subagent/start", (info) => {
+    if (config.mode === "plan") return planDispatcher.onChildStart(info);
     const child = ctx.agents.get(info.id);
     if (!child) throw new Error("Auto requires native in-process children.");
     const parent = rootOf(child),
@@ -1209,6 +1309,7 @@ export function apply(ctx, options) {
     });
   });
   ctx.on("subagent/end", async (info) => {
+    if (config.mode === "plan") return planDispatcher.onChildEnd(info);
     const running = active.get(info.id);
     if (!running) throw new Error("Native child ended without a start.");
     active.delete(info.id);
@@ -1849,6 +1950,11 @@ export function apply(ctx, options) {
     const saved = persistGraph(agent.session.id);
     try {
       if (agent.session.header.parentSession !== undefined) return;
+      if (config.mode === "plan") {
+        await planDispatcher.settleLearning(agent).catch((error) =>
+          record({ kind: "route_learning_failed", session: agent.session.id, error: String(error) }));
+        return;
+      }
       // Auto and native share the reviewer; single mode and keyless runs stay native-only.
       const steered =
         config.reviewBeforeFinish && config.apiKey && modeOf(agent) !== "single"
@@ -2115,6 +2221,12 @@ export function apply(ctx, options) {
   ctx.on("tools/execute", async (exec, next) => {
     const agent = exec.agent,
       session = agent?.session.id;
+    if (config.mode === "plan") {
+      const dependency = agent && await planDispatcher.mainDependency(exec);
+      if (dependency) return dependency;
+      await planDispatcher.beforeEdit(exec);
+      return next();
+    }
     if (routedSessions.has(session) && modeOf(agent) === "auto") {
       if (delegation.has(exec.name)) {
         try {
@@ -2175,7 +2287,7 @@ export function apply(ctx, options) {
 
   class JevCompaction extends BasicCompactionEngine {
     async summarize(input, agent, signal) {
-      const selection = prepared.get(agent.session.id);
+      const selection = config.mode === "plan" ? undefined : prepared.get(agent.session.id);
       return selection
         ? { summary: selection.summary, provider: "opencode-console", model: selection.model }
         : super.summarize(input, agent, signal);
@@ -2380,6 +2492,39 @@ export function apply(ctx, options) {
     currentTurn.set(id, payload.turn);
     await restoreGraph(id);
     graphFor(id);
+    if (config.mode === "plan") {
+      installPlanTool();
+      if (isChild) {
+        const used = planDispatcher.childRequests(id), cap = config.planChildRequests ?? 16;
+        if (used >= cap) throw new Error("Plan child request budget exhausted.");
+        finalRequest = used === cap - 1;
+      } else {
+        await planDispatcher.startReady(agent, signal);
+      }
+      if (!finalRequest && agent.session.requestHeader() !== undefined) {
+        try { await getCompactor().compactIfNeeded(agent, "pressure", signal); }
+        catch (error) {
+          if (signal.aborted) throw error;
+          record({ kind: "context_unshrinkable", session: id, error: String(error) });
+        }
+      }
+      if (isChild) {
+        const used = planDispatcher.childRequests(id), cap = config.planChildRequests ?? 16;
+        if (used >= cap) throw new Error("Plan child request budget exhausted.");
+        finalRequest = used === cap - 1;
+      }
+      const admitted = await next();
+      if (admitted.kind === "reject") return admitted;
+      graphSteps.set(id, graphStep(id) + 1);
+      const state = !isChild && planDispatcher.stateFor(agent);
+      const message = isChild && finalRequest ? dispatcherLabel + " This is your final model request under the plan child budget. Report the actual result and unfinished work through structured_output now." :
+        state && !state.planned && !state.prompted ? dispatcherLabel + " Call plan before the first file-changing tool. Read-only tools may run first." : undefined;
+      if (!message) return admitted;
+      if (state) state.prompted = true;
+      record({ kind: "message_appended", to: id, from: rootOf(agent), messageKind: finalRequest ? "budget" : "plan-reminder",
+        label: true, sourceLabel: dispatcherLabel, chars: message.length });
+      return { ...admitted, messages: [...(admitted.messages ?? []), note(message)] };
+    }
     const newTurn = !isChild && turnStartSteps.get(id)?.turn !== payload.turn;
     if (newTurn) {
       endEffortPhase(id, "turn_end");
@@ -2556,7 +2701,11 @@ export function apply(ctx, options) {
   });
   ctx.on("llm/stream", async function* (options, next) {
     const agent = options.sessionId ? ctx.agents.get(options.sessionId) : undefined;
-    if (agent && agent.session.header.parentSession !== undefined) {
+    if (agent && config.mode === "plan" && agent.session.header.parentSession !== undefined) {
+      if (planDispatcher.childRequests(agent.session.id) >= (config.planChildRequests ?? 16))
+        throw new Error("Plan child model-call budget exhausted, including compaction calls.");
+      planDispatcher.countRequest(agent.session.id);
+    } else if (agent && agent.session.header.parentSession !== undefined) {
       const id = agent.session.id,
         state = budget(rootOf(agent)),
         used = turnRequests.get(id) ?? 0,
@@ -2579,7 +2728,7 @@ export function apply(ctx, options) {
         record({ kind: "cache_fingerprint_failed", session: agent.session.id });
       }
     };
-    if (rootExecution) {
+    if (rootExecution || (agent && config.mode === "plan" && options.purpose === undefined)) {
       // The host has now committed these messages. Retries derive them from the surface itself.
       admittedMessages.delete(agent.session.id);
       checkCacheGeneration(agent);
@@ -2656,6 +2805,10 @@ export function apply(ctx, options) {
     }
   });
   ctx.on("session/event", (session, event) => {
+    if (config.mode === "plan") {
+      planDispatcher.onEvent(session, event);
+      return;
+    }
     if (event.type === "compaction/summary") {
       pressureAnchors.delete(session.id);
       pendingLedgers.add(session.id);
@@ -2676,6 +2829,7 @@ export function apply(ctx, options) {
   });
   // Feedback on a session that is not loaded is committed to its log and announced here instead.
   ctx.on("feedback/committed", (inspection) => {
+    if (config.mode === "plan") return;
     const event = inspection?.events?.at(-1);
     if (!event || inspection.meta?.parentSession !== undefined) return;
     const events = inspection.events;

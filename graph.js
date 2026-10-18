@@ -310,6 +310,24 @@ function patchWritePaths(tokens) {
   return [];
 }
 
+export function shellWritePaths(command) {
+  const paths = [], entries = segments(command);
+  for (const { command: raw, heredoc } of entries) {
+    const parsed = redirects(raw), tokens = tokenize(parsed.command), head = base(tokens[0]);
+    paths.push(...parsed.paths, ...writePaths(tokens), ...patchWritePaths(tokens), ...pythonWrites(pythonScript(tokens, heredoc)));
+    const operands = tokens.slice(1).filter((token) => !token.startsWith("-"));
+    if (["rm", "touch", "mkdir", "rmdir", "mv"].includes(head)) paths.push(...operands);
+    else if (head === "cp" || head === "ln") paths.push(operands.at(-1) ?? "(shell-target)");
+    else if (head === "git" && ["checkout", "restore", "reset", "clean", "switch", "merge", "cherry-pick"].includes(tokens[1]))
+      paths.push("(shell-target)");
+    else if (/\b(?:writeFile(?:Sync)?|appendFile(?:Sync)?|\.write_(?:text|bytes)|\.unlink|\.rename|\.truncate)\s*\(/.test(raw + heredoc))
+      paths.push("(shell-target)");
+  }
+  const writes = [...new Set(paths)].filter((path) => !/^\/dev(?:\/|$)/.test(path));
+  if (writes.length && entries.some((entry) => base(tokenize(entry.command)[0]) === "cd")) return ["(shell-target)"];
+  return writes;
+}
+
 function classifyBash(graph, observation, command, text, failed) {
   const parsed = segments(command).map((entry) => ({ ...entry, ...redirects(entry.command) }));
   const testCount = parsed.filter((entry) => isTestCommand(tokenize(entry.command))).length;

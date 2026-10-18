@@ -9,7 +9,15 @@ window.__ModuleLoader__.load({
 			pageIntro: "Jev decides who works on a task (reviewer, advisor, workers), when to think and when to compact context; it learns from finished tasks in this workspace. The composer card shows each session's choices, costs and pending weight changes.",
 			title: "Auto context",
 			mode: "Mode",
-			modeHint: "auto asks Jev for every decision; single keeps one agent; native keeps native compaction.",
+			modeHint: "auto asks Jev for decisions; single keeps one agent; native keeps native compaction; plan dispatches explicit subtasks with native compaction.",
+			planRouting: "Plan routing",
+			planRoutingHint: "jev chooses task suitability, then context; fixed keeps the parent's model and effort without Jev. Plan mode disables review, advice, effort adaptation and economy guidance.",
+			planMaxChildren: "Plan children per task",
+			planMaxChildrenHint: "Total delegated subtasks across plans and replans (default 3).",
+			planMaxJevCalls: "Plan Jev budget",
+			planMaxJevCallsHint: "Separate routing, context and mediation calls per root task (default 6). Exhaustion uses fixed routing.",
+			planChildRequests: "Plan child request cap",
+			planChildRequestsHint: "Model requests per child, including compaction and reused turns (default 16).",
 			apiKey: "Jev API key",
 			apiKeyHint: "Leave blank to keep the configured key.",
 			jevModel: "Jev model",
@@ -27,7 +35,7 @@ window.__ModuleLoader__.load({
 			economyGuidance: "Execution economy note",
 			economyGuidanceHint: "Append one note before the root task's first request asking for batched, narrow tool use.",
 			reviewBeforeFinish: "Review before finish",
-			reviewBeforeFinishHint: "Start one independent review child before a root turn that changed files finishes. Requires an API key and a non-single mode.",
+			reviewBeforeFinishHint: "Optional independent review, off by default. Requires an API key; disabled in single and plan modes.",
 			reviewMaxRequests: "Review request cap",
 			reviewMaxRequestsHint: "Model requests allowed for one review child.",
 			reviewerModel: "Reviewer model",
@@ -152,7 +160,15 @@ window.__ModuleLoader__.load({
 			pageIntro: "由 Jev 决定任务由谁参与（复核、顾问、子任务）、何时思考、何时压缩上下文，并从本工作区已完成的任务中学习。输入框统计卡片会显示每个会话的选择、成本与待确认的权重调整。",
 			title: "Auto 上下文",
 			mode: "模式",
-			modeHint: "auto 每次决策都询问 Jev；single 只用单代理；native 保持原生压缩。",
+			modeHint: "auto 由 Jev 决策；single 只用单代理；native 保持原生压缩；plan 显式分派子任务并保持原生压缩。",
+			planRouting: "计划路由",
+			planRoutingHint: "jev 先选适合任务的模型，再选上下文；fixed 沿用父代理模型与强度，不调用 Jev。plan 模式关闭复核、顾问、强度自适应及经济提示。",
+			planMaxChildren: "计划子任务总数",
+			planMaxChildrenHint: "同一根任务各次计划累计可委派的子任务数，默认 3。",
+			planMaxJevCalls: "计划 Jev 预算",
+			planMaxJevCallsHint: "路由、上下文及中介使用独立调用预算，默认 6；耗尽后使用 fixed 规则。",
+			planChildRequests: "计划子代理请求上限",
+			planChildRequestsHint: "每个子代理的模型请求数，包含压缩与复用后的轮次，默认 16。",
 			apiKey: "Jev API Key",
 			apiKeyHint: "留空表示保持当前密钥。",
 			jevModel: "Jev 模型",
@@ -170,7 +186,7 @@ window.__ModuleLoader__.load({
 			economyGuidance: "执行经济提示",
 			economyGuidanceHint: "在根任务首次请求前追加一条提示，要求批量、精准地使用工具。",
 			reviewBeforeFinish: "完成前复核",
-			reviewBeforeFinishHint: "根任务修改文件后、结束本轮前，启动一个独立复核子代理。需配置 API key，且不处于单代理模式。",
+			reviewBeforeFinishHint: "可选的独立复核，默认关闭。需配置 API key；single 与 plan 模式禁用。",
 			reviewMaxRequests: "复核请求上限",
 			reviewMaxRequestsHint: "单个复核子代理可用的模型请求次数。",
 			reviewerModel: "复核模型",
@@ -293,9 +309,9 @@ window.__ModuleLoader__.load({
 		const NS = "plugins.dshAutoctx";
 		const CONFIG_KEY = "dsh-autoctx#dsh-autoctx";
 		const inject = ["slots", "locale", "configForms"];
-		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "ceilingRatio", "retainTokens", "keepRatio", "reviewMaxRequests", "advisorMaxConsults", "advisorStallSteps"];
+		const NUMERIC_FIELDS = ["maxDecisions", "maxChildren", "maxConcurrent", "pressureTokens", "ceilingRatio", "retainTokens", "keepRatio", "reviewMaxRequests", "advisorMaxConsults", "advisorStallSteps", "planMaxChildren", "planMaxJevCalls", "planChildRequests"];
 		// Enumerated fields render as segmented controls.
-		const SEGMENTED = { mode: ["auto", "single", "native"], learning: ["auto", "manual", "frozen"], contextSelection: ["jev", "summary"] };
+		const SEGMENTED = { mode: ["auto", "single", "native", "plan"], planRouting: ["jev", "fixed"], learning: ["auto", "manual", "frozen"], contextSelection: ["jev", "summary"] };
 		// modelRoutes is a model -> provider map, edited as "model=provider, model=provider".
 		const routesField = {
 			field: "modelRoutes",
@@ -429,6 +445,7 @@ window.__ModuleLoader__.load({
 				onSave: save, onDiscard: discard,
 				children: jsxs("div", { className: "dac-form", children: [
 					field("mode"),
+					field("planRouting"), field("planMaxChildren"), field("planMaxJevCalls"), field("planChildRequests"),
 					section("sectionJev"),
 					jsx(ui.SettingsSecretField, {
 						id: "dac-apiKey", label: t("apiKey"), hint: t("apiKeyHint"), disabled,
