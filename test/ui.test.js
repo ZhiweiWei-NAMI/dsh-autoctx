@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRecordTap, registerUiRoutes } from '../uiapi.js';
+import { createRecordTap, registerUiRoutes, createSessionResolver } from '../uiapi.js';
 import { emptyPriors, setPrior } from '../priors.js';
 
 function fixture(overrides = {}) {
@@ -10,13 +10,20 @@ function fixture(overrides = {}) {
     set: async (model, value, reason) => { priorState = setPrior(priorState, model, value, 100, reason); } };
   const ctx = { inject: (_services, fn) => fn(ctx), effect: fn => fn(),
     connection: { fetch: { register: route => { routes.set(route.path, route); return () => {}; } } } };
-  const deps = { tap, priors, config: { routes: [{ id: 'r', model: 'custom', provider: 'p', efforts: ['high'] }], modelRoutes: { m: 'p' } },
-    catalog: [{ id: 'm', prior: 'catalog text', routes: ['p'] }], statsRoot: id => id === 'child' ? 'root' : id === 'grandchild' ? 'child' : id,
-    cwdOf: id => id === 'root' ? '/workspace' : undefined,
-    readLedger: async () => ({ history: Array.from({ length: 12 }, (_, i) => ({
+  const headers = new Map([
+    ['root', { id: 'root', cwd: '/workspace' }],
+    ['child', { id: 'child', cwd: '/child', parentSession: 'root' }],
+    ['grandchild', { id: 'grandchild', parentSession: 'child' }],
+  ]);
+  const resolveSession = createSessionResolver({ get: id => headers.has(id) ? { session: { header: headers.get(id) } } : undefined }, () => undefined);
+  const deps = { tap, priors, resolveSession, readStats: async () => undefined,
+    uiStore: { records: async () => [] }, record() {}, config: { routes: [{ id: 'r', model: 'custom', provider: 'p', efforts: ['high'] }], modelRoutes: { m: 'p' } },
+    catalog: [{ id: 'm', prior: 'catalog text', routes: ['p'] }],
+    readLedger: async () => ({ history: Array.from({ length: 50 }, (_, i) => ({
       version: i + 1, at: i + 1, via: 'auto', changes: [{ key: 't|m|worker', from: 0.5, to: 0.6,
         basis: 'Jev basis', evidence: ['turn:' + i], source: 'jev' }],
     })) }), ...overrides };
+  deps.readHistory ??= async cwd => (await deps.readLedger(cwd)).history;
   registerUiRoutes(ctx, deps);
   const request = async (path, body) => {
     const url = new URL('http://localhost/api/dsh-autoctx/' + path), route = routes.get(url.pathname);
@@ -39,7 +46,7 @@ test('injections use recipient session, retain metadata only, and have a bounded
   tap.push(injection('root', 2));
   const result = await request('injections?session=child');
   assert.deepEqual(result.body.injections, [injection('child')]);
-  assert.equal((await request('injections?session=unknown')).body.injections.length, 0);
+  assert.equal((await request('injections?session=unknown')).status, 404);
   assert.equal((await request('injections')).status, 400);
   const bounded = createRecordTap(1);
   bounded.push(injection('child')); bounded.push(injection('child', 2));
@@ -68,11 +75,11 @@ test('history pages all retained ledger entries and prior edits; filters include
   const { request, priors } = fixture();
   await priors.set('m', 'override', 'User rationale');
   let result = await request('history?session=child&limit=5');
-  assert.equal(result.body.total, 13);
+  assert.equal(result.body.total, 51);
   assert.equal(result.body.entries[0].kind, 'prior');
   assert.equal(result.body.nextOffset, 5);
-  result = await request('history?session=root&limit=5&offset=10');
-  assert.equal(result.body.entries.length, 3);
+  result = await request('history?session=root&limit=5&offset=50');
+  assert.equal(result.body.entries.length, 1);
   assert.equal(result.body.nextOffset, null);
   result = await request('history?session=root&q=turn%3A0');
   assert.equal(result.body.total, 1);
@@ -80,7 +87,7 @@ test('history pages all retained ledger entries and prior edits; filters include
   result = await request('history?kind=prior');
   assert.equal(result.body.total, 1);
   result = await request('history?session=root&via=auto');
-  assert.equal(result.body.total, 12);
+  assert.equal(result.body.total, 50);
 });
 
 test('old history without provenance projects missing fields without fabricated evidence counts', async () => {
@@ -105,8 +112,9 @@ test('priors list catalog and configured models; edits and clearing preserve rea
 test('invalid input returns 400; failed persistence returns 500 without exposing error text', async () => {
   const { request } = fixture();
   for (const path of ['history?session=root&limit=0', 'history?session=root&offset=-1', 'history?session=root&limit=101',
-    'history?session=root&kind=unknown', 'history?session=root&via=unknown', 'history?session=missing'])
+    'history?session=root&kind=unknown', 'history?session=root&via=unknown'])
     assert.equal((await request(path)).status, 400, path);
+  assert.equal((await request('history?session=missing')).status, 404);
   for (const body of ['{', [], { model: 'missing', value: 'text' }, { model: 'm', value: '' },
     { model: 'm', value: false }, { model: 'm', value: null, reason: 1 }])
     assert.equal((await request('priors', body)).status, 400);

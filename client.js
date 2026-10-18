@@ -43,7 +43,7 @@ window.__ModuleLoader__.load({
 			invalidWeight: "Enter a number from 0 to 1, or use Clear override.",
 			invalidPrior: "Enter nonempty prior text, or use Clear override.",
 			loadFailed: "Could not load this data.", loading: "Loading…", refresh: "Refresh view",
-			historyTitle: "Change history", noHistory: "No retained changes match these filters.",
+			historyTitle: "Change history", noHistory: "No retained changes match these filters.", revertVersion: "Revert v{version}",
 			historyHint: "All retained workspace ledger changes and deployment-wide prior edits. Older records may lack reasons or evidence ids.",
 			search: "Filter model, key, reason or evidence id", all: "All", previous: "Previous", next: "Next",
 			historyPage: "{start}–{end} of {total}", source: "Source", time: "Time", beforeAfter: "Before → after", changeReason: "Reason / Jev basis", evidenceIds: "Evidence source ids",
@@ -240,7 +240,7 @@ window.__ModuleLoader__.load({
 			priorValue: "能力先验文本", weightValue: "用户权重 [0,1]", userWeight: "用户权重",
 			invalidWeight: "请输入 0 到 1 的数字，或使用清除覆盖。", invalidPrior: "请输入非空先验文本，或使用清除覆盖。",
 			loadFailed: "无法读取数据。", loading: "读取中…", refresh: "刷新视图",
-			historyTitle: "变更历史", noHistory: "保留的变更中暂无匹配记录。",
+			historyTitle: "变更历史", noHistory: "保留的变更中暂无匹配记录。", revertVersion: "撤回 v{version}",
 			historyHint: "包含全部保留的工作区账本变更和部署级先验编辑。旧记录可能没有原因或证据 id。",
 			search: "筛选模型、key、原因或证据 id", all: "全部", previous: "上一页", next: "下一页",
 			historyPage: "{start}–{end} / {total}", source: "来源", time: "时间", beforeAfter: "修改前 → 修改后", changeReason: "原因 / Jev 依据", evidenceIds: "证据来源 id",
@@ -836,8 +836,9 @@ window.__ModuleLoader__.load({
 				] }, model.id))
 			] });
 		}
-		function HistoryPanel({ t, sessionId, kind, revision }) {
+		function HistoryPanel({ t, sessionId, kind, revision, post, busy }) {
 			const [offset, setOffset] = react.useState(0), [query, setQuery] = react.useState(""), [via, setVia] = react.useState("");
+			react.useEffect(() => setOffset(0), [sessionId, kind, revision]);
 			const params = new URLSearchParams({ offset: String(offset), limit: "25" });
 			if (sessionId) params.set("session", sessionId);
 			if (kind) params.set("kind", kind);
@@ -859,7 +860,8 @@ window.__ModuleLoader__.load({
 					jsx("div", { className: "dac-prose", "aria-label": t("beforeAfter"), children: valueText(entry.before) + " → " + valueText(entry.after) }),
 					jsx("div", { className: "dac-prose dac-sub", children: t("changeReason") + ": " + valueText(entry.reason) }),
 					jsx("div", { className: "dac-sub", children: Array.isArray(entry.evidence) ? t("evidence", { n: String(entry.evidence.length) }) : t("evidenceIds") + ": –" }),
-					Array.isArray(entry.evidence) && entry.evidence.length ? jsx("div", { className: "dac-prose dac-sub", children: entry.evidence.join("\n") }) : null
+					Array.isArray(entry.evidence) && entry.evidence.length ? jsx("div", { className: "dac-prose dac-sub", children: entry.evidence.join("\n") }) : null,
+					post && entry.kind === "ledger" && ["auto", "approved"].includes(entry.via) ? actionButton(t("revertVersion", { version: String(entry.version) }), () => post({ action: "revert", version: entry.version }), busy) : null
 				] }, entry.id)),
 				data ? jsxs("div", { className: "dac-actions", children: [
 					actionButton(t("previous"), () => setOffset(Math.max(0, offset - data.limit)), resource.loading || offset === 0),
@@ -869,7 +871,9 @@ window.__ModuleLoader__.load({
 			] });
 		}
 		function CandidatePanel({ t, sessionId }) {
-			const resource = useResource("candidates?session=" + encodeURIComponent(sessionId), undefined, 3000), data = resource.data;
+			const [offset, setOffset] = react.useState(0);
+			react.useEffect(() => setOffset(0), [sessionId]);
+			const resource = useResource("candidates?session=" + encodeURIComponent(sessionId) + "&offset=" + offset + "&limit=25", undefined, 3000), data = resource.data;
 			const candidates = (entries) => entries?.length ? table("minmax(0,1fr) minmax(0,1fr) auto", [t("colModel"), "provider / id", "efforts"],
 				entries.map((entry) => [entry.model ?? entry.id, [entry.provider, entry.id].filter(Boolean).join(" / ") || "–", entry.efforts?.join(", ") || "–"]))
 				: jsx("div", { className: "dac-hint", children: t("noCandidates") });
@@ -891,18 +895,29 @@ window.__ModuleLoader__.load({
 					jsx("div", { className: "dac-prose", children: t("basis") + ": " + valueText(pool.basis) }),
 					...(pool.unavailable ?? []).map((entry, index) => jsx("div", { className: "dac-prose dac-sub", children: t("unavailableModels") + ": " + entry.id + " · " + valueText(entry.reason) }, "u" + index)),
 					...(pool.filtered ?? []).map((entry, index) => jsx("div", { className: "dac-prose dac-sub", children: t("filtered") + ": " + entry.model + " · " + valueText(entry.reason) }, "f" + index))
-				] }, pool.role))
+				] }, pool.role)),
+				data && data.total > 25 ? jsx(PageControls, { t, data, setOffset, loading: resource.loading }) : null
+			] });
+		}
+		function PageControls({ t, data, setOffset, loading }) {
+			return jsxs("div", { className: "dac-actions", children: [
+				actionButton(t("previous"), () => setOffset(Math.max(0, data.offset - data.limit)), loading || data.offset === 0),
+				jsx("span", { className: "dac-hint", children: t("historyPage", { start: String(data.total ? data.offset + 1 : 0), end: String(Math.min(data.offset + data.limit, data.total)), total: String(data.total) }) }),
+				actionButton(t("next"), () => setOffset(data.nextOffset), loading || data.nextOffset === null)
 			] });
 		}
 		// No generic per-message decoration slot exists on this host. The additive turn-tail slot
 		// also renders in one-shot and embedded child Chat, where the ordinary composer is hidden.
 		function InjectionPanel({ t, sessionId, turn }) {
-			const resource = useResource("injections?session=" + encodeURIComponent(sessionId), undefined, turn.status === "open" ? 3000 : undefined);
+			const [offset, setOffset] = react.useState(0);
 			const start = turn.start?.time, end = turn.end?.time;
-			const entries = resource.data?.injections.filter((entry) => {
-				const at = typeof entry.at === "number" ? entry.at : Date.parse(entry.at);
-				return (turn.turn === 1 || start === undefined || at >= start) && (end === undefined || at <= end);
-			});
+			react.useEffect(() => setOffset(0), [sessionId, turn.turn, start, end]);
+			const params = new URLSearchParams({ session: sessionId, offset: String(offset), limit: "25" });
+			// Filter on the server before paging so an older turn never looks empty due to another turn.
+			if (turn.turn !== 1 && start !== undefined) params.set("start", String(start));
+			if (end !== undefined) params.set("end", String(end));
+			const resource = useResource("injections?" + params.toString(), undefined, turn.status === "open" ? 3000 : undefined);
+			const entries = resource.data?.injections;
 			return jsxs("details", { className: "dac-injections", children: [
 				jsx("summary", { children: t("injectedTitle") }),
 				jsx("div", { className: "dac-hint", children: t("injectionHint") }),
@@ -912,14 +927,14 @@ window.__ModuleLoader__.load({
 					jsx("span", { className: "dac-badge", children: entry.sourceLabel }),
 					jsx("div", { className: "dac-sub", children: valueText(entry.messageKind) + " · " + t("chars", { n: compact(entry.chars) }) + " · " + timeText(entry.at) }),
 					jsx("div", { className: "dac-sub", children: t("from") + ": " + valueText(entry.from) })
-				] }, entry.contentSha256 + ":" + index))
+				] }, entry.contentSha256 + ":" + index)),
+				resource.data && resource.data.total > 25 ? jsx(PageControls, { t, data: resource.data, setOffset, loading: resource.loading }) : null
 			] });
 		}
 		function SchedulePanel({ t, sessionId, stats, ledger, busy, failed, updated, post, revision }) {
 			const mode = ledger?.mode ?? stats.learning?.mode;
-			const history = ledger?.history ?? [];
-			const lastAuto = [...history].reverse().find((entry) => entry.via === "auto");
-			const reverted = !!lastAuto && history.some((entry) => entry.via === "revert" && entry.of === lastAuto.version);
+			const lastAuto = ledger?.lastAuto;
+			const reverted = ledger?.lastAutoReverted === true;
 			const changed = (lastAuto?.changes ?? []).filter((change) => "to" in change);
 			const pending = ledger?.pending;
 			const weights = ledger?.weights ?? [];
@@ -991,7 +1006,7 @@ window.__ModuleLoader__.load({
 					] })
 				] }) : null,
 				failed ? jsx("div", { className: "dac-hint", children: t("actionFailed") }) : null,
-				jsx(CandidatePanel, { t, sessionId }), jsx(HistoryPanel, { t, sessionId, revision }),
+				jsx(CandidatePanel, { t, sessionId }), jsx(HistoryPanel, { t, sessionId, revision, post, busy }),
 				jsx("div", { className: "dac-hint", children: t("feedbackNote") })
 			] });
 		}
@@ -1074,7 +1089,10 @@ window.__ModuleLoader__.load({
 			};
 			if (!stats) return jsxs("details", { className: "dac-sessionDetails", onToggle: (event) => setDetailsOpen(event.currentTarget.open), children: [
 				jsx("summary", { className: "dac-link", children: t("title") }),
-				detailsOpen ? jsxs("div", { className: "dac-card", children: [jsx(ResourceStatus, { t, resource: { failed: statsFailed || ledgerFailed } }), jsx(CandidatePanel, { t, sessionId }), jsx(HistoryPanel, { t, sessionId })] }) : null
+				detailsOpen ? jsxs("div", { className: "dac-card", children: [
+					jsx(ResourceStatus, { t, resource: { failed: statsFailed || ledgerFailed } }),
+					jsx(SchedulePanel, { t, sessionId, stats: {}, ledger, busy, failed, updated, post, revision })
+				] }) : null
 			] });
 			const decisions = stats.maxDecisions > 0 ? Math.min(1, stats.decisions / stats.maxDecisions) : 0;
 			const context = stats.pressureTokens > 0 && stats.contextTokens !== null
