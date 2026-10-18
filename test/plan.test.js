@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validatePlan, planGuard, contextOptions, sourceLabel, childPrompt, changedPaths, changesPlanFiles, suitabilityQuestions } from "../plan.js";
+import { validatePlan, planGuard, contextOptions, sourceLabel, childPrompt, changedPaths, changesPlanFiles, suitabilityQuestions, resultBlock } from "../plan.js";
 import { emptyRouteLedger, routeKey, routePrior, applyRouteFacts, verifiedRouteFacts } from "../routeledger.js";
 import { emptyLedger, weightKey, setUser } from "../ledger.js";
 import { costUSD } from "../models.js";
@@ -164,4 +164,13 @@ test("replans share the root child budget and validation errors remain errors", 
   assert.equal(rejected.isError, true);
   assert.match(rejected.error.message, /planMaxChildren/);
   assert.equal(app.dispatcher.stateFor(app.root).used, 1);
+});
+
+test("child results parse from the closing message's last json block without host outputSchema", () => {
+  const text = "Notes\n```json\n{\"summary\":\"old\"}\n```\nFinal\n```json\n" + JSON.stringify({ summary: "Fixed", filesChanged: ["a.py", 3],
+    testsRun: [{ command: "pytest a", outcome: "pass" }, { command: "x", outcome: "maybe" }], openIssues: [] }) + "\n```";
+  assert.deepEqual(resultBlock(text), { summary: "Fixed", filesChanged: ["a.py"], testsRun: [{ command: "pytest a", outcome: "pass" }], openIssues: [] });
+  assert.equal(resultBlock("no block"), undefined);
+  assert.equal(resultBlock("```json\nnot json\n```"), undefined);
+  assert.match(childPrompt({ session: "root", task: task(), brief: "b", dependencies: [] }), /```json block/);
 });

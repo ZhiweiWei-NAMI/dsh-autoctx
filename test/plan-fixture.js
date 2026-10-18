@@ -4,9 +4,9 @@ import { emptyRouteLedger, applyRouteFacts } from "../routeledger.js";
 
 export const task = (id = "work", extra = {}) => ({ id, kind: "implement", goal: "Fix the observed defect",
   owner: "delegate", files: [id + ".js"], acceptance: "The requested behavior works", context: ["parent-history"], ...extra });
-export const completed = (extra = {}) => ({ stopReason: "completed", output: [], structured: {
-  summary: "Completed assigned work", filesChanged: [], testsRun: [], openIssues: [],
-}, ...extra });
+export const resultText = (value = { summary: "Completed assigned work", filesChanged: [], testsRun: [], openIssues: [] }) =>
+  "Done.\n```json\n" + JSON.stringify(value) + "\n```";
+export const completed = (extra = {}) => ({ stopReason: "completed", output: [{ type: "text", text: resultText() }], ...extra });
 export const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 export function fakePlan(overrides = {}) {

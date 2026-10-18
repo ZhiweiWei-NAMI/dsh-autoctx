@@ -19,16 +19,21 @@ export const planParameters = {
     } },
   },
 };
-export const planOutputSchema = {
-  type: "object", additionalProperties: false, required: ["summary", "filesChanged", "testsRun", "openIssues"],
-  properties: {
-    summary: { type: "string" }, filesChanged: strings, openIssues: strings,
-    testsRun: { type: "array", items: {
-      type: "object", additionalProperties: false, required: ["command", "outcome"],
-      properties: { command: { type: "string" }, outcome: { type: "string", enum: ["pass", "fail", "error"] } },
-    } },
-  },
-};
+export function resultBlock(text) {
+  const blocks = [...String(text ?? "").matchAll(/```json\s*\n([\s\S]*?)```/g)];
+  if (!blocks.length) return undefined;
+  try {
+    const value = JSON.parse(blocks.at(-1)[1]);
+    const list = (items) => Array.isArray(items) ? items : [];
+    if (!value || typeof value !== "object" || typeof value.summary !== "string") return undefined;
+    return { summary: value.summary, filesChanged: list(value.filesChanged).filter((item) => typeof item === "string"),
+      testsRun: list(value.testsRun).filter((run) => run && typeof run.command === "string" &&
+        ["pass", "fail", "error"].includes(run.outcome)).map(({ command, outcome }) => ({ command, outcome })),
+      openIssues: list(value.openIssues).filter((item) => typeof item === "string") };
+  } catch {
+    return undefined;
+  }
+}
 const nonempty = (value) => typeof value === "string" && value.trim().length > 0;
 const stringList = (value) => Array.isArray(value) && value.every(nonempty);
 
@@ -124,7 +129,6 @@ export function contextOptions({ route, parent, prefixTokens, briefTokens, sibli
   const parentCached = sameSpace ? prefixTokens : 0;
   const options = [{ option: "parent-prefix", provider: "fork", sameSpace, carriesNeeded: true,
     ...estimate(parentCached, prefixTokens - parentCached + briefTokens),
-    cacheCaveat: "Host outputSchema adds a structured_output tool and trailing system instruction; same-space prefix reuse is an estimate, not a verified cache hit.",
     cache: sameSpace ? "same model/provider/effort cache space; estimated prefix reuse" : "different cache space: entire prefix re-read uncached on first request" }];
   for (const sibling of siblings.filter((sibling) => sameRoute(sibling.route, route) && sibling.status === "settled")) {
     const reused = sibling.latest ? switchEstimate({ latest: sibling.latest, target: sibling.latest, at: sibling.at,
@@ -166,7 +170,7 @@ export function childPrompt({ session, task, brief, dependencies }) {
     JSON.stringify({ id: task.id, kind: task.kind, goal: task.goal, acceptance: task.acceptance,
       files: task.files ?? [], context: task.context, dependsOn: dependencies }) +
     "\nRoot request and observed evidence (attributed background):\n" + brief +
-    "\nReturn summary, filesChanged, testsRun with actual command/outcome, and openIssues through structured_output. Do not claim unperformed work.";
+    "\nEnd your closing message with one ```json block {\"summary\": string, \"filesChanged\": [path], \"testsRun\": [{\"command\": string, \"outcome\": \"pass\"|\"fail\"|\"error\"}], \"openIssues\": [string]}. Do not claim unperformed work.";
 }
 
 export function assertWorkspaceFiles(task, cwd) {

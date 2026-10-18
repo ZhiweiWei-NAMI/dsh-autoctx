@@ -4,7 +4,7 @@ import { STATE_BYTES } from "./decisions.js";
 import {
   validatePlan, sameModelEffort, contextOptions, suitabilityQuestions, contextQuestions, childPrompt,
   planGuard, changedPaths, changesPlanFiles, workspacePath, assertWorkspaceFiles, sourceLabel, dispatcherLabel,
-  briefLabel, planOutputSchema,
+  briefLabel, resultBlock,
 } from "./plan.js";
 
 const errorResult = (error) => {
@@ -190,7 +190,6 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
   }
   function onResult(exec, result) {
     const assignment = children.get(exec.agent?.session.id);
-    if (assignment && !result.isError && exec.name === "structured_output") assignment.structured = exec.arguments;
     if (!assignment || result.isError || !changesPlanFiles(exec.name, exec.arguments, changesFilesCall)) return;
     for (const path of changedPaths(exec.name, exec.arguments)) assignment.touched.add(workspacePath(exec.agent.session.header.cwd, path));
   }
@@ -258,6 +257,7 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
   }
 
   function collect(state, assignment, outcome) {
+    outcome = { ...outcome, structured: outcome.structured ?? resultBlock(outputText(outcome.output)) };
     const pending = settle(state, assignment, outcome);
     state.settlements.add(pending);
     pending.catch((error) => record({ kind: "plan_settlement_failed", child: assignment.child, error: String(error) }))
@@ -291,7 +291,7 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
           } else {
             const activation = await ctx.subagents.startActivation({ childId: assignment.child, provider: assignment.option.provider,
               label: "Plan " + assignment.task.id, signal, delivery: "parent", request: {
-                parent: state.agent, prompt: [{ type: "text", text: content }], maxDepth: 1, outputSchema: planOutputSchema,
+                parent: state.agent, prompt: [{ type: "text", text: content }], maxDepth: 1,
                 ...(!sameModelEffort(assignment.route, currentRoute(state.agent)) ? {
                   agentOptions: { ...assignment.route, reasoningEffort: assignment.route.reasoningEffort },
                 } : {}),
@@ -364,8 +364,7 @@ export function createPlanDispatcher({ ctx, config, record, note, decide, curren
     onChildEnd(info) {
       const assignment = children.get(info.id);
       if (!assignment || assignment.option.provider !== "reuse" || !["starting", "running"].includes(assignment.status)) return;
-      return collect(stateFor(assignment.parent), assignment, { stopReason: info.stopReason, output: info.lastAssistantMessage,
-        structured: assignment.structured }).catch(() => {});
+      return collect(stateFor(assignment.parent), assignment, { stopReason: info.stopReason, output: info.lastAssistantMessage }).catch(() => {});
     },
     async mainDependency(exec) {
       const state = roots.get(exec.agent.session.id);

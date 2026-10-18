@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { apply } from "../index.js";
-import { fakePlan, task, completed, tick } from "./plan-fixture.js";
+import { fakePlan, task, completed, tick, resultText } from "./plan-fixture.js";
 
 test("delegation concludes the tool turn and queues a notice synchronously at turn/end", async () => {
   const app = fakePlan();
@@ -42,8 +42,7 @@ test("the next pre-step awaits establishment with reserved fork ids and unchange
   assert.equal(spec.delivery, "parent");
   assert.equal(spec.label, "Plan work");
   assert.equal(spec.request.maxDepth, 1);
-  for (const key of ["agentOptions", "persona", "toolFilter"]) assert.equal(Object.hasOwn(spec.request, key), false);
-  assert.deepEqual(spec.request.outputSchema.required, ["summary", "filesChanged", "testsRun", "openIssues"]);
+  for (const key of ["agentOptions", "persona", "toolFilter", "outputSchema"]) assert.equal(Object.hasOwn(spec.request, key), false);
   release();
   await preStep;
   assert.equal(admitted, true);
@@ -57,7 +56,7 @@ test("dependent children start after settlement with the dependency's actual str
   app.end();
   await app.start();
   assert.equal(app.starts.length, 1);
-  const outcome = completed({ structured: { summary: "Defect is in the missing branch", filesChanged: [], testsRun: [], openIssues: [] } });
+  const outcome = completed({ output: [{ type: "text", text: resultText({ summary: "Defect is in the missing branch", filesChanged: [], testsRun: [], openIssues: [] }) }] });
   app.starts[0].settle(outcome);
   await tick();
   assert.equal(app.starts.length, 1);
@@ -101,7 +100,7 @@ test("mediation appends a labelled summary to each running sibling", async () =>
   await app.accept([task("a"), task("b")]);
   app.end();
   await app.start();
-  app.starts[0].settle(completed({ structured: { summary: "Observed a shared interface mismatch", filesChanged: [], testsRun: [], openIssues: [] } }));
+  app.starts[0].settle(completed({ output: [{ type: "text", text: resultText({ summary: "Observed a shared interface mismatch", filesChanged: [], testsRun: [], openIssues: [] }) }] }));
   await tick();
   assert.equal(app.decisions.filter((request) => request.trigger === "plan_mediation").length, 1);
   assert.equal(app.messages.length, 1);
@@ -168,9 +167,7 @@ test("a settled sibling is reused by append-only delivery in the same route", as
   assert.equal(app.messages.length, 1);
   assert.equal(app.messages[0].targetId, child);
   assert.match(app.messages[0].content[0].text, /^\[from parent root · brief · via dsh-autoctx\]/);
-  app.dispatcher.onResult(app.exec("structured_output", completed().structured,
-    { session: { id: child, header: { parentSession: "root" } } }), { isError: false });
-  await app.dispatcher.onChildEnd({ id: child, stopReason: "completed", lastAssistantMessage: [] });
+  await app.dispatcher.onChildEnd({ id: child, stopReason: "completed", lastAssistantMessage: completed().output });
   assert.equal(app.records.filter((record) => record.kind === "child_settled").length, 2);
 });
 
