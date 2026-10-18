@@ -31,6 +31,8 @@ import {
 import { AUTOCTX_FORK, createClosedStepForkProvider, createSeedRequestAudit, childSeedFacts, requestConfig, sameRequestConfig } from "./seed.js";
 import { createOwnershipTracker, ownershipContract, appendOwnershipResult } from "./ownership.js";
 import { newStats, applyStatsRecord } from "./stats.js";
+import { registerUiRoutes, createRecordTap } from "./uiapi.js";
+import { openPriors, priorTextOf } from "./priors.js";
 import { createPlanDispatcher } from "./plandispatch.js";
 import { planParameters, dispatcherLabel } from "./plan.js";
 import { emptyRouteLedger, applyRouteFacts } from "./routeledger.js";
@@ -52,7 +54,7 @@ import {
   modelInfo,
   availableModels,
   pickModel,
-  knowledge,
+  knowledge as catalogKnowledge,
   costUSD,
   jevCostUSD,
   routePolicy,
@@ -609,7 +611,22 @@ export function apply(ctx, options) {
       });
     return budgets.get(id);
   };
+  // UI tap (bounded, whitelisted metadata) first, independent of record-file logging.
+  const tap = createRecordTap(1000);
+  // Deployment-wide capability-prior overrides; apply stays synchronous. Overrides apply once the store is open
+  // (knowledge is first built when a root task starts); before that the catalog prior is used and recorded.
+  let priorsStore;
+  const priorsReady = openPriors(ctx).then((store) => (priorsStore = store), (error) => {
+    record({ kind: "priors_unavailable", error: String(error) });
+    return undefined;
+  });
+  const priorOverride = (id) => (priorsStore ? priorTextOf(id) : undefined);
+  const knowledge = (list) => {
+    if (!priorsStore) record({ kind: "priors_not_ready" });
+    return catalogKnowledge(list.map((entry) => ({ ...entry, prior: priorOverride(entry.id) ?? entry.prior })));
+  };
   const record = (value) => {
+    tap.push({ at: Date.now(), ...value });
     if (config.recordFile)
       fs.appendFileSync(
         config.recordFile,
@@ -720,7 +737,7 @@ export function apply(ctx, options) {
       updatedAt: entry.updatedAt,
     })),
     pending: ledger.pending,
-    history: ledger.history.slice(-8),
+    history: ledger.history,
   });
   async function ledgerRoute(request) {
     const url = new URL(request.url);
@@ -736,11 +753,11 @@ export function apply(ctx, options) {
       reject: (ledger) => reject(ledger, body.version, now),
       revert: (ledger) => revert(ledger, body.version, now),
       mode: (ledger) => ({ ledger: setMode(ledger, body.mode) }),
-      user: (ledger) => ({ ledger: setUser(ledger, body.key, body.value ?? null, now) }),
+      user: (ledger) => ({ ledger: setUser(ledger, body.key, body.value ?? null, now, body.reason) }),
     };
     if (!actions[body.action] || (body.action === "mode" && !MODES.includes(body.mode)))
       return json({ error: "unknown action" }, 400);
-    if (body.action === "user" && (typeof body.key !== "string" || (body.value !== null && !(body.value >= 0 && body.value <= 1))))
+    if (body.action === "user" && (typeof body.key !== "string" || !body.key.trim() || (body.value != null && (typeof body.value !== "number" || !Number.isFinite(body.value) || body.value < 0 || body.value > 1)) || (body.reason !== undefined && typeof body.reason !== "string")))
       return json({ error: "user weight needs a key and a value in [0, 1] or null" }, 400);
     const result = await updateLedger(cwd, actions[body.action]);
     record({ kind: "ledger_action", cwd, action: body.action, version: body.version, error: result.error });
@@ -926,6 +943,14 @@ export function apply(ctx, options) {
     });
     return result;
   }
+  registerUiRoutes(ctx, { config, readLedger, updateLedger, statsRoot,
+    cwdOf: (id) => ctx.agents.get(id)?.session.header.cwd, catalog: CATALOG.models, tap,
+    priors: { snapshot: () => priorsStore?.snapshot() ?? { overrides: {}, history: [] },
+      set: async (...args) => {
+        const store = await priorsReady;
+        if (!store) throw new Error("AutoCTX prior overrides are unavailable (storage domain did not open).");
+        return store.set(...args);
+      } } });
 
   const newUse = (turn) => ({
     turn,
@@ -2956,6 +2981,7 @@ export function apply(ctx, options) {
     // headless runner still owns waitForChildren and settlement wakeups.
     if (event.type === "assistant/message" && config.mode === "auto" &&
         session.header.parentSession === undefined &&
+        Array.isArray(event.data?.message?.content) &&
         !event.data.message.content.some((block) => block.type === "tool-call")) {
       const agent = ctx.agents.get(session.id);
       if (agent && modeOf(agent) === "auto") {

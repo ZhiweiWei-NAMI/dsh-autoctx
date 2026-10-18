@@ -98,7 +98,7 @@ export function createOwnershipTracker(record, now = () => new Date().toISOStrin
     record({ kind: "child_result_delivered", parent, child, at: now(), via });
   };
   const observeMessage = (parent, message) => {
-    const source = message.source;
+    const source = message?.source;
     if (source?.kind === "agent-message" || source?.kind === "subagent-settled")
       deliver(parent, source.senderSessionId, message, source.kind === "agent-message" ? "send_message" : "settlement-inbox");
   };
@@ -132,7 +132,7 @@ export function createOwnershipTracker(record, now = () => new Date().toISOStrin
       if (entry) { entry.running = false; entry.state = state(entry); }
     },
     onEvent(session, event) {
-      if (event.type === "agent/inbox/spliced") for (const message of event.data.inserted) observeMessage(session.id, message);
+      if (event.type === "agent/inbox/spliced") for (const message of event.data?.inserted ?? []) observeMessage(session.id, message);
       if (event.type === "user/message") observeMessage(session.id, event.data);
     },
     // The actual model boundary, not pre-step admission or inbox claiming.

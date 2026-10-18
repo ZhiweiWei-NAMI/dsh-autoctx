@@ -10,6 +10,8 @@
   "license": "MIT",
   "files": [
     "index.js",
+    "ownership.js",
+    "seed.js",
     "plan.js",
     "plandispatch.js",
     "routeledger.js",

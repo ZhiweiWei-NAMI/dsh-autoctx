@@ -869,7 +869,8 @@ test("a fresh root can use every child slot through the real guard, then decline
     const result = await app.execute("Investigate part " + i);
     assert.equal(result.isError, false);
     const child = app.children.at(-1);
-    assert.equal(child.provider, "fork");
+    // Routed children use AutoCTX's closed-step fork provider (native fork otherwise).
+    assert.equal(child.provider, "autoctx-fork");
     app.handlers.get("subagent/end")({
       id: child.id,
       runId: child.id + "-run",
