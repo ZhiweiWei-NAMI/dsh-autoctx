@@ -148,10 +148,10 @@ export function contextOptions({ route, parent, prefixTokens, briefTokens, sibli
 
 export function suitabilityQuestions(subtasks, profiles, prior) {
   return Object.fromEntries(subtasks.map((task, i) => ["route_" + i, {
-    type: "choice", instructions: "Choose for task suitability; do not consider caching. Use the subtask kind, goal, acceptance and frozen routing prior.",
+    type: "choice", instructions: "Choose for task suitability; do not consider caching. Use the subtask kind, goal, acceptance and frozen routing prior. When suitability is comparable, prefer preferredRoute=true; other listed routes are valid when clearly more suitable.",
     criteria: Object.fromEntries(profiles.map((profile, j) => ["p" + j, JSON.stringify({
       model: profile.options.model, effort: profile.options.reasoningEffort ?? "default", capability: profile.capability,
-      knowledge: profile.knowledge, prior: routePrior(prior, routeKey(task.kind, profile.options.model, profile.options.reasoningEffort)),
+      knowledge: profile.knowledge, ...(profile.route === undefined ? {} : { route: profile.route, preferredRoute: !!profile.preferredRoute }), prior: routePrior(prior, routeKey(task.kind, profile.options.model, profile.options.reasoningEffort)),
     })])),
   }]));
 }

@@ -50,7 +50,7 @@ import {
   knowledge,
   costUSD,
   jevCostUSD,
-  preferRoutes,
+  routePolicy,
 } from "./models.js";
 import {
   emptyLedger,
@@ -176,7 +176,12 @@ export const Config = z.object({
     .array(z.string())
     .default([])
     .volatile()
-    .description("Providers whose models are used for executor-side roles whenever one fits; others are fallbacks. Jev keeps its own route"),
+    .description("Preferred providers for executor-side roles (the default choice when suitability is comparable). Jev keeps its own route"),
+  allowedProviders: z
+    .array(z.string())
+    .default([])
+    .volatile()
+    .description("Further valid providers for executor-side roles; with preferredProviders they exclude other providers whenever one fits"),
   modelRoutes: z
     .dict(z.string())
     .default({})
@@ -802,10 +807,11 @@ export function apply(ctx, options) {
   const planProfiles = async (agent, signal) => {
     const profiles = [];
     const configured = config.routes?.length ? config.routes : [buildDefaultRoute(planRoute(agent))];
-    const preference = preferRoutes(configured, (route) => route.provider ?? planRoute(agent).provider, config.preferredProviders);
-    if (preference.dropped.length)
-      record({ kind: "route_policy", session: agent.session.id, role: "worker", dropped: preference.dropped.map((route) => route.id) });
-    for (const route of preference.kept) {
+    const routeOf = (route) => route.provider ?? planRoute(agent).provider;
+    const policy = routePolicy(configured, routeOf, { preferred: config.preferredProviders, allowed: config.allowedProviders });
+    if (policy.dropped.length)
+      record({ kind: "route_policy", session: agent.session.id, role: "worker", dropped: policy.dropped.map((route) => route.id) });
+    for (const route of policy.kept) {
       for (const effort of route.efforts?.length ? route.efforts : [undefined]) {
         const options = { provider: route.provider ?? planRoute(agent).provider, model: route.model,
           ...(effort === undefined ? {} : { reasoningEffort: effort }) };
@@ -813,6 +819,7 @@ export function apply(ctx, options) {
           await ctx.llm.prepareCall(options, signal);
           const info = modelInfo(route.model);
           profiles.push({ id: route.id + "/" + (effort ?? "default"), options, capability: route.description,
+            route: routeOf(route), preferredRoute: (config.preferredProviders ?? []).includes(routeOf(route)),
             ...(info ? { knowledge: knowledge([info]) } : {}) });
         } catch (error) {
           if (signal.aborted) throw error;
@@ -1783,18 +1790,21 @@ export function apply(ctx, options) {
       if (Number.isFinite(entry.context) && entry.context < 2 * briefTokens)
         filtered.push({ model: entry.id, reason: "context window " + entry.context + " is below twice the brief" });
       else fitting.push(entry);
-    const preference = preferRoutes(fitting, (entry) => providerOf(agent, entry.id), config.preferredProviders);
-    for (const entry of preference.dropped)
-      filtered.push({ model: entry.id, reason: "a preferred-provider model fits this role (preferredProviders)" });
-    if (preference.dropped.length)
-      record({ kind: "route_policy", session: root, role, dropped: preference.dropped.map((entry) => entry.id) });
-    const candidates = preference.kept;
+    const policy = routePolicy(fitting, (entry) => providerOf(agent, entry.id),
+      { preferred: config.preferredProviders, allowed: config.allowedProviders });
+    for (const entry of policy.dropped)
+      filtered.push({ model: entry.id, reason: "a preferred or allowed provider model fits this role (preferredProviders/allowedProviders)" });
+    if (policy.dropped.length)
+      record({ kind: "route_policy", session: root, role, dropped: policy.dropped.map((entry) => entry.id) });
+    const candidates = policy.kept;
     const rowsNow = () => candidates.map((entry) => ({ model: entry.id, ...weight(entry.id) }));
     const rows = rowsNow();
     const fallback = () =>
-      pickModel(role, { available: candidates, weightOf: (id) => weight(id).weight });
+      pickModel(role, { available: policy.preferredOnly.length ? policy.preferredOnly : candidates, weightOf: (id) => weight(id).weight });
     if (setting === "auto" && candidates.length && budget(root).decisions < config.maxDecisions) {
-      const criteria = Object.fromEntries(candidates.map((entry) => [entry.id, knowledge([entry])]));
+      const routeNote = (entry) => (config.preferredProviders ?? []).length
+        ? "\nroute: " + providerOf(agent, entry.id) + (policy.isPreferred(entry) ? " (preferred)" : " (valid alternative)") : "";
+      const criteria = Object.fromEntries(candidates.map((entry) => [entry.id, knowledge([entry]) + routeNote(entry)]));
       const models = modelKnowledge.get(root);
       const request = {
         ...(models ? { models } : {}),

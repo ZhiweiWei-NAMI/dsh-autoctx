@@ -62,13 +62,16 @@ export function availableModels(modelRoutes, { allowPaid = false } = {}) {
   });
 }
 
-// Route preference: when a model on a preferred provider meets the role's hard requirements, the others step aside.
-export function preferRoutes(items, providerOf, preferred = []) {
+// Route policy: when a model on a preferred or allowed provider meets the role's hard requirements, models on
+// other providers step aside. Preferred marks the default choice; allowed routes stay valid alternatives.
+export function routePolicy(items, providerOf, { preferred = [], allowed = [] } = {}) {
   const list = Array.isArray(items) ? items : [];
-  const wanted = new Set(Array.isArray(preferred) ? preferred : []);
-  const kept = list.filter(item => wanted.has(providerOf(item)));
-  if (!wanted.size || !kept.length) return { kept: list, dropped: [] };
-  return { kept, dropped: list.filter(item => !wanted.has(providerOf(item))) };
+  const top = new Set(Array.isArray(preferred) ? preferred : []);
+  const eligible = new Set([...top, ...(Array.isArray(allowed) ? allowed : [])]);
+  const kept = list.filter(item => eligible.has(providerOf(item)));
+  const isPreferred = item => top.has(providerOf(item));
+  if (!eligible.size || !kept.length) return { kept: list, dropped: [], preferredOnly: list.filter(isPreferred), isPreferred };
+  return { kept, dropped: list.filter(item => !eligible.has(providerOf(item))), preferredOnly: kept.filter(isPreferred), isPreferred };
 }
 
 // Fallback without a Jev answer: the highest effective ledger weight for this role, then the cheapest brief.

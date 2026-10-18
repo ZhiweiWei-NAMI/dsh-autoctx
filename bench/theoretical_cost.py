@@ -108,6 +108,9 @@ def case_totals(case_dir, prices, jev_prices, ttl):
             if p is None:
                 c[name + '_unpriced'] += 1
                 continue
+            if p.get('above') and r['inputTokens'] > p['above']['tokens']:
+                # Long-context tiers are not priced here (base rates apply); count them so a report can state it.
+                c[name + '_above_tier'] += 1
             c[f'{name}_usd_{role}'] += ((r['inputTokens'] - hit) * p.get('cacheWrite', p['input']) + hit * p['cacheRead']
                                         + (r.get('outputTokens') or 0) * p['output']) / 1e6
     return c
@@ -120,7 +123,7 @@ def summary(c, method):
     usd = {'executor': c[f'{method}_usd_main'], 'compaction': c[f'{method}_usd_compaction'],
            'children': c[f'{method}_usd_child'], 'jev': c['usd_jev']}
     return {'method': method, 'cases': c['cases'], 'resolved': c['resolved'], 'missingUsage': c['missingUsage'],
-            'unpricedRequests': c[method + '_unpriced'], 'cacheRateMain': rate(['main']), 'cacheRateChildren': rate(['child']),
+            'unpricedRequests': c[method + '_unpriced'], 'aboveTierRequestsAtBaseRate': c[method + '_above_tier'], 'cacheRateMain': rate(['main']), 'cacheRateChildren': rate(['child']),
             'cacheRateAll': rate(['main', 'compaction', 'child']),
             'usd': {**usd, 'total': sum(usd.values())}, 'label': 'theoretical estimate, not billed cost'}
 

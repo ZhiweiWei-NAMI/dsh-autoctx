@@ -86,15 +86,33 @@ test('malformed entries are skipped by selection and knowledge stays lenient',()
   assert.equal(briefCost({id:'broken'}),Infinity);
 });
 
-test("preferRoutes keeps preferred-provider models when one fits and falls back otherwise", async () => {
-  const { preferRoutes } = await import("../models.js");
-  const routes = { "deepseek-v4-pro": "workbuddy", "glm-5.3": "workbuddy", "claude-haiku-5-5": "opencode-go-anthropic" };
+test("routePolicy keeps preferred and allowed routes, drops others when one fits, and falls back otherwise", async () => {
+  const { routePolicy } = await import("../models.js");
+  const routes = { "deepseek-v4-pro": "workbuddy", "gpt-6.1-sol": "openai-codex", "claude-haiku-5-5": "opencode-go-anthropic" };
   const items = Object.keys(routes).map((id) => ({ id }));
   const by = (item) => routes[item.id];
-  const preferred = preferRoutes(items, by, ["workbuddy"]);
-  assert.deepEqual(preferred.kept.map((item) => item.id), ["deepseek-v4-pro", "glm-5.3"]);
-  assert.deepEqual(preferred.dropped.map((item) => item.id), ["claude-haiku-5-5"]);
-  const only = preferRoutes([{ id: "claude-haiku-5-5" }], by, ["workbuddy"]);
-  assert.deepEqual(only, { kept: [{ id: "claude-haiku-5-5" }], dropped: [] });
-  assert.deepEqual(preferRoutes(items, by, []), { kept: items, dropped: [] });
+  const policy = routePolicy(items, by, { preferred: ["workbuddy"], allowed: ["openai-codex"] });
+  assert.deepEqual(policy.kept.map((item) => item.id), ["deepseek-v4-pro", "gpt-6.1-sol"]);
+  assert.deepEqual(policy.dropped.map((item) => item.id), ["claude-haiku-5-5"]);
+  assert.deepEqual(policy.preferredOnly.map((item) => item.id), ["deepseek-v4-pro"]);
+  assert.equal(policy.isPreferred({ id: "gpt-6.1-sol" }), false);
+  const codexOnly = routePolicy([{ id: "gpt-6.1-sol" }, { id: "claude-haiku-5-5" }], by, { preferred: ["workbuddy"], allowed: ["openai-codex"] });
+  assert.deepEqual(codexOnly.kept.map((item) => item.id), ["gpt-6.1-sol"]);
+  assert.deepEqual(codexOnly.preferredOnly, []);
+  const none = routePolicy([{ id: "claude-haiku-5-5" }], by, { preferred: ["workbuddy"], allowed: ["openai-codex"] });
+  assert.deepEqual(none.kept.map((item) => item.id), ["claude-haiku-5-5"]);
+  assert.deepEqual(routePolicy(items, by).kept, items);
+});
+
+test("DSH GPT-family entries carry list prices, the long-context tier and the openai-codex route", async () => {
+  const { modelInfo, costUSD } = await import("../models.js");
+  for (const id of ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+    const entry = modelInfo(id);
+    assert.deepEqual(entry.routes, ["openai-codex"], id);
+    for (const key of ["input", "output", "cacheRead", "cacheWrite"]) assert.equal(typeof entry.price[key], "number", id + " " + key);
+    assert.equal(entry.price.above.tokens, 272000);
+  }
+  const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-9, a + " != " + b);
+  near(costUSD("gpt-6.1-sol", { inputTokens: 100000, cacheReadTokens: 100000, outputTokens: 10000 }), 0.2 + 0.01 + 0.1);
+  near(costUSD("gpt-6.1-sol", { inputTokens: 200000, cacheReadTokens: 100000, outputTokens: 10000 }), 0.8 + 0.02 + 0.15);
 });
