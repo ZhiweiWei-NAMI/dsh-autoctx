@@ -28,7 +28,8 @@ import {
   createMessageAudit,
   profileCandidates,
 } from "./routing.js";
-import { AUTOCTX_FORK, createClosedStepForkProvider, childSeedFacts, requestConfig, sameRequestConfig } from "./seed.js";
+import { AUTOCTX_FORK, createClosedStepForkProvider, createSeedRequestAudit, childSeedFacts, requestConfig, sameRequestConfig } from "./seed.js";
+import { createOwnershipTracker, ownershipContract, appendOwnershipResult } from "./ownership.js";
 import { newStats, applyStatsRecord } from "./stats.js";
 import { createPlanDispatcher } from "./plandispatch.js";
 import { planParameters, dispatcherLabel } from "./plan.js";
@@ -784,9 +785,14 @@ export function apply(ctx, options) {
   });
   const routedSeeds = new Map();
   const messageAudit = createMessageAudit(record);
+  const ownership = createOwnershipTracker(record);
+  const ownershipContracts = new WeakMap();
+  const ownershipCalls = new WeakMap();
+  const seedRequests = createSeedRequestAudit(record);
   ctx.on("dispose", () => messageAudit.clear());
-  const routedFork = createClosedStepForkProvider(ctx.subagents, (request, facts) => {
+  const routedFork = createClosedStepForkProvider(ctx.subagents, (request, facts, prepared) => {
     routedSeeds.set(request.sessionId, facts);
+    seedRequests.prepared(request, facts, prepared);
   });
   const listChildren = async (id, signal) =>
     (await ctx.subagents.listChildren(id, signal)).map((child) => ({
@@ -1355,6 +1361,7 @@ export function apply(ctx, options) {
     routedSeeds.delete(info.id);
   });
   ctx.on("subagent/end", async (info) => {
+    ownership.end(info.id);
     if (config.mode === "plan") return planDispatcher.onChildEnd(info);
     const running = active.get(info.id);
     if (!running) throw new Error("Native child ended without a start.");
@@ -2158,6 +2165,8 @@ export function apply(ctx, options) {
     resources.pending.add(exec.callId);
     let id,
       previous,
+      ownershipReservation,
+      accepted = false,
       started = false;
     try {
       const decision = await decide(parent, request, exec.signal);
@@ -2183,6 +2192,8 @@ export function apply(ctx, options) {
         resources.pending.delete(exec.callId);
         id = selected.child.id;
         previous = settled.get(id)?.runId;
+        ownershipReservation = ownership.reserve({ child: id, parent: parent.session.id,
+          description: args.description, assignment: args.prompt, cwd: parent.session.header.cwd });
         const messageId = await messageAudit.deliver(id, parent.session.id, "assignment",
           "AutoCTX delegation · " + (selected.child.profile ?? id), args.prompt, () => ctx.subagents.sendMessage(
             parent,
@@ -2191,8 +2202,12 @@ export function apply(ctx, options) {
             { signal: exec.signal },
           ));
         record({ kind: "child_reused", parent: parent.session.id, id, messageId });
+        ownershipReservation.accept();
+        accepted = true;
       } else {
         id = reserved;
+        ownershipReservation = ownership.reserve({ child: id, parent: parent.session.id,
+          description: args.description, assignment: args.prompt, cwd: parent.session.header.cwd });
         const task =
           "Your assigned subtask:\n" +
           args.prompt +
@@ -2238,16 +2253,21 @@ export function apply(ctx, options) {
         // infrastructure failure even though worker collection uses events.
         activation.result?.catch((error) =>
           record({ kind: "child_activation_failed", parent: parent.session.id, id, error: String(error) }));
+        ownershipReservation.accept();
+        accepted = true;
         started = true;
       }
     } finally {
+      if (!accepted) ownershipReservation?.cancel();
       if (!started) {
         routedSeeds.delete(reserved);
+        seedRequests.cancel(reserved);
         resources.pending.delete(exec.callId);
         if (assignments.delete(reserved)) await persistedAssignments.delete(reserved);
       }
     }
-    if (args.run_in_background !== false) return { kind: "continuable", subagentId: id };
+    const contract = ownershipContract(id, args.description);
+    if (args.run_in_background !== false) return { kind: "continuable", subagentId: id, contract };
     const outcome = await awaitSettlement(id, previous, exec.signal);
     recordCollection(parent.session.id, id, outcome);
     if (outcome.stopReason !== "completed")
@@ -2261,12 +2281,14 @@ export function apply(ctx, options) {
     if (reports.has(outcome.runId))
       return {
         kind: "foreground",
+        subagentId: id,
+        contract,
         runId: outcome.runId,
         output: [{ type: "text", text: reports.get(outcome.runId) }],
       };
     if (!Array.isArray(outcome.lastAssistantMessage) || !outcome.lastAssistantMessage.length)
       throw new Error("Native child completed without a final output to collect.");
-    return { kind: "foreground", runId: outcome.runId, output: outcome.lastAssistantMessage };
+    return { kind: "foreground", subagentId: id, contract, runId: outcome.runId, output: outcome.lastAssistantMessage };
   }
 
   function recordCollection(parent, id, outcome) {
@@ -2307,6 +2329,7 @@ export function apply(ctx, options) {
       return next();
     }
     if (routedSessions.has(session) && modeOf(agent) === "auto") {
+      ownershipCalls.set(exec, ownership.toolSnapshot(session, exec.name, exec.arguments, agent.session.header.cwd));
       if (delegation.has(exec.name)) {
         try {
           const violations = validateJsonSchemaValue(
@@ -2319,7 +2342,7 @@ export function apply(ctx, options) {
             exec.arguments,
             exec,
           );
-          const content =
+          const output =
             value.kind === "foreground"
               ? value.output.filter((block) => block.type === "text" || block.type === "image")
               : [
@@ -2328,10 +2351,15 @@ export function apply(ctx, options) {
                     text: `Started subagent ${value.subagentId} in the background; its result arrives as a message.`,
                   },
                 ];
+          const content = [...output, { type: "text", text: value.contract }];
+          ownershipContracts.set(exec, value.contract);
           // 0.2.1 validates wrapper-authored values against an activation-only
           // tool output schema. Keep the internal routing/collection contract.
           const activationOutput = ctx.tools.get(exec.name, agent).output?.schema?.properties?.kind?.const === "activation";
-          return { isError: false, value: activationOutput ? { kind: "activation", subagentId: value.subagentId } : value, content };
+          const nativeValue = activationOutput ? { kind: "activation", subagentId: value.subagentId } : value.kind === "foreground"
+            ? { kind: "foreground", runId: value.runId, output: value.output }
+            : { kind: "continuable", subagentId: value.subagentId };
+          return { isError: false, value: nativeValue, content };
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           return { isError: true, error: { message }, content: [{ type: "text", text: message }] };
@@ -2361,6 +2389,27 @@ export function apply(ctx, options) {
       return result;
     }
     return next();
+  });
+
+  // 0.2.1 re-renders wrapper-authored successful values at the tools/execute
+  // boundary. The native post-execute content override survives normalization
+  // without changing the tool's schema, typed value or concurrency policy.
+  ctx.on("tools/post-execute", async (exec, result, next) => {
+    const decision = await next();
+    const agent = exec.agent;
+    if (decision.kind !== "accept" || !agent || !routedSessions.has(agent.session.id) || modeOf(agent) !== "auto") return decision;
+    const notes = ownership.toolNotes(agent.session.id, exec.name, exec.arguments, agent.session.header.cwd, ownershipCalls.get(exec));
+    ownershipCalls.delete(exec);
+    const contract = ownershipContracts.get(exec);
+    ownershipContracts.delete(exec);
+    const content = decision.content ?? result.content ?? [];
+    if (contract && !result.isError && !content.some((block) => block.type === "text" && block.text === contract)) notes.unshift(contract);
+    if (!notes.length) return decision;
+    // Preserve another interceptor's typed-value replacement. Its new render
+    // is host-owned; additional inbox context is the native supported channel.
+    if (Object.hasOwn(decision, "value")) return { ...decision,
+      additionalContexts: [...(decision.additionalContexts ?? []), ...notes.map(note)] };
+    return appendOwnershipResult({ ...decision, content }, notes);
   });
 
   const injectingCompactions = new Set();
@@ -2841,6 +2890,10 @@ export function apply(ctx, options) {
     const dispatchEstimate = agent ? ctx.tokenMeter.measure(agent.session).totalTokens : undefined;
     if (agent) updateStats(rootOf(agent), { nativeEstimate: dispatchEstimate });
     try {
+      if (agent && options.purpose === undefined) {
+        seedRequests.onRequest(agent, options);
+        ownership.onRequest(agent.session.id, options.messages);
+      }
       for await (const chunk of next()) {
         if (chunk.type === "usage") usage = chunk.usage;
         yield chunk;
@@ -2897,6 +2950,19 @@ export function apply(ctx, options) {
   });
   ctx.on("session/event", (session, event) => {
     messageAudit.onEvent(session, event);
+    ownership.onEvent(session, event);
+    // Only a tool-free assistant message attempts to finish. Steering once
+    // lets the model see the contract, then yield normally; the native
+    // headless runner still owns waitForChildren and settlement wakeups.
+    if (event.type === "assistant/message" && config.mode === "auto" &&
+        session.header.parentSession === undefined &&
+        !event.data.message.content.some((block) => block.type === "tool-call")) {
+      const agent = ctx.agents.get(session.id);
+      if (agent && modeOf(agent) === "auto") {
+        const content = ownership.dependencyNote(session.id);
+        if (content) agent.steer(note(content));
+      }
+    }
     // Record the committed, host-framed checkpoint, not the unframed summary
     // returned by summarize(). This also covers native summaries via our engine.
     if (injectingCompactions.has(session.id) && event.type === "user/message" &&

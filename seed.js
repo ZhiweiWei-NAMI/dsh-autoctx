@@ -39,8 +39,55 @@ export function createClosedStepForkProvider(subagents, onPrepared = () => {}) {
       // initial inbox acceptance, continuation and disposal) remains host-owned.
       const prepared = seed ? { seed } : await provider.prepareContinuable(request);
       onPrepared(request, { seeded: prepared.seed !== undefined, seedEvents: prepared.seed?.length ?? 0,
-        seedBoundary: seed ? "closed-step" : prepared.seed?.length ? "completed-turn" : "empty" });
+        seedBoundary: seed ? "closed-step" : prepared.seed?.length ? "completed-turn" : "empty" }, prepared);
       return prepared;
+    },
+  };
+}
+
+// Observe the model-visible projection, after the host has reconciled system
+// messages and committed inbox input. Event counts are not message counts.
+export function createSeedRequestAudit(record) {
+  const parentRequests = new Map(), pending = new Map();
+  return {
+    prepared(request, facts, prepared) {
+      const parent = request.parent.session.id;
+      const observed = parentRequests.get(parent);
+      const boundaryStep = prepared?.seed?.findLast((event) => event.type === "step/start");
+      // For a nonempty seed, use the parent's request at that seed's last
+      // step, not its later delegation request (which may have more messages).
+      pending.set(request.sessionId, { ...facts, parent,
+        parentRequestMessages: boundaryStep ? observed?.steps.get(boundaryStep.seq) : observed?.latest });
+    },
+    cancel(child) { pending.delete(child); },
+    onRequest(agent, options) {
+      if (options.purpose !== undefined) return;
+      const id = agent.session.id;
+      if (agent.session.header.parentSession === undefined) {
+        if (!parentRequests.has(id)) parentRequests.set(id, { steps: new Map() });
+        const observed = parentRequests.get(id);
+        observed.latest = options.messages.length;
+        const step = agent.session.snapshotEvents().findLast((event) => event.type === "step/start");
+        if (step) observed.steps.set(step.seq, options.messages.length);
+      }
+      const facts = pending.get(id);
+      if (!facts) return;
+      pending.delete(id);
+      // Durable message identities survive fork projection. Only messages
+      // still visible in this request count: replaced system messages and
+      // pruned/offloaded seed material cannot inflate the metric.
+      const inherited = new Set([...agent.session.surface.nodes]
+        .filter((seq) => seq < facts.seedEvents)
+        .map((seq) => agent.session.deriveEventMessage(agent.session.eventAt(seq))?.id)
+        .filter((messageId) => messageId !== undefined));
+      if (facts.parentRequestMessages === undefined) {
+        record({ kind: "child_first_request_unavailable", child: id, parent: facts.parent,
+          reason: "The parent's boundary model request was not observed by the plugin." });
+        return;
+      }
+      record({ kind: "child_first_request", child: id, parent: facts.parent, seedBoundary: facts.seedBoundary,
+        seededMessages: options.messages.filter((message) => inherited.has(message.id)).length,
+        parentRequestMessages: facts.parentRequestMessages });
     },
   };
 }

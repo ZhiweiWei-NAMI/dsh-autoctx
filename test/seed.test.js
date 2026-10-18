@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
-import { AUTOCTX_FORK, closedStepSeed, createClosedStepForkProvider, sameRequestConfig } from "../seed.js";
+import { AUTOCTX_FORK, closedStepSeed, createClosedStepForkProvider, createSeedRequestAudit, sameRequestConfig } from "../seed.js";
 import { messageAppended, createMessageAudit } from "../routing.js";
 
 function history({ completed = false, closed = true } = {}) {
@@ -89,6 +89,45 @@ test("a prior turn's closed step is not mistaken for a closed step in the curren
   const seed = closedStepSeed(events);
   seed.push({ type: "turn/start", seq: seed.length, time: 1234, data: { turn: 2 } });
   assert.equal(closedStepSeed(seed), undefined);
+});
+
+test("first child request counts projected seed messages and the actual parent request at the closed boundary", () => {
+  const records = [], audit = createSeedRequestAudit((record) => records.push(record));
+  const system = { id: "system", role: "system", content: [] };
+  const user = { id: "user", role: "user", content: [] };
+  const output = { id: "output", role: "assistant", content: [] };
+  const tool = { id: "tool", role: "tool", content: [] };
+  const events = [{ type: "step/start", seq: 0 },
+    ...[system, user, output, tool].map((message, index) => ({ type: "message", seq: index + 1, message })),
+    { type: "step/end", seq: 5 }];
+  let parentEvents = [events[0]];
+  const parent = { session: { id: "parent", header: {}, snapshotEvents: () => parentEvents } };
+  audit.onRequest(parent, { messages: [system, user] });
+  parentEvents = [...events, { type: "step/start", seq: 6 }];
+  audit.onRequest(parent, { messages: [system, user, output, tool] });
+  audit.prepared({ sessionId: "child", parent }, { seedBoundary: "closed-step", seedEvents: events.length }, { seed: events });
+  const child = { session: { id: "child", header: { parentSession: "parent" },
+    surface: { nodes: [1, 2, 3, 4, 7] }, eventAt: (seq) => events[seq], deriveEventMessage: (event) => event?.message } };
+  const request = { messages: [{ id: "new-system" }, user, output, tool, { id: "assignment" }, { id: "runtime" }] };
+  audit.onRequest(child, { ...request, purpose: "compaction" });
+  assert.deepEqual(records, []);
+  audit.onRequest(child, request);
+  audit.onRequest(child, request);
+  assert.deepEqual(records, [{ kind: "child_first_request", child: "child", parent: "parent", seedBoundary: "closed-step",
+    seededMessages: 3, parentRequestMessages: 2 }]);
+  assert.equal(JSON.stringify(records).includes("content"), false);
+});
+
+test("empty seeds use the observed delegation request; unrouted children do not emit seed verification", () => {
+  const records = [], audit = createSeedRequestAudit((record) => records.push(record));
+  const parent = { session: { id: "parent", header: {}, snapshotEvents: () => [] } };
+  audit.onRequest(parent, { messages: [{ id: "root" }] });
+  audit.prepared({ sessionId: "child", parent }, { seedBoundary: "empty", seedEvents: 0 }, {});
+  const child = { session: { id: "child", header: { parentSession: "parent" }, surface: { nodes: [] } } };
+  audit.onRequest(child, { messages: [{ id: "assignment" }] });
+  audit.onRequest({ session: { ...child.session, id: "native-child" } }, { messages: [] });
+  assert.deepEqual(records, [{ kind: "child_first_request", child: "child", parent: "parent", seedBoundary: "empty",
+    seededMessages: 0, parentRequestMessages: 1 }]);
 });
 
 test("message audit hashes exact UTF-8 text blocks joined with two newlines", () => {

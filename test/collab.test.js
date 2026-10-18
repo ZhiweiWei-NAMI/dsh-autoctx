@@ -251,6 +251,19 @@ function collab(options = {}) {
         { agent, messages, turn, signal },
         next,
       ),
+    execute: async (exec, next = async () => ({ isError: false, value: {}, content: [] })) => {
+      let result = await handlers.get("tools/execute")(exec, next);
+      // The 0.2.1 host discards wrapper content and renders the typed native
+      // activation value before invoking post-execute. Exercise that boundary.
+      if (options.activationAPI && !result.isError && ["subagent", "subagent_fork"].includes(exec.name))
+        result = { ...result, content: [{ type: "text", text: `started subagent ${result.value.subagentId}` }] };
+      const decision = await handlers.get("tools/post-execute")(exec, result, async () => ({ kind: "accept" }));
+      return { ...result, ...(decision.content === undefined ? {} : { content: decision.content }) };
+    },
+    modelRequest: async (agent = root, messages = [], extra = {}) => {
+      const stream = handlers.get("llm/stream")({ sessionId: agent.session.id, messages, ...extra }, async function* () {});
+      for await (const _chunk of stream) { /* no provider call */ }
+    },
     edit: (agent = root, path = "src/a.js") =>
       handlers.get("tools/result")(
         { name: "edit", agent, arguments: { file_path: path }, callId: "edit-" + path },
@@ -579,7 +592,7 @@ test("helpers from a resumed listing do not consume delegation slots", async (t)
     signal: new AbortController().signal,
   };
   assert.equal(app.handlers.get("tools/guard")(exec), undefined);
-  const result = await app.handlers.get("tools/execute")(
+  const result = await app.execute(
     exec,
     () => {
       throw new Error("unexpected native dispatch");
@@ -587,6 +600,9 @@ test("helpers from a resumed listing do not consume delegation slots", async (t)
   );
   assert.equal(result.isError, false);
   assert.equal(result.value.kind, "activation");
+  assert.match(result.content.at(-1).text, /now owns this subtask/);
+  assert.match(result.content.at(-1).text, /must not redo/);
+  assert.match(result.content.at(-1).text, /send_message reply or native subagent-settled inbox notice/);
   assert.equal(app.started, 1);
   const child = app.children.find((child) => child.id === result.value.subagentId);
   assert.equal(child.mode, "continuable");
@@ -614,6 +630,54 @@ test("helpers from a resumed listing do not consume delegation slots", async (t)
     typeof candidate.id === "string" && typeof candidate.model === "string" && typeof candidate.provider === "string" && Array.isArray(candidate.efforts))));
   assert.equal(states.length, 1);
   assert.equal(states[0].observation.childrenRemaining, 2);
+});
+
+test("routed ownership survives native rendering, allows disjoint tools and yields after one finish reminder", async (t) => {
+  const records = recordAll(t);
+  t.mock.method(globalThis, "fetch", async () => ({ ok: true, status: 200, text: async () => JSON.stringify({
+    model: "jev", answers: { fit_0: { type: "score", score: 2, confidence: 1 } },
+  }) }));
+  const app = collab({ activationAPI: true });
+  await app.preStep(app.root, [userMessage("Investigate the widget and separate work.")]);
+  const signal = new AbortController().signal;
+  const routed = await app.execute({ name: "subagent", callId: "delegate", agent: app.root, signal,
+    arguments: { prompt: "Investigate src/widget.js.", description: "Widget investigation" } });
+  const child = routed.value.subagentId;
+  assert.deepEqual(records.find((record) => record.kind === "ownership_assigned"), {
+    at: records.find((record) => record.kind === "ownership_assigned").at,
+    kind: "ownership_assigned", parent: "root", child, description: "Widget investigation",
+  });
+  const read = (path) => app.execute({ name: "read", callId: "read-" + path, agent: app.root, signal,
+    arguments: { file_path: path } }, async () => ({ isError: false, value: { path }, content: [{ type: "text", text: "Native read output" }] }));
+  assert.equal((await read("src/disjoint.js")).content.length, 1);
+  assert.match((await read("src/widget.js")).content.at(-1).text, /^\[AutoCTX ownership\]/);
+  assert.equal((await read("src/widget.js")).content.length, 1);
+  assert.equal(records.filter((record) => record.kind === "ownership_overlap").length, 1);
+  const assistant = (content) => app.handlers.get("session/event")(app.root.session, {
+    type: "assistant/message", data: { message: { role: "assistant", content } },
+  });
+  assistant([{ type: "tool-call", name: "read" }]);
+  assert.equal(app.steered.length, 0);
+  assistant([{ type: "text", text: "Attempt to finish" }]);
+  assistant([{ type: "text", text: "Yielding while the child works" }]);
+  assert.equal(app.steered.length, 1);
+  assert.match(app.steered[0].content[0].text, /Outstanding child results/);
+  assert.match(app.steered[0].content[0].text, /yield the turn/);
+  assert.equal(records.filter((record) => record.messageKind === "ownership-dependency").length, 1);
+  await app.handlers.get("subagent/end")({ id: child, runId: child + "-run", stopReason: "completed",
+    lastAssistantMessage: [{ type: "text", text: "Found the cause" }] });
+  const result = { id: "native-result", role: "user", source: { kind: "subagent-settled", senderSessionId: child },
+    content: [{ type: "text", text: "Found the cause" }] };
+  app.handlers.get("session/event")(app.root.session, { type: "agent/inbox/spliced", data: { inserted: [result] } });
+  app.handlers.get("session/event")(app.root.session, { type: "user/message", data: result });
+  assert.equal(records.filter((record) => record.kind === "child_result_delivered").length, 1);
+  await app.modelRequest(app.root, [result], { purpose: "compaction" });
+  assert.equal(records.filter((record) => record.kind === "child_result_consumed").length, 0);
+  await app.modelRequest(app.root, [result]);
+  assert.equal(records.filter((record) => record.kind === "child_result_consumed").length, 1);
+  assert.equal(records.find((record) => record.kind === "child_result_consumed").parentRequestAfter, true);
+  assistant([{ type: "text", text: "Integrated result" }]);
+  assert.equal(app.steered.length, 1);
 });
 
 test("maxConcurrent still counts a running helper", async (t) => {
