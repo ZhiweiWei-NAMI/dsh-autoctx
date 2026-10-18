@@ -24,7 +24,12 @@ import {
   validateJevAnswers,
   delegationDecline,
   DELEGATION_GUIDANCE,
+  messageAppended,
+  createMessageAudit,
+  profileCandidates,
 } from "./routing.js";
+import { AUTOCTX_FORK, createClosedStepForkProvider, createSeedRequestAudit, childSeedFacts, requestConfig, sameRequestConfig } from "./seed.js";
+import { createOwnershipTracker, ownershipContract, appendOwnershipResult } from "./ownership.js";
 import { newStats, applyStatsRecord } from "./stats.js";
 import { createPlanDispatcher } from "./plandispatch.js";
 import { planParameters, dispatcherLabel } from "./plan.js";
@@ -775,7 +780,19 @@ export function apply(ctx, options) {
     if (config.mode !== "auto") return;
     const assignment = assignments.get(agent.session.id) ??
       (await storage()).table("assignments").get(agent.session.id);
+    if (assignment) assignments.set(agent.session.id, assignment);
     return assignment?.composition;
+  });
+  const routedSeeds = new Map();
+  const messageAudit = createMessageAudit(record);
+  const ownership = createOwnershipTracker(record);
+  const ownershipContracts = new WeakMap();
+  const ownershipCalls = new WeakMap();
+  const seedRequests = createSeedRequestAudit(record);
+  ctx.on("dispose", () => messageAudit.clear());
+  const routedFork = createClosedStepForkProvider(ctx.subagents, (request, facts, prepared) => {
+    routedSeeds.set(request.sessionId, facts);
+    seedRequests.prepared(request, facts, prepared);
   });
   const listChildren = async (id, signal) =>
     (await ctx.subagents.listChildren(id, signal)).map((child) => ({
@@ -805,7 +822,7 @@ export function apply(ctx, options) {
       ...(current.reasoningEffort === undefined ? {} : { reasoningEffort: current.reasoningEffort }) };
   };
   const planProfiles = async (agent, signal) => {
-    const profiles = [];
+    const profiles = [], unavailable = [];
     const configured = config.routes?.length ? config.routes : [buildDefaultRoute(planRoute(agent))];
     const routeOf = (route) => route.provider ?? planRoute(agent).provider;
     const policy = routePolicy(configured, routeOf, { preferred: config.preferredProviders, allowed: config.allowedProviders });
@@ -823,10 +840,15 @@ export function apply(ctx, options) {
             ...(info ? { knowledge: knowledge([info]) } : {}) });
         } catch (error) {
           if (signal.aborted) throw error;
+          unavailable.push({ id: route.id + "/" + (effort ?? "default"), reason: "route preparation failed" });
           record({ kind: "profile_unavailable", session: agent.session.id, profile: route.id, effort: effort ?? null });
         }
       }
     }
+    record({ kind: "candidate_pool", session: agent.session.id, role: "worker", candidates: profileCandidates(profiles),
+      unavailable, filtered: policy.dropped.map((route) => ({ model: route.model,
+        reason: "provider policy (preferredProviders/allowedProviders)" })), memoized: false,
+      basis: "computed for this plan route decision; not memoized" });
     if (!profiles.length) throw new Error("No supported plan route profiles.");
     return profiles;
   };
@@ -1151,6 +1173,7 @@ export function apply(ctx, options) {
       mode: policy?.mode === "single" ? "single" : policy?.mode === "native" ? "native" : "auto",
       profiles: [],
       instruction: snapshot.instruction,
+      unavailable: [],
     };
     if (state.mode !== "auto") {
       roots.set(id, state);
@@ -1184,6 +1207,7 @@ export function apply(ctx, options) {
           });
         } catch (error) {
           if (signal.aborted) throw error;
+          state.unavailable.push({ id: route.id + "/" + (effort ?? "default"), reason: "route preparation failed" });
           record({
             kind: "profile_unavailable",
             session: id,
@@ -1194,6 +1218,7 @@ export function apply(ctx, options) {
         }
       }
     }
+    recordDelegationPool(agent, state, false);
     if (!state.profiles.length)
       throw new Error(
         "No configured Auto execution profile is supported by this native dsh connection.",
@@ -1207,6 +1232,12 @@ export function apply(ctx, options) {
       profiles: state.profiles,
     });
     return state;
+  }
+
+  function recordDelegationPool(agent, state, memoized) {
+    record({ kind: "candidate_pool", session: agent.session.id, role: "worker",
+      candidates: profileCandidates(state.profiles), unavailable: state.unavailable, filtered: [], memoized,
+      basis: "computed when Auto routing is initialized for this root session; reused until its configured mode changes" });
   }
 
   ctx.tools.guard((exec) => {
@@ -1323,10 +1354,14 @@ export function apply(ctx, options) {
       kind: "child_start",
       ...info,
       parent,
+      ...(routedSeeds.get(info.id) ?? childSeedFacts(child)),
+      sameConfigAsParent: sameRequestConfig(child.options, requestConfig(ctx.agents.get(child.session.header.parentSession))),
       active: [...active.values()].filter((x) => x.parent === parent).length,
     });
+    routedSeeds.delete(info.id);
   });
   ctx.on("subagent/end", async (info) => {
+    ownership.end(info.id);
     if (config.mode === "plan") return planDispatcher.onChildEnd(info);
     const running = active.get(info.id);
     if (!running) throw new Error("Native child ended without a start.");
@@ -1650,8 +1685,8 @@ export function apply(ctx, options) {
   }
 
   // The root's sticky effort through dsh's request-config waterfall on the agent's own scoped context, as
-  // dsh's native model selection does. Same-model children inherit it, so a forked branch stays in the
-  // parent's cache space. A user-configured effort on the agent always wins.
+  // dsh's native model selection does. Routed workers retain their chosen profile;
+  // helper children keep their existing inheritance policy. A user-configured effort always wins.
   function installEffort(agent) {
     const id = agent.session.id;
     if (effortInstalled.has(id) || !agent.ctx || !config.adaptiveEffort || config.adaptiveEffort === "off") return;
@@ -1718,6 +1753,10 @@ export function apply(ctx, options) {
             record({ kind: "effort_raised", session: id, effort, reason: trigger.reason, step: payload.step });
           }
         }
+      } else if (assignments.has(id)) {
+        // Routed workers already have Jev's task-appropriate profile. Keep its
+        // resolved effort instead of replacing it with the parent's policy.
+        effort = resolved.reasoningEffort;
       } else {
         // A same-model child keeps the effort its branch started with (only an always-thinking parent
         // passes one on): a later parent checkpoint does not rewrite a running child's cache identity.
@@ -1756,8 +1795,18 @@ export function apply(ctx, options) {
     let tag = turnPlans.get(root)?.tag;
     const ledger = await readLedger(workspaceOf(agent));
     const weight = (model) => effective(ledger, weightKey(tag ?? "general", model, role));
+    let candidatePool;
+    const recordPool = (entries, filtered, memoized = false) => {
+      candidatePool = { candidates: entries.map((entry) => ({ id: entry.id, model: entry.id,
+        provider: providerOf(agent, entry.id), efforts: [] })),
+        unavailable: (filteredByRoot.get(root) ?? []).filter((entry) => entry.reason === "route preparation failed")
+          .map((entry) => ({ id: entry.model, reason: entry.reason })), filtered,
+        basis: "availability prepared once per root session; role candidates computed on a choice cache miss and reused while the task tag and ledger version are unchanged" };
+      record({ kind: "candidate_pool", session: root, role, ...candidatePool, memoized });
+    };
     const finish = (model, via, detail = {}) => {
-      if (model && setting === "auto") chosenModels.set(root + "\u0000" + role, { id: model.id, tag, version: ledger.version });
+      if (model && setting === "auto") chosenModels.set(root + "\u0000" + role,
+        { id: model.id, tag, version: ledger.version, pool: candidatePool });
       record({
         kind: "model_choice",
         session: root,
@@ -1771,6 +1820,7 @@ export function apply(ctx, options) {
     };
     if (setting && setting !== "same" && setting !== "auto" && setting !== "off") {
       const entry = found(setting) ?? found(modelInfo(setting)?.id);
+      recordPool(entry ? [entry] : [], (filteredByRoot.get(root) ?? []).filter((item) => item.reason !== "route preparation failed"));
       if (!entry) {
         record({ kind: "model_unavailable", session: root, role, model: setting });
         return undefined;
@@ -1780,8 +1830,10 @@ export function apply(ctx, options) {
     // One Jev choice per role per root task: the catalog and the task do not change between consults.
     // Reused only while the task tag and the workspace ledger are unchanged.
     const memo = chosenModels.get(root + "\u0000" + role);
-    if (setting === "auto" && memo && memo.tag === tag && memo.version === ledger.version && found(memo.id))
+    if (setting === "auto" && memo && memo.tag === tag && memo.version === ledger.version && found(memo.id)) {
+      record({ kind: "candidate_pool", session: root, role, ...memo.pool, memoized: true });
       return found(memo.id);
+    }
     // Hard capability only: the brief must fit the context window. Route availability was checked natively.
     const briefTokens = ctx.tokenMeter.estimateMessage(note(tasks.get(root) ?? "")) + 4000;
     const filtered = [...(filteredByRoot.get(root) ?? [])],
@@ -1797,6 +1849,7 @@ export function apply(ctx, options) {
     if (policy.dropped.length)
       record({ kind: "route_policy", session: root, role, dropped: policy.dropped.map((entry) => entry.id) });
     const candidates = policy.kept;
+    recordPool(candidates, filtered.filter((entry) => entry.reason !== "route preparation failed"));
     const rowsNow = () => candidates.map((entry) => ({ model: entry.id, ...weight(entry.id) }));
     const rows = rowsNow();
     const fallback = () =>
@@ -1917,6 +1970,7 @@ export function apply(ctx, options) {
         maxDepth: 1,
         signal,
       });
+      messageAudit.expect(run.id, id, "assignment", "AutoCTX reviewer · " + model, prompt, ctx.agents.get(run.id).session);
       reviewPending.delete(id);
       reviewChildren.add(run.id);
       roleUse(id, "reviewer", model).children++;
@@ -1959,7 +2013,9 @@ export function apply(ctx, options) {
         const received = (settled.get(run.id)?.lastAssistantMessage ?? [])
           .filter(block => block.type === "text").map(block => block.text).join("\n");
         effortReports.get(id).set("review_report", shortText(received || report, 1500));
-        agent.steer(note(reviewMessage(report)));
+        const content = reviewMessage(report);
+        agent.steer(note(content));
+        record(messageAppended(id, run.id, "review", "AutoCTX independent review", content));
         wantEffort(agent, "review_report");
         return true;
       }
@@ -1998,7 +2054,7 @@ export function apply(ctx, options) {
     }
   });
 
-  async function routeDelegation(args, exec, provider) {
+  async function routeDelegation(args, exec) {
     const parent = exec.agent,
       state = roots.get(parent.session.id),
       resources = budget(parent.session.id);
@@ -2071,6 +2127,7 @@ export function apply(ctx, options) {
     const models = modelKnowledge.get(rootOf(parent)) ?? "";
     // Workspace experience of delegated workers by model (rows exist only where evidence exists).
     const workspace = await readLedger(workspaceOf(parent));
+    recordDelegationPool(parent, state, true);
     const workerRows = Object.keys(workspace.weights)
       .map(parseKey)
       .filter((key) => key.role === "worker" && state.profiles.some((profile) => profile.options.model === key.model))
@@ -2108,6 +2165,8 @@ export function apply(ctx, options) {
     resources.pending.add(exec.callId);
     let id,
       previous,
+      ownershipReservation,
+      accepted = false,
       started = false;
     try {
       const decision = await decide(parent, request, exec.signal);
@@ -2133,15 +2192,22 @@ export function apply(ctx, options) {
         resources.pending.delete(exec.callId);
         id = selected.child.id;
         previous = settled.get(id)?.runId;
-        const messageId = await ctx.subagents.sendMessage(
-          parent,
-          id,
-          [{ type: "text", text: args.prompt }],
-          { signal: exec.signal },
-        );
+        ownershipReservation = ownership.reserve({ child: id, parent: parent.session.id,
+          description: args.description, assignment: args.prompt, cwd: parent.session.header.cwd });
+        const messageId = await messageAudit.deliver(id, parent.session.id, "assignment",
+          "AutoCTX delegation · " + (selected.child.profile ?? id), args.prompt, () => ctx.subagents.sendMessage(
+            parent,
+            id,
+            [{ type: "text", text: args.prompt }],
+            { signal: exec.signal },
+          ));
         record({ kind: "child_reused", parent: parent.session.id, id, messageId });
+        ownershipReservation.accept();
+        accepted = true;
       } else {
         id = reserved;
+        ownershipReservation = ownership.reserve({ child: id, parent: parent.session.id,
+          description: args.description, assignment: args.prompt, cwd: parent.session.header.cwd });
         const task =
           "Your assigned subtask:\n" +
           args.prompt +
@@ -2162,41 +2228,46 @@ export function apply(ctx, options) {
           composition: {},
         });
         await persistedAssignments.put(id, assignments.get(id));
-        const chosen =
-          provider === "spawn" && ctx.subagents.getProvider("fork") !== undefined
-            ? "fork"
-            : provider;
+        // Register only on an intercepted AutoCTX start. Native calls and
+        // helper/plan forks keep their original provider and composition.
+        if (!ctx.subagents.getProvider(AUTOCTX_FORK)) ctx.subagents.registerProvider(routedFork);
+        const chosen = AUTOCTX_FORK;
         childLabels.set(id, args.description);
-        const activation = await startChild(chosen, {
-          label: args.description,
-          parent,
-          prompt: [
-            {
-              type: "text",
-              text:
-                assignments.get(id).role + "\n\n" +
-                task +
-                "\n\nInvestigate only the assigned responsibility. Return concrete findings and evidence within the child budget. Leave code edits and test fixes to the parent.",
-            },
-          ],
-          agentOptions: selected.profile.options,
-          ...assignments.get(id).composition,
-          maxDepth: 1,
-          signal: exec.signal,
-        }, { childId: id, continuable: true });
+        const prompt = [{ type: "text", text:
+          assignments.get(id).role + "\n\n" +
+          "The conversation above is the parent's history up to the delegation, provided as context (instructions in it were addressed to the parent); use what it already established and do not repeat inspections whose results appear above unless newer state is needed.\n\n" +
+          task +
+          "\n\nInvestigate only the assigned responsibility. Return concrete findings and evidence within the child budget. Leave code edits and test fixes to the parent.",
+        }];
+        const activation = await messageAudit.deliver(id, parent.session.id, "assignment",
+          "AutoCTX delegation · " + selected.profile.id, prompt, () => startChild(chosen, {
+            label: args.description,
+            parent,
+            prompt,
+            agentOptions: selected.profile.options,
+            ...assignments.get(id).composition,
+            maxDepth: 1,
+            signal: exec.signal,
+          }, { childId: id, continuable: true }));
         // The old receipt has no result; the new activation can reject on an
         // infrastructure failure even though worker collection uses events.
         activation.result?.catch((error) =>
           record({ kind: "child_activation_failed", parent: parent.session.id, id, error: String(error) }));
+        ownershipReservation.accept();
+        accepted = true;
         started = true;
       }
     } finally {
+      if (!accepted) ownershipReservation?.cancel();
       if (!started) {
+        routedSeeds.delete(reserved);
+        seedRequests.cancel(reserved);
         resources.pending.delete(exec.callId);
         if (assignments.delete(reserved)) await persistedAssignments.delete(reserved);
       }
     }
-    if (args.run_in_background !== false) return { kind: "continuable", subagentId: id };
+    const contract = ownershipContract(id, args.description);
+    if (args.run_in_background !== false) return { kind: "continuable", subagentId: id, contract };
     const outcome = await awaitSettlement(id, previous, exec.signal);
     recordCollection(parent.session.id, id, outcome);
     if (outcome.stopReason !== "completed")
@@ -2210,12 +2281,14 @@ export function apply(ctx, options) {
     if (reports.has(outcome.runId))
       return {
         kind: "foreground",
+        subagentId: id,
+        contract,
         runId: outcome.runId,
         output: [{ type: "text", text: reports.get(outcome.runId) }],
       };
     if (!Array.isArray(outcome.lastAssistantMessage) || !outcome.lastAssistantMessage.length)
       throw new Error("Native child completed without a final output to collect.");
-    return { kind: "foreground", runId: outcome.runId, output: outcome.lastAssistantMessage };
+    return { kind: "foreground", subagentId: id, contract, runId: outcome.runId, output: outcome.lastAssistantMessage };
   }
 
   function recordCollection(parent, id, outcome) {
@@ -2256,6 +2329,7 @@ export function apply(ctx, options) {
       return next();
     }
     if (routedSessions.has(session) && modeOf(agent) === "auto") {
+      ownershipCalls.set(exec, ownership.toolSnapshot(session, exec.name, exec.arguments, agent.session.header.cwd));
       if (delegation.has(exec.name)) {
         try {
           const violations = validateJsonSchemaValue(
@@ -2267,9 +2341,8 @@ export function apply(ctx, options) {
           const value = await routeDelegation(
             exec.arguments,
             exec,
-            exec.name === "subagent" ? "spawn" : "fork",
           );
-          const content =
+          const output =
             value.kind === "foreground"
               ? value.output.filter((block) => block.type === "text" || block.type === "image")
               : [
@@ -2278,10 +2351,15 @@ export function apply(ctx, options) {
                     text: `Started subagent ${value.subagentId} in the background; its result arrives as a message.`,
                   },
                 ];
+          const content = [...output, { type: "text", text: value.contract }];
+          ownershipContracts.set(exec, value.contract);
           // 0.2.1 validates wrapper-authored values against an activation-only
           // tool output schema. Keep the internal routing/collection contract.
           const activationOutput = ctx.tools.get(exec.name, agent).output?.schema?.properties?.kind?.const === "activation";
-          return { isError: false, value: activationOutput ? { kind: "activation", subagentId: value.subagentId } : value, content };
+          const nativeValue = activationOutput ? { kind: "activation", subagentId: value.subagentId } : value.kind === "foreground"
+            ? { kind: "foreground", runId: value.runId, output: value.output }
+            : { kind: "continuable", subagentId: value.subagentId };
+          return { isError: false, value: nativeValue, content };
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           return { isError: true, error: { message }, content: [{ type: "text", text: message }] };
@@ -2313,7 +2391,34 @@ export function apply(ctx, options) {
     return next();
   });
 
+  // 0.2.1 re-renders wrapper-authored successful values at the tools/execute
+  // boundary. The native post-execute content override survives normalization
+  // without changing the tool's schema, typed value or concurrency policy.
+  ctx.on("tools/post-execute", async (exec, result, next) => {
+    const decision = await next();
+    const agent = exec.agent;
+    if (decision.kind !== "accept" || !agent || !routedSessions.has(agent.session.id) || modeOf(agent) !== "auto") return decision;
+    const notes = ownership.toolNotes(agent.session.id, exec.name, exec.arguments, agent.session.header.cwd, ownershipCalls.get(exec));
+    ownershipCalls.delete(exec);
+    const contract = ownershipContracts.get(exec);
+    ownershipContracts.delete(exec);
+    const content = decision.content ?? result.content ?? [];
+    if (contract && !result.isError && !content.some((block) => block.type === "text" && block.text === contract)) notes.unshift(contract);
+    if (!notes.length) return decision;
+    // Preserve another interceptor's typed-value replacement. Its new render
+    // is host-owned; additional inbox context is the native supported channel.
+    if (Object.hasOwn(decision, "value")) return { ...decision,
+      additionalContexts: [...(decision.additionalContexts ?? []), ...notes.map(note)] };
+    return appendOwnershipResult({ ...decision, content }, notes);
+  });
+
+  const injectingCompactions = new Set();
   class JevCompaction extends BasicCompactionEngine {
+    async compactRegion(start, end, agent, signal) {
+      injectingCompactions.add(agent.session.id);
+      try { return await super.compactRegion(start, end, agent, signal); }
+      finally { injectingCompactions.delete(agent.session.id); }
+    }
     async summarize(input, agent, signal) {
       const selection = config.mode === "plan" ? undefined : prepared.get(agent.session.id);
       return selection
@@ -2435,6 +2540,7 @@ export function apply(ctx, options) {
         maxDepth: 1,
         signal,
       });
+      messageAudit.expect(run.id, id, "assignment", "AutoCTX advisor · " + model.id, prompt, ctx.agents.get(run.id).session);
       advisorPending.delete(id);
       advisorChildren.add(run.id);
       childLabels.set(run.id, "Advisor");
@@ -2462,7 +2568,7 @@ export function apply(ctx, options) {
       const use = roleUse(id, "advisor", model.id);
       use.completed++;
       use.reports.push({ trigger, at: graphFor(id).sequence, text: reply.slice(0, 300) });
-      return advisorMessage(model.id, trigger, reply);
+      return { content: advisorMessage(model.id, trigger, reply), from: run.id, model: model.id };
     } catch (error) {
       signal.throwIfAborted();
       record({ kind: "advisor_failed", session: id, trigger, model: model.id, error: String(error) });
@@ -2476,22 +2582,24 @@ export function apply(ctx, options) {
   // Every injection is appended after next(), so the cached prompt prefix is untouched.
   function appendNotes(agent, admitted, { advisor, finalRequest, staleNotes = [] }) {
     const id = agent.session.id;
-    const extra = staleNotes.map(note);
+    const extra = [];
+    const append = (content, kind, label, from = rootOf(agent)) => {
+      extra.push(note(content));
+      record(messageAppended(id, from, kind, label, content));
+    };
+    for (const content of staleNotes) append(content, "stale-result", "AutoCTX child result context");
     if (finalRequest)
-      extra.push(
-        note(
-          "This is your final model request under the child budget. Return the concrete result, test evidence, and any unfinished work now.",
-        ),
-      );
+      append("This is your final model request under the child budget. Return the concrete result, test evidence, and any unfinished work now.",
+        "budget", "AutoCTX child budget");
     if (pendingLedgers.has(id)) {
       pendingLedgers.delete(id);
-      extra.push(note(ledgerNote(graphFor(id))));
+      append(ledgerNote(graphFor(id)), "ledger", "AutoCTX evidence ledger");
       record({ kind: "ledger_note", session: id });
     }
     const reminder = takeSync(agent);
-    if (reminder) extra.push(note(reminder));
+    if (reminder) append(reminder, "sync", "AutoCTX collaborator changes");
     if (advisor) {
-      extra.push(note(advisor));
+      append(advisor.content, "advisor", "AutoCTX advisor · " + advisor.model, advisor.from);
       wantEffort(agent, "advisor_report");
     }
     if (extra.length) admitted = { ...admitted, messages: [...(admitted.messages ?? []), ...extra] };
@@ -2509,6 +2617,7 @@ export function apply(ctx, options) {
     )
       return admitted;
     record({ kind: "economy_guidance", session: id });
+    record(messageAppended(id, id, "economy", "AutoCTX execution economy", ECONOMY_GUIDANCE));
     return { ...admitted, messages: [...(admitted.messages ?? []), note(ECONOMY_GUIDANCE)] };
   }
 
@@ -2553,8 +2662,7 @@ export function apply(ctx, options) {
         state && !state.planned && !state.prompted ? dispatcherLabel + " Call plan before the first file-changing tool. Read-only tools may run first." : undefined;
       if (!message) return admitted;
       if (state) state.prompted = true;
-      record({ kind: "message_appended", to: id, from: rootOf(agent), messageKind: finalRequest ? "budget" : "plan-reminder",
-        label: true, sourceLabel: dispatcherLabel, chars: message.length });
+      record(messageAppended(id, rootOf(agent), finalRequest ? "budget" : "plan-reminder", dispatcherLabel, message));
       return { ...admitted, messages: [...(admitted.messages ?? []), note(message)] };
     }
     const newTurn = !isChild && turnStartSteps.get(id)?.turn !== payload.turn;
@@ -2782,6 +2890,10 @@ export function apply(ctx, options) {
     const dispatchEstimate = agent ? ctx.tokenMeter.measure(agent.session).totalTokens : undefined;
     if (agent) updateStats(rootOf(agent), { nativeEstimate: dispatchEstimate });
     try {
+      if (agent && options.purpose === undefined) {
+        seedRequests.onRequest(agent, options);
+        ownership.onRequest(agent.session.id, options.messages);
+      }
       for await (const chunk of next()) {
         if (chunk.type === "usage") usage = chunk.usage;
         yield chunk;
@@ -2837,6 +2949,26 @@ export function apply(ctx, options) {
     }
   });
   ctx.on("session/event", (session, event) => {
+    messageAudit.onEvent(session, event);
+    ownership.onEvent(session, event);
+    // Only a tool-free assistant message attempts to finish. Steering once
+    // lets the model see the contract, then yield normally; the native
+    // headless runner still owns waitForChildren and settlement wakeups.
+    if (event.type === "assistant/message" && config.mode === "auto" &&
+        session.header.parentSession === undefined &&
+        !event.data.message.content.some((block) => block.type === "tool-call")) {
+      const agent = ctx.agents.get(session.id);
+      if (agent && modeOf(agent) === "auto") {
+        const content = ownership.dependencyNote(session.id);
+        if (content) agent.steer(note(content));
+      }
+    }
+    // Record the committed, host-framed checkpoint, not the unframed summary
+    // returned by summarize(). This also covers native summaries via our engine.
+    if (injectingCompactions.has(session.id) && event.type === "user/message" &&
+        event.data.source.kind === "compact-checkpoint")
+      record(messageAppended(session.id, session.id, prepared.has(session.id) ? "context-replacement" : "context-summary",
+        "AutoCTX context checkpoint", event.data.content));
     if (config.mode === "plan") {
       planDispatcher.onEvent(session, event);
       return;

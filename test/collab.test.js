@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import BasicCompactionEngine from "@deepseek-ai/dsh-compaction-basic";
 import { apply } from "../index.js";
 import { createGraph, observe, digest } from "../graph.js";
@@ -63,6 +64,15 @@ function collab(options = {}) {
     ...options,
   };
   const events = [];
+  const providers = new Map([[
+    "fork", { name: "fork", inheritsParentContext: true,
+      capabilities: { agentOptions: true, agentPreset: false, outputSchema: true, depthLimit: true },
+      async prepareContinuable({ parent }) {
+        const events = parent.session.snapshotEvents();
+        const end = events.findLast((event) => event.type === "turn/end");
+        return end ? { seed: events.slice(0, end.seq + 1) } : {};
+      } },
+  ], ["spawn", {}]]);
   const root = {
     options: { provider: "native", model: "deepseek-v4.1-flash" },
     session: {
@@ -77,9 +87,18 @@ function collab(options = {}) {
     steer: (message) => steered.push(message),
   };
   agents.set("root", root);
-  async function registerChild(child, parent = "root") {
+  async function registerChild(child, parent = "root", seed) {
+    const childEvents = [...(seed ?? [])];
+    const session = childSession(child.id, parent);
+    session.header.isSeeded = seed !== undefined;
+    session.inheritedEventCount = seed?.length ?? 0;
+    session.snapshotEvents = () => childEvents;
+    const parentConfig = agents.get(parent).session.requestHeader()?.config ?? agents.get(parent).options;
+    const options = { ...parentConfig, ...child.agentOptions };
+    if ((options.provider !== parentConfig.provider || options.model !== parentConfig.model) &&
+        child.agentOptions?.reasoningEffort === undefined) delete options.reasoningEffort;
     const agent = {
-      session: childSession(child.id, parent), steer() {},
+      options, session, steer() {},
       ctx: {
         tools: { restrict: (filter) => { child.toolFilter = filter; } },
         systemPrompt: {
@@ -91,6 +110,13 @@ function collab(options = {}) {
     agents.set(child.id, agent);
     await handlers.get("agent/created")({ agent });
     handlers.get("subagent/start")({ id: child.id, runId: child.id + "-run" });
+    return agent;
+  }
+  function commitPrompt(agent, content) {
+    const events = agent.session.snapshotEvents();
+    const event = { seq: events.length, type: "user/message", data: { source: { kind: "user" }, content } };
+    events.push(event);
+    handlers.get("session/event")(agent.session, event);
   }
   async function startChild(provider, request, childId) {
     if (startError) throw startError;
@@ -107,7 +133,8 @@ function collab(options = {}) {
       maxDepth: request.maxDepth,
     };
     children.push(child);
-    await registerChild(child);
+    const agent = await registerChild(child);
+    commitPrompt(agent, request.prompt);
     const result = new Promise((resolve) => {
       const finish = async (reason = "completed", output) => {
         const blocks =
@@ -169,16 +196,21 @@ function collab(options = {}) {
     },
     subagents: {
       listChildren: async () => children.map(({ kind, ...entry }) => entry),
-      getProvider: () => ({}),
+      getProvider: (name) => providers.get(name),
+      registerProvider: (provider) => { providers.set(provider.name, provider); },
       start: startChild,
       startContinuable: async ({ childId, provider, label, request }) => {
         started++;
         const child = {
           id: childId, kind: "child", mode: "continuable", provider, label,
-          prompt: request.prompt[0].text,
+          prompt: request.prompt[0].text, agentOptions: request.agentOptions,
         };
         children.push(child);
-        await registerChild(child, request.parent.session.id);
+        const prepared = await providers.get(provider).prepareContinuable({ sessionId: childId,
+          parent: request.parent, signal: new AbortController().signal });
+        const agent = await registerChild(child, request.parent.session.id, prepared.seed);
+        child.injected = [...request.prompt, { type: "text", text: "Native return guidance" }];
+        commitPrompt(agent, child.injected);
         return { childId, messageId: childId + "-message" };
       },
     },
@@ -219,6 +251,19 @@ function collab(options = {}) {
         { agent, messages, turn, signal },
         next,
       ),
+    execute: async (exec, next = async () => ({ isError: false, value: {}, content: [] })) => {
+      let result = await handlers.get("tools/execute")(exec, next);
+      // The 0.2.1 host discards wrapper content and renders the typed native
+      // activation value before invoking post-execute. Exercise that boundary.
+      if (options.activationAPI && !result.isError && ["subagent", "subagent_fork"].includes(exec.name))
+        result = { ...result, content: [{ type: "text", text: `started subagent ${result.value.subagentId}` }] };
+      const decision = await handlers.get("tools/post-execute")(exec, result, async () => ({ kind: "accept" }));
+      return { ...result, ...(decision.content === undefined ? {} : { content: decision.content }) };
+    },
+    modelRequest: async (agent = root, messages = [], extra = {}) => {
+      const stream = handlers.get("llm/stream")({ sessionId: agent.session.id, messages, ...extra }, async function* () {});
+      for await (const _chunk of stream) { /* no provider call */ }
+    },
     edit: (agent = root, path = "src/a.js") =>
       handlers.get("tools/result")(
         { name: "edit", agent, arguments: { file_path: path }, callId: "edit-" + path },
@@ -547,7 +592,7 @@ test("helpers from a resumed listing do not consume delegation slots", async (t)
     signal: new AbortController().signal,
   };
   assert.equal(app.handlers.get("tools/guard")(exec), undefined);
-  const result = await app.handlers.get("tools/execute")(
+  const result = await app.execute(
     exec,
     () => {
       throw new Error("unexpected native dispatch");
@@ -555,18 +600,84 @@ test("helpers from a resumed listing do not consume delegation slots", async (t)
   );
   assert.equal(result.isError, false);
   assert.equal(result.value.kind, "activation");
+  assert.match(result.content.at(-1).text, /now owns this subtask/);
+  assert.match(result.content.at(-1).text, /must not redo/);
+  assert.match(result.content.at(-1).text, /send_message reply or native subagent-settled inbox notice/);
   assert.equal(app.started, 1);
   const child = app.children.find((child) => child.id === result.value.subagentId);
   assert.equal(child.mode, "continuable");
   assert.equal(child.label, "Inspect A");
   assert.match(child.prompt, /^You are a delegated child, not the parent/);
   assert.match(child.prompt, /Your assigned subtask:\nInspect A/);
+  assert.match(child.prompt, /conversation above is the parent's history up to the delegation/);
+  assert.equal(child.provider, "autoctx-fork");
   assert.equal(child.persona, undefined);
   assert.equal(child.toolFilter, undefined);
   assert.deepEqual(app.tables.get("assignments").get(child.id).composition, {});
-  assert.ok(records.some((record) => record.kind === "child_start" && record.id === child.id));
+  const start = records.find((record) => record.kind === "child_start" && record.id === child.id);
+  assert.equal(start.seeded, false);
+  assert.equal(start.seedEvents, 0);
+  assert.equal(start.seedBoundary, "empty");
+  assert.equal(start.sameConfigAsParent, true);
+  const injection = records.find((record) => record.kind === "message_appended" && record.to === child.id);
+  assert.equal(injection.messageKind, "assignment");
+  assert.equal(injection.sourceLabel, "AutoCTX delegation · " + app.tables.get("assignments").get(child.id).profile.id);
+  assert.equal(injection.contentSha256, createHash("sha256")
+    .update(child.injected.map((block) => block.text).join("\n\n"), "utf8").digest("hex"));
+  const pools = records.filter((record) => record.kind === "candidate_pool" && record.role === "worker");
+  assert.deepEqual(pools.map((pool) => pool.memoized), [false, true]);
+  assert.ok(pools.every((pool) => pool.candidates.every((candidate) =>
+    typeof candidate.id === "string" && typeof candidate.model === "string" && typeof candidate.provider === "string" && Array.isArray(candidate.efforts))));
   assert.equal(states.length, 1);
   assert.equal(states[0].observation.childrenRemaining, 2);
+});
+
+test("routed ownership survives native rendering, allows disjoint tools and yields after one finish reminder", async (t) => {
+  const records = recordAll(t);
+  t.mock.method(globalThis, "fetch", async () => ({ ok: true, status: 200, text: async () => JSON.stringify({
+    model: "jev", answers: { fit_0: { type: "score", score: 2, confidence: 1 } },
+  }) }));
+  const app = collab({ activationAPI: true });
+  await app.preStep(app.root, [userMessage("Investigate the widget and separate work.")]);
+  const signal = new AbortController().signal;
+  const routed = await app.execute({ name: "subagent", callId: "delegate", agent: app.root, signal,
+    arguments: { prompt: "Investigate src/widget.js.", description: "Widget investigation" } });
+  const child = routed.value.subagentId;
+  assert.deepEqual(records.find((record) => record.kind === "ownership_assigned"), {
+    at: records.find((record) => record.kind === "ownership_assigned").at,
+    kind: "ownership_assigned", parent: "root", child, description: "Widget investigation",
+  });
+  const read = (path) => app.execute({ name: "read", callId: "read-" + path, agent: app.root, signal,
+    arguments: { file_path: path } }, async () => ({ isError: false, value: { path }, content: [{ type: "text", text: "Native read output" }] }));
+  assert.equal((await read("src/disjoint.js")).content.length, 1);
+  assert.match((await read("src/widget.js")).content.at(-1).text, /^\[AutoCTX ownership\]/);
+  assert.equal((await read("src/widget.js")).content.length, 1);
+  assert.equal(records.filter((record) => record.kind === "ownership_overlap").length, 1);
+  const assistant = (content) => app.handlers.get("session/event")(app.root.session, {
+    type: "assistant/message", data: { message: { role: "assistant", content } },
+  });
+  assistant([{ type: "tool-call", name: "read" }]);
+  assert.equal(app.steered.length, 0);
+  assistant([{ type: "text", text: "Attempt to finish" }]);
+  assistant([{ type: "text", text: "Yielding while the child works" }]);
+  assert.equal(app.steered.length, 1);
+  assert.match(app.steered[0].content[0].text, /Outstanding child results/);
+  assert.match(app.steered[0].content[0].text, /yield the turn/);
+  assert.equal(records.filter((record) => record.messageKind === "ownership-dependency").length, 1);
+  await app.handlers.get("subagent/end")({ id: child, runId: child + "-run", stopReason: "completed",
+    lastAssistantMessage: [{ type: "text", text: "Found the cause" }] });
+  const result = { id: "native-result", role: "user", source: { kind: "subagent-settled", senderSessionId: child },
+    content: [{ type: "text", text: "Found the cause" }] };
+  app.handlers.get("session/event")(app.root.session, { type: "agent/inbox/spliced", data: { inserted: [result] } });
+  app.handlers.get("session/event")(app.root.session, { type: "user/message", data: result });
+  assert.equal(records.filter((record) => record.kind === "child_result_delivered").length, 1);
+  await app.modelRequest(app.root, [result], { purpose: "compaction" });
+  assert.equal(records.filter((record) => record.kind === "child_result_consumed").length, 0);
+  await app.modelRequest(app.root, [result]);
+  assert.equal(records.filter((record) => record.kind === "child_result_consumed").length, 1);
+  assert.equal(records.find((record) => record.kind === "child_result_consumed").parentRequestAfter, true);
+  assistant([{ type: "text", text: "Integrated result" }]);
+  assert.equal(app.steered.length, 1);
 });
 
 test("maxConcurrent still counts a running helper", async (t) => {
@@ -599,6 +710,41 @@ test("maxConcurrent still counts a running helper", async (t) => {
   await pending;
   await app.preStep(app.root, []);
   assert.equal(app.children.filter((child) => child.label === "Advisor").length, 1);
+});
+
+test("routed delegation seeds closed steps and records the selected effort against the live parent config", async (t) => {
+  const records = recordAll(t);
+  t.mock.method(globalThis, "fetch", async () => ({ ok: true, status: 200, text: async () => JSON.stringify({
+    model: "jev", answers: { fit_0: { type: "score", score: 2, confidence: 1 } },
+  }) }));
+  const app = collab({ routes: [{ id: "investigation", label: "Investigator", description: "Focused inspection",
+    provider: "native", model: "deepseek-v4.1-flash", efforts: ["low"] }] });
+  const nativeFork = app.ctx.subagents.getProvider("fork");
+  app.root.session.requestHeader = () => ({ config: { provider: "native", model: "deepseek-v4.1-flash", reasoningEffort: "high" } });
+  await app.preStep(app.root, [userMessage("Inspect the observed failure.")]);
+  assert.equal(app.ctx.subagents.getProvider("autoctx-fork"), undefined);
+  const append = (type, data) => app.events.push({ type, data, seq: app.events.length, time: 1000 });
+  append("turn/start", { turn: 1 });
+  append("step/start", { turn: 1, step: 1 });
+  append("tool/call", { turn: 1, step: 1, callId: "read", name: "read" });
+  append("tool/result", { turn: 1, step: 1, message: { toolCallId: "read" } });
+  append("step/end", { turn: 1, step: 1 });
+  append("step/start", { turn: 1, step: 2 });
+  append("tool/call", { turn: 1, step: 2, callId: "delegate", name: "subagent_fork" });
+  const result = await app.handlers.get("tools/execute")({ name: "subagent_fork", callId: "delegate", agent: app.root,
+    arguments: { prompt: "Inspect A", description: "Inspect A" }, signal: new AbortController().signal },
+  () => { throw new Error("unexpected native dispatch"); });
+  assert.equal(result.isError, false);
+  assert.equal(app.ctx.subagents.getProvider("fork"), nativeFork);
+  const child = app.children[0];
+  assert.equal(child.provider, "autoctx-fork");
+  assert.equal(child.agentOptions.reasoningEffort, "low");
+  const start = records.find((record) => record.kind === "child_start" && record.id === child.id);
+  assert.equal(start.seeded, true);
+  assert.equal(start.seedEvents, 7);
+  assert.equal(start.seedBoundary, "closed-step");
+  assert.equal(start.sameConfigAsParent, false);
+  assert.equal(app.agents.get(child.id).session.snapshotEvents().some((event) => event.data.callId === "delegate"), false);
 });
 
 test("a configured cross-model reviewer uses spawn, agentOptions and the ledger", async (t) => {
