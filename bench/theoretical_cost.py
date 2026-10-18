@@ -55,16 +55,20 @@ def log_method(requests, ttl):
     return reused
 
 
-def exact_method(requests, ttl):
+def exact_method(requests, ttl, space='config'):
+    """space='config' (historical default): cache space = model + configHash (effort/thinking) + toolsHash.
+    space='content': same model and identical serialized content only (tools block + system + messages); effort and
+    thinking settings are not assumed to split the cache."""
     if not requests or not all(r.get('messageHashes') for r in requests):
         return None
     prefix_tokens = collections.defaultdict(dict)
     for r in requests:
         prefix_tokens[(r.get('actualModel') or r.get('model'), r.get('toolsHash'))][r['messageHashes'][-1]] = r['inputTokens']
-    seen, reused = collections.defaultdict(dict), {}
+    seen, reused, space_kind = collections.defaultdict(dict), {}, space
     for r in requests:
         model = r.get('actualModel') or r.get('model')
-        space, hashes = (model, r.get('configHash'), r.get('toolsHash')), r['messageHashes']
+        space = (model, r.get('configHash'), r.get('toolsHash')) if space_kind == 'config' else (model, r.get('toolsHash'))
+        hashes = r['messageHashes']
         k = 0
         for i in range(len(hashes) - 1, -1, -1):
             t = seen[space].get(hashes[i])
