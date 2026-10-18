@@ -37,7 +37,7 @@ export function resultBlock(text) {
 const nonempty = (value) => typeof value === "string" && value.trim().length > 0;
 const stringList = (value) => Array.isArray(value) && value.every(nonempty);
 
-export function validatePlan(input, remaining) {
+export function validatePlan(input, remaining, minDelegated = 0) {
   if (!input || !Array.isArray(input.subtasks) || !input.subtasks.length) return "A plan needs at least one subtask.";
   const ids = new Map();
   for (const task of input.subtasks) {
@@ -49,6 +49,8 @@ export function validatePlan(input, remaining) {
     if (task.dependsOn !== undefined && !stringList(task.dependsOn)) return "Invalid dependencies for " + task.id;
     ids.set(task.id, task);
   }
+  if (input.subtasks.filter((task) => task.owner === "delegate").length < minDelegated)
+    return "This run requires at least " + minDelegated + " delegated subtask(s) (owner \"delegate\") in the plan.";
   if (input.subtasks.filter((task) => task.owner === "delegate").length > remaining)
     return "Plan exceeds the remaining planMaxChildren budget (" + remaining + ").";
   for (const task of ids.values())
