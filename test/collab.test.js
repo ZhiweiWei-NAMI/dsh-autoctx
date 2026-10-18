@@ -559,10 +559,11 @@ test("helpers from a resumed listing do not consume delegation slots", async (t)
   const child = app.children.find((child) => child.id === result.value.subagentId);
   assert.equal(child.mode, "continuable");
   assert.equal(child.label, "Inspect A");
+  assert.match(child.prompt, /^You are a delegated child, not the parent/);
   assert.match(child.prompt, /Your assigned subtask:\nInspect A/);
-  assert.match(child.persona, /You are a delegated child, not the parent/);
-  assert.deepEqual(child.toolFilter, { deny: ["subagent", "subagent_fork"] });
-  assert.equal(app.tables.get("assignments").get(child.id).composition.persona, child.persona);
+  assert.equal(child.persona, undefined);
+  assert.equal(child.toolFilter, undefined);
+  assert.deepEqual(app.tables.get("assignments").get(child.id).composition, {});
   assert.ok(records.some((record) => record.kind === "child_start" && record.id === child.id));
   assert.equal(states.length, 1);
   assert.equal(states[0].observation.childrenRemaining, 2);
