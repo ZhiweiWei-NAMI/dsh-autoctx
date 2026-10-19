@@ -1,12 +1,18 @@
 # dsh-autoctx
 
-Context and subagent decision plugin for dsh, version **1.2.6**. Jev scores options and makes structured choices; the plugin implements them through native dsh sessions, tools, subagents and compaction. The executor model still does all the coding.
+Context and subagent decision plugin for dsh, version **1.2.7**. Jev scores options and makes structured choices; the plugin implements them through native dsh sessions, tools, subagents and compaction. The executor model still does all the coding.
 
 [中文](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/README.md) · [Source](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
 
 1.2.6 adds explicit plan dispatch (`mode: plan`) with separately stored route learning; DSH GPT-family models on `openai-codex` as allowed alternatives with theoretical list-price cost; closed-step seeds from the parent's current turn and an inherited-context note for newly routed delegation children in `auto` mode; routed delegation ownership and parent result-consumption tracking; and prior overrides for configured-route capability text.
 
 **1.2.6 evaluation takeaway:** On this fixed sample, `deepseek-v4.1-flash` with AutoCTX passed official grading on **18/24 cases (75.0%)**, versus **14/24 (58.3%)** for a single agent and **13/24 (54.2%)** for native subagents: **4 and 5 more resolved cases**, respectively. All three `gpt-6.1-sol` arms resolved the same 18 cases; AutoCTX had about 37% lower theoretical cost than native subagents, but still cost more than a single agent. The DeepSeek paired differences were not statistically significant, and infra reruns occurred; this is not proof of general superiority or savings. See the benchmark and limitations below.
+
+## 1.2.7 runtime fix
+
+Restores native model-capacity checks and context-overflow recovery. The service registers before the first request and allows at most one compaction retry after a provider-confirmed context overflow. Jev context selection runs first; the subsequent native capacity guard can still override a decision to defer replacement. Jev scoring, routing, learning rules and the frontend are unchanged. Native-composition regressions verify actual Session replacement, shorter requests, preservation of the current user instruction and bounded retries. Their summary model is a fixed fixture, not evidence of older-fact retention quality or complete AgentLoop task success. The 1.2.6 benchmark below was not rerun.
+
+**An active plugin does not imply automatic mode.** `mode: native` explicitly disables AutoCTX automatic decisions; `learning: auto` only controls learning. Automatic decisions require `mode: auto`, a valid Jev key and a non-native session strategy. Upgrading does not change those explicit settings. New input enters the session after pre-step, so a first oversized request relies on overflow recovery. Very small model windows may not satisfy native proactive-compaction headroom; not every request is guaranteed to fit before submission.
 
 ## Environment and accounts
 
@@ -30,12 +36,10 @@ Without `apiKey`, the plugin makes no Jev call; `auto` sessions run in native mo
 
    For a headless profile, replace the template with `headless` in the initial creation command. Start your custom profile with `dsh --profile autoctx ...`.
 
-2. Install from npm, or choose the GitHub release tag source.
+2. Install the GitHub 1.2.7 release tag. This release is GitHub-only; the published npm version remains 1.2.6.
 
    ```sh
-   dsh plugin --profile autoctx add dsh-autoctx@1.2.6
-   # Or use the release tag
-   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.6
+   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.7
    ```
 
    `dsh plugin --profile <name> <pnpm-args...>` passes arguments to pnpm. Profiles live in `$DSH_HOME/profiles/<name>`. The package's declared dsh bundle patch (`cordis.patch.yml`) mounts the plugin and disables native `compaction-basic`; no duplicate manual mount is needed.
@@ -60,12 +64,10 @@ Disable the plugin and restore native compaction for one launch:
 dsh --profile autoctx --patch "$DSH_HOME/profiles/autoctx/node_modules/dsh-autoctx/off.patch.yml"
 ```
 
-Upgrade to the latest version, or pin this version:
+Upgrade or pin to this GitHub version:
 
 ```sh
-dsh plugin --profile autoctx add dsh-autoctx@latest
-# Or pin the version
-dsh plugin --profile autoctx add dsh-autoctx@1.2.6
+dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.7
 ```
 
 Before uninstalling, delete any `- id: dsh-autoctx` override you added to the profile's `cordis.patch.yml`, then run:
@@ -323,4 +325,4 @@ Replace `<dir>` with an output directory. A is AutoCTX; use separate directories
 
 ## Upgrading from older versions
 
-Install 1.2.6 using the upgrade steps above and check profile overrides against the current configuration table. Do not carry over the old README's default model or installation tag: the current default is billed `jev-1.13`, and the release tag is `v1.2.6`.
+Install 1.2.7 using the upgrade steps above and check profile overrides against the current configuration table. Do not carry over the old README's default model or installation tag: the current default is billed `jev-1.13`, and the release tag is `v1.2.7`.

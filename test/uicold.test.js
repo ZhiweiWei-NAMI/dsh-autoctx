@@ -30,6 +30,7 @@ const headers = () => new Map([
 function context(storageDomain, known = headers(), live = new Map(), queryAvailable = true) {
   const routes = new Map(), handlers = new Map(), disposals = [], queries = [];
   const ctx = {
+    reflect: { provide: (name, service) => { ctx[name] = service; } },
     storageDomain, agents: { get: id => live.get(id) }, subagents: {}, tools: { guard() {} },
     on(name, handler) {
       if (!handlers.has(name)) handlers.set(name, []);

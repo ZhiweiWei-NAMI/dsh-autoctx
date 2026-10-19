@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 import { createOwnershipTracker, ownershipContract, appendOwnershipResult, OWNERSHIP_LABEL } from "../ownership.js";
 
 function setup() {
@@ -81,7 +82,7 @@ test("parent overlap notes are soft, conservative and once per child/path", () =
   assert.deepEqual(tracker.toolNotes("other-parent", "read", { file_path: "src/widget.js" }, "/repo"), []);
   const first = tracker.toolNotes("parent", "read", { file_path: "./src/widget.js" }, "/repo");
   assert.equal(first.length, 1);
-  assert.match(first[0], /Child child owns investigation of \/repo\/src\/widget.js/);
+  assert.ok(first[0].includes(`Child child owns investigation of ${path.resolve("/repo", "src/widget.js")}.`));
   assert.deepEqual(tracker.toolNotes("parent", "read", { path: "/repo/src/widget.js" }, "/repo"), []);
   const edit = tracker.toolNotes("parent", "edit", { path: "src/widget.js" }, "/repo");
   assert.equal(edit.length, 1); // one separate dependency reminder when integrating
@@ -89,8 +90,8 @@ test("parent overlap notes are soft, conservative and once per child/path", () =
   const second = tracker.toolNotes("parent", "bash", { command: "sed -n '1,30p' src/records.js" }, "/repo");
   assert.equal(second.length, 1);
   assert.deepEqual(records.filter((record) => record.kind === "ownership_overlap"), [
-    { kind: "ownership_overlap", parent: "parent", child: "child", tool: "read", path: "/repo/src/widget.js" },
-    { kind: "ownership_overlap", parent: "parent", child: "child", tool: "bash", path: "/repo/src/records.js" },
+    { kind: "ownership_overlap", parent: "parent", child: "child", tool: "read", path: path.resolve("/repo", "src/widget.js") },
+    { kind: "ownership_overlap", parent: "parent", child: "child", tool: "bash", path: path.resolve("/repo", "src/records.js") },
   ]);
   assert.ok(records.filter((record) => record.kind === "message_appended").every((record) => record.sourceLabel === OWNERSHIP_LABEL));
 });

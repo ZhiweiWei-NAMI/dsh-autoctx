@@ -16,8 +16,36 @@ import {
 } from "../decisions.js";
 import { selectDelegation, validateJevAnswers } from "../routing.js";
 
+// Match Cordis: waterfall listeners wrap in registration order; events fan out.
+function hostListeners() {
+  const listeners = new Map();
+  return {
+    on(name, fn) {
+      if (!listeners.has(name)) listeners.set(name, []);
+      listeners.get(name).push(fn);
+    },
+    handlers: {
+      clear: () => listeners.clear(),
+      get(name) {
+        const registered = listeners.get(name);
+        if (!registered) return undefined;
+        return (...args) => {
+          const callbacks = [...registered];
+          if (typeof args.at(-1) === "function") {
+            const inner = args.pop();
+            const next = () => (callbacks.shift() ?? inner)(...args, next);
+            return next();
+          }
+          const results = callbacks.map((callback) => callback(...args));
+          return results.some((result) => result instanceof Promise) ? Promise.all(results) : undefined;
+        };
+      },
+    },
+  };
+}
+
 function composition(mode) {
-  const handlers = new Map();
+  const { handlers, on } = hostListeners();
   let guard;
   const ctx = {
     tools: {
@@ -25,10 +53,9 @@ function composition(mode) {
         guard = fn;
       },
     },
-    on(name, fn) {
-      handlers.set(name, fn);
-    },
+    on,
     inject() {},
+    reflect: { provide(name, service) { ctx[name] = service; } },
   };
   apply(ctx, { mode, maxChildren: 2, maxConcurrent: 2, pressureTokens: 24000, retainTokens: 8000 });
   return { guard, handlers };
@@ -77,8 +104,9 @@ test("native delegation reservations share a task limit and release on failure",
   assert.equal(guard({ name: "subagent", callId: "other", agent: unrelated }), undefined);
 });
 
-test("the final budgeted child report concludes the returned native result", async () => {
-  const handlers = new Map();
+test("the final budgeted child report concludes the returned native result", async (t) => {
+  const pressure = t.mock.method(BasicCompactionEngine.prototype, "compactIfNeeded", async () => null);
+  const { handlers, on } = hostListeners();
   const agent = {
     session: {
       id: "child",
@@ -91,10 +119,9 @@ test("the final budgeted child report concludes the returned native result", asy
     tools: { guard() {}, get: () => ({}) },
     agents: { get: (id) => (id === "child" ? agent : undefined) },
     tokenMeter: { measure: () => ({ totalTokens: 100 }) },
-    on(name, fn) {
-      handlers.set(name, fn);
-    },
+    on,
     inject() {},
+    reflect: { provide(name, service) { ctx[name] = service; } },
   };
   apply(ctx, { mode: "native", retainTokens: 8000, maxChildRequests: 16, maxChildTurnRequests: 2 });
   await handlers.get("agent/pre-step")(
@@ -104,6 +131,11 @@ test("the final budgeted child report concludes the returned native result", asy
   for (let i = 0; i < 2; i++) {
     const stream = handlers.get("llm/stream")({ sessionId: "child" }, async function* () {});
     await stream.next();
+    if (i === 0) {
+      assert.equal(pressure.mock.callCount(), 1);
+      assert.equal(await ctx.compaction.compactIfNeeded(agent, "pressure", new AbortController().signal), null);
+      assert.equal(pressure.mock.callCount(), 1, "pressure must not spend the child's final reporting request");
+    }
   }
   const result = { isError: false, value: { accepted: true }, content: [] };
   let dispatched = 0;
@@ -446,10 +478,11 @@ test("a complete single batch preserves the evidence tail and reasoning in previ
 });
 
 function autoComposition(options = {}) {
-  const handlers = new Map(),
-    children = [],
+  const { handlers, on } = hostListeners();
+  const children = [],
     agents = new Map(),
-    tables = new Map();
+    tables = new Map(),
+    warnings = [];
   let guard,
     call = 0;
   const signal = new AbortController().signal;
@@ -498,7 +531,8 @@ function autoComposition(options = {}) {
     session: {
       id: "root",
       header: {},
-      requestHeader: () => (options.pressure ? {} : undefined),
+      requestHeader: () => (options.pressure ? { config: { ...agent.options } } : undefined),
+      get seq() { return events.length; },
       snapshotEvents: () => events,
       surface: { nodes: options.pressure ? [0, 1, 2, 3] : [] },
       eventAt: (seq) => events[seq],
@@ -513,12 +547,15 @@ function autoComposition(options = {}) {
       },
       get: () => ({ parameters: { type: "object" } }),
     },
-    on(name, fn) {
-      handlers.set(name, fn);
-    },
+    on,
     inject() {},
-    reflect: { provide() {} },
-    llm: { prepareCall: async () => {} },
+    reflect: { provide(name, service) { ctx[name] = service; } },
+    get: (name) => ctx[name],
+    logger: { info() {}, warn: (message) => warnings.push(message) },
+    llm: {
+      prepareCall: async () => {},
+      resolveModelInfo: async () => ({ context: { contextWindow: 128000 } }),
+    },
     agents: { get: (id) => agents.get(id) },
     tokenMeter: {
       measure: () => ({
@@ -573,7 +610,10 @@ function autoComposition(options = {}) {
   const step = (abort = signal) =>
     handlers.get("agent/pre-step")(
       { agent, messages: [], turn: "turn", signal: abort },
-      async () => ({ kind: "continue" }),
+      async () => {
+        abort.throwIfAborted();
+        return { kind: "continue" };
+      },
     );
   const execute = async (prompt = "Inspect the failure") => {
     const exec = {
@@ -602,6 +642,7 @@ function autoComposition(options = {}) {
     tables,
     ctx,
     agents,
+    warnings,
     guard: (exec) => guard(exec),
   };
 }
@@ -957,9 +998,16 @@ test("the schema default is Jev selection; contextSelection summary compacts wit
 
 test("a budgeted selection keeps one copy of a repeated output piece and replaces the region", async (t) => {
   const native = nativeCompaction(t),
-    records = [];
+    records = [], order = [];
   t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
-  const fetch = t.mock.method(globalThis, "fetch", async (url, { body }) => jevReply(body));
+  const nativeGuard = t.mock.method(BasicCompactionEngine.prototype, "compactIfNeeded", async () => {
+    order.push("native");
+    return null;
+  });
+  const fetch = t.mock.method(globalThis, "fetch", async (url, { body }) => {
+    order.push("jev");
+    return jevReply(body);
+  });
   const app = autoComposition({
     pressure: true,
     pressureTokens: 3000,
@@ -967,6 +1015,8 @@ test("a budgeted selection keeps one copy of a repeated output piece and replace
   });
   const original = app.agent.session.snapshotEvents().map((event) => JSON.stringify(event));
   await app.step();
+  assert.deepEqual(order, ["jev", "native"]);
+  assert.equal(nativeGuard.mock.callCount(), 1);
   assert.equal(native.compact.mock.callCount(), 1);
   assert.deepEqual(native.compact.mock.calls[0].arguments.slice(0, 2), [2, 2]);
   assert.equal(fetch.mock.callCount(), 1);
@@ -1372,6 +1422,25 @@ function commitGuidance(app, message) {
   app.agent.session.surface.nodes.push(seq);
 }
 
+test("native automatic pressure checks run once before AutoCTX admission", async (t) => {
+  const compact = t.mock.method(BasicCompactionEngine.prototype, "compactIfNeeded");
+  const app = autoComposition({ mode: "native", pressure: true });
+  assert.equal(app.ctx.compaction.config.auto, true);
+  assert.equal(app.ctx.compaction.config.maxOverflowRetries, 1);
+  for (let i = 0; i < 2; i++) {
+    const admitted = await app.step();
+    assert.equal(admitted.kind, "continue");
+    assert.match(guidanceText(admitted.messages), /Execution economy/);
+  }
+  assert.equal(compact.mock.callCount(), 2);
+  for (const call of compact.mock.calls) {
+    assert.equal(call.this, app.ctx.compaction);
+    assert.equal(call.arguments[0], app.agent);
+    assert.equal(call.arguments[1], "pressure");
+  }
+  assert.deepEqual(app.warnings, []);
+});
+
 test("resumed roots tolerate native compaction errors but propagate cancellation", async (t) => {
   const records = [];
   t.mock.method(fs, "appendFileSync", (file, line) => records.push(JSON.parse(line)));
@@ -1384,10 +1453,8 @@ test("resumed roots tolerate native compaction errors but propagate cancellation
     recordFile: "context-decisions.jsonl",
   });
   assert.equal((await app.step()).kind, "continue");
-  assert.match(
-    records.find((record) => record.kind === "context_unshrinkable").error,
-    /above threshold/,
-  );
+  assert.equal(app.warnings.length, 1);
+  assert.match(app.warnings[0], /step compaction failed: .*above threshold.*continuing the turn/);
   compact.mock.mockImplementation(async () => {
     throw new DOMException("Connection closed", "AbortError");
   });
@@ -1397,17 +1464,19 @@ test("resumed roots tolerate native compaction errors but propagate cancellation
     recordFile: "context-decisions.jsonl",
   });
   assert.equal((await native.step()).kind, "continue");
-  assert.match(
-    records.filter((record) => record.kind === "context_unshrinkable").at(-1).error,
-    /Connection closed/,
-  );
+  assert.equal(native.warnings.length, 1);
+  assert.match(native.warnings[0], /step compaction failed: Connection closed.*continuing the turn/);
   const controller = new AbortController();
   compact.mock.mockImplementation(async () => {
     controller.abort(new Error("cancelled native compaction"));
     throw controller.signal.reason;
   });
   await assert.rejects(app.step(controller.signal), /cancelled native compaction/);
-  assert.equal(records.filter((record) => record.kind === "context_unshrinkable").length, 2);
+  assert.equal(app.warnings.length, 2);
+  assert.match(app.warnings[1], /step compaction failed: cancelled native compaction.*continuing the turn/);
+  assert.equal(compact.mock.callCount(), 3);
+  for (const call of compact.mock.calls) assert.equal(call.arguments[1], "pressure");
+  assert.equal(records.filter((record) => record.kind === "context_unshrinkable").length, 0);
 });
 
 test("the economy note is appended exactly once for a root and never for a child", async (t) => {
@@ -1448,6 +1517,7 @@ test("uncommitted guidance is retried and committed guidance survives a plugin r
   assert.equal(retry.messages[0].role, "user");
   assert.deepEqual(retry.messages[0].source, { kind: "dsh-autoctx" });
   commitGuidance(app, retry.messages[0]);
+  app.handlers.clear(); // Unload the old plugin's listeners before reinstalling it.
   apply(app.ctx, app.config);
   assert.equal(guidanceText((await app.step()).messages), "");
 });
@@ -1456,14 +1526,18 @@ test("native compaction restores guidance once despite a post-replacement error"
   const app = autoComposition({ mode: "native" });
   const first = await app.step();
   commitGuidance(app, first.messages[0]);
-  app.agent.session.requestHeader = () => ({});
-  t.mock.method(BasicCompactionEngine.prototype, "compactIfNeeded", async () => {
+  app.agent.session.requestHeader = () => ({ config: { ...app.agent.options } });
+  const compact = t.mock.method(BasicCompactionEngine.prototype, "compactIfNeeded", async () => {
     app.agent.session.surface.nodes = [];
     throw new Error("compacted context remains above threshold");
   });
   const restored = await app.step();
+  assert.equal(app.warnings.length, 1);
+  assert.match(app.warnings[0], /step compaction failed: .*above threshold.*continuing the turn/);
   assert.equal(guidanceText(restored.messages), guidanceText(first.messages));
   assert.equal(restored.messages.length, 1);
+  assert.equal(compact.mock.callCount(), 1);
+  compact.mock.restore();
   commitGuidance(app, restored.messages[0]);
   app.agent.session.requestHeader = () => undefined;
   assert.equal(guidanceText((await app.step()).messages), "");
@@ -1479,7 +1553,7 @@ test("region selection requires guidance and restores its message after replacem
   events[2].type = "user/message";
   events[2].data.message = first.messages[0];
   app.config.keepRatio = 0;
-  app.agent.session.requestHeader = () => ({});
+  app.agent.session.requestHeader = () => ({ config: { ...app.agent.options } });
   const fetch = t.mock.method(globalThis, "fetch", async (url, { body }) => {
     const state = JSON.parse(JSON.parse(body).state);
     // Only the non-required output is a candidate, judged as evidence pieces.

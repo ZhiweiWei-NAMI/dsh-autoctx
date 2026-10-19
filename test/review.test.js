@@ -183,12 +183,19 @@ function reviewComposition(options = {}) {
     };
   }
   const ctx = {
+    reflect: { provide: (name, service) => { ctx[name] = service; } },
     tools: {
       guard() {},
       get: () => ({ parameters: { type: "object" } }),
     },
     on(name, fn) {
-      handlers.set(name, fn);
+      const previous = handlers.get(name);
+      handlers.set(name, previous ? (...args) => {
+        const next = args.at(-1);
+        if (typeof next === "function") return previous(...args.slice(0, -1), () => fn(...args));
+        previous(...args);
+        return fn(...args);
+      } : fn);
     },
     inject() {},
     llm: { prepareCall: async () => {} },

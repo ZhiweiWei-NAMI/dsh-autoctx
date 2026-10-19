@@ -204,6 +204,7 @@ function composition(t, overrides = {}) {
       deriveEventMessage: (event) => event.data?.message }, followup: (message) => notices.push(message) };
   agents.set("root", root);
   const ctx = {
+    reflect: { provide: (name, service) => { ctx[name] = service; } },
     on: (name, handler) => { if (!handlers.has(name)) handlers.set(name, []); handlers.get(name).push(handler); }, inject() {},
     tools: { register: (tool) => tools.set(tool.name, tool), guard: (guard) => guards.push(guard), get: (name) => tools.get(name) },
     agents: { get: (id) => agents.get(id) },
@@ -230,7 +231,8 @@ function composition(t, overrides = {}) {
     maxConcurrent: 2, maxDecisions: 0, apiKey: "", adaptiveEffort: "high", reviewerModel: "auto",
     reviewBeforeFinish: true, advisorModel: "auto", economyGuidance: true, recordFile: "fake.jsonl", ...overrides });
   const preStep = (agent = root, turn = 1, next = async () => ({ kind: "continue", messages: [] })) =>
-    handlers.get("agent/pre-step")[0]({ agent, turn, messages: [], signal }, next);
+    handlers.get("agent/pre-step").reduceRight((next, handler) =>
+      () => handler({ agent, turn, messages: [], signal }, next), next)();
   return { root, ctx, tools, guards, notices, starts, handlers, preStep, records, agents, signal,
     async invoke(name, args, agent = root) {
       let concluded = false;

@@ -2359,6 +2359,20 @@ export function apply(ctx, options) {
 
   const injectingCompactions = new Set();
   class JevCompaction extends BasicCompactionEngine {
+    async compactIfNeeded(agent, reason, signal) {
+      // Keep the existing final child request available for its result report.
+      if (reason === "pressure" && agent.session.header.parentSession !== undefined) {
+        const id = agent.session.id, plan = config.mode === "plan";
+        const used = plan ? planDispatcher.childRequests(id) : (turnRequests.get(id) ?? 0);
+        const cap = plan ? (config.planChildRequests ?? 16) : reviewChildren.has(id) ? config.reviewMaxRequests :
+          advisorChildren.has(id) ? 1 : config.maxChildTurnRequests;
+        if (used >= cap - 1 || (!plan && budget(rootOf(agent)).childRequests >= config.maxChildRequests - 1))
+          return null;
+      }
+      if (this.config.retainTokens !== config.retainTokens)
+        this.config = { ...this.config, retainTokens: config.retainTokens };
+      return super.compactIfNeeded(agent, reason, signal);
+    }
     async compactRegion(start, end, agent, signal) {
       injectingCompactions.add(agent.session.id);
       try { return await super.compactRegion(start, end, agent, signal); }
@@ -2371,23 +2385,6 @@ export function apply(ctx, options) {
         : super.summarize(input, agent, signal);
     }
   }
-  const createCompactor = () =>
-    new JevCompaction(ctx, {
-      auto: false,
-      thresholdRatio: config.nativeThresholdRatio,
-      retainTokens: config.retainTokens,
-      compactionRetries: 0,
-      maxOverflowRetries: 0,
-    });
-  // Built on first use (one Service for the plugin's life); a saved retainTokens is applied in place.
-  let compactor;
-  const getCompactor = () => {
-    compactor ??= createCompactor();
-    if (compactor.config.retainTokens !== config.retainTokens)
-      compactor.config = { ...compactor.config, retainTokens: config.retainTokens };
-    return compactor;
-  };
-
   const advisorFor = (root) => {
     if (!advisorState.has(root))
       advisorState.set(root, { key: undefined, consults: 0, stallDone: false, failures: new Set() });
@@ -2587,13 +2584,6 @@ export function apply(ctx, options) {
       } else {
         await planDispatcher.startReady(agent, signal);
       }
-      if (!finalRequest && agent.session.requestHeader() !== undefined) {
-        try { await getCompactor().compactIfNeeded(agent, "pressure", signal); }
-        catch (error) {
-          if (signal.aborted) throw error;
-          record({ kind: "context_unshrinkable", session: id, error: String(error) });
-        }
-      }
       if (isChild) {
         const used = planDispatcher.childRequests(id), cap = config.planChildRequests ?? 16;
         if (used >= cap) throw new Error("Plan child request budget exhausted.");
@@ -2766,17 +2756,8 @@ export function apply(ctx, options) {
         }
       }
     }
-    if (!finalRequest && agent.session.requestHeader() !== undefined) {
-      // A native compaction in this step rewrites the prefix, so its ledger can follow immediately.
-      if (modeOf(agent) !== "auto") {
-        try {
-          await getCompactor().compactIfNeeded(agent, "pressure", signal);
-        } catch (error) {
-          if (signal.aborted) throw error;
-          record({ kind: "context_unshrinkable", session: id, error: String(error) });
-        }
-      } else await selectUnderPressure(agent, signal);
-    }
+    if (!finalRequest && agent.session.requestHeader() !== undefined && modeOf(agent) === "auto")
+      await selectUnderPressure(agent, signal);
     const admitted = await next();
     if (admitted.kind === "reject") return admitted;
     graphSteps.set(id, graphStep(id) + 1);
@@ -2784,6 +2765,15 @@ export function apply(ctx, options) {
     if (!isChild) admittedMessages.set(id, withNotes.messages ?? []);
     return withNotes;
   });
+  // Register after AutoCTX admission so Jev selection runs before the native capacity guard.
+  // Eager registration also covers overflow on the first model request.
+  const compactor = new JevCompaction(ctx, {
+    auto: true,
+    thresholdRatio: config.nativeThresholdRatio,
+    retainTokens: config.retainTokens,
+    compactionRetries: 0,
+  });
+
   ctx.on("llm/stream", async function* (options, next) {
     const agent = options.sessionId ? ctx.agents.get(options.sessionId) : undefined;
     if (agent && config.mode === "plan" && agent.session.header.parentSession !== undefined) {
@@ -3153,7 +3143,7 @@ export function apply(ctx, options) {
     const compactRegion = async (reason, regionEnd = fullEnd) => {
       signal.throwIfAborted();
       try {
-        const result = await getCompactor().compactRegion(
+        const result = await compactor.compactRegion(
           nodes[start],
           nodes[regionEnd],
           agent,

@@ -1,12 +1,18 @@
 # dsh-autoctx
 
-面向 dsh 的上下文与子代理决策插件，版本 **1.2.6**。Jev 负责评分和结构化选择，插件通过 dsh 原生会话、工具、子代理和压缩执行决策；编码仍由执行模型完成。
+面向 dsh 的上下文与子代理决策插件，版本 **1.2.7**。Jev 负责评分和结构化选择，插件通过 dsh 原生会话、工具、子代理和压缩执行决策；编码仍由执行模型完成。
 
 [English](https://github.com/ZhiweiWei-NAMI/dsh-autoctx/blob/main/README.en.md) · [源码](https://github.com/ZhiweiWei-NAMI/dsh-autoctx) · MIT
 
 1.2.6 新增显式计划调度 `mode: plan`，路由学习独立存储；DSH `openai-codex` 路由的 GPT 系列可作为允许的备选模型，费用按目录价理论估算；`auto` 模式下新建的路由委派子代理继承父代理当前回合已闭合步骤并收到继承上下文说明；跟踪委派归属与父代理对结果的接收；先验覆盖也用于配置路由的能力文本。
 
 **1.2.6 评测结论：** 在本次固定样本中，`deepseek-v4.1-flash` 配合 AutoCTX 通过官方评测 **18/24（75.0%）**，单代理为 **14/24（58.3%）**、原生子代理为 **13/24（54.2%）**，分别多解决 **4、5 个案例**。`gpt-6.1-sol` 三组解决相同的 18 个案例，AutoCTX 相对原生子代理的理论费用约低 37%，但仍比单代理贵。DeepSeek 的配对差异未达统计显著性，且存在基础设施重跑；这不是普遍更强或更省钱的证明，详见下方基准与限制。
+
+## 1.2.7 运行时修复
+
+恢复原生压缩服务的模型容量检查与上下文溢出恢复；服务在首次请求前注册，提供方确认上下文超窗后最多压缩重试一次。Jev 上下文选择先执行，随后原生容量安全检查仍可能覆盖暂缓替换的决定；未改 Jev 评分、路由、学习规则和前端。原生组合回归验证了真实 Session 替换、请求缩短、当前用户指令保留与重试上限；摘要使用固定模型夹具，不证明旧历史事实的保留质量或完整 AgentLoop 任务成功，未重跑下方 1.2.6 基准。
+
+**插件 active 不等于自动模式开启。** `mode: native` 明确停用 AutoCTX 自动决策；`learning: auto` 只控制学习，不会开启执行模式。启用自动决策需要 `mode: auto`、有效 Jev key，以及非 native 的会话策略。升级不会修改这些显式设置。新输入在 pre-step 后才写入会话，首次超大请求依赖溢出恢复；极小模型窗口可能无法满足原生预压缩余量，因此不保证所有请求都能提前缩到窗口内。
 
 ## 环境与所需账号
 
@@ -30,12 +36,10 @@
 
    需要 headless profile 时，首次创建命令中的模板改为 `headless`。自定义 profile 启动时使用 `dsh --profile autoctx ...`。
 
-2. 从 npm 安装，或选择 GitHub 发布标签来源。
+2. 安装 GitHub 1.2.7 发布标签。本次只发布 GitHub；npm 的已发布版本仍为 1.2.6。
 
    ```sh
-   dsh plugin --profile autoctx add dsh-autoctx@1.2.6
-   # 或使用发布标签
-   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.6
+   dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.7
    ```
 
    `dsh plugin --profile <name> <pnpm-args...>` 把参数传给 pnpm。Profile 位于 `$DSH_HOME/profiles/<name>`。包声明的 dsh bundle patch（`cordis.patch.yml`）会挂载插件并停用原生 `compaction-basic`，无需手工重复挂载。
@@ -60,12 +64,10 @@
 dsh --profile autoctx --patch "$DSH_HOME/profiles/autoctx/node_modules/dsh-autoctx/off.patch.yml"
 ```
 
-升级到最新版，或固定到本版本：
+升级或固定到本 GitHub 版本：
 
 ```sh
-dsh plugin --profile autoctx add dsh-autoctx@latest
-# 或固定版本
-dsh plugin --profile autoctx add dsh-autoctx@1.2.6
+dsh plugin --profile autoctx add github:ZhiweiWei-NAMI/dsh-autoctx#v1.2.7
 ```
 
 卸载前，先删除自己在 profile 的 `cordis.patch.yml` 中添加的 `- id: dsh-autoctx` 覆盖项，再执行：
@@ -323,4 +325,4 @@ python3 bench/theoretical_cost.py "A=<dir>/*/A" "B=<dir>/*/B" "C=<dir>/*/C"
 
 ## 从旧版本升级
 
-按上面的升级步骤安装 1.2.6，并对照当前配置表检查 profile 覆盖项。不要沿用旧 README 中的默认模型或安装标签；当前默认是计费的 `jev-1.13`，发布标签为 `v1.2.6`。
+按上面的升级步骤安装 1.2.7，并对照当前配置表检查 profile 覆盖项。不要沿用旧 README 中的默认模型或安装标签；当前默认是计费的 `jev-1.13`，发布标签为 `v1.2.7`。
