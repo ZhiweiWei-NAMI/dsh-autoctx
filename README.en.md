@@ -6,6 +6,8 @@ Context and subagent decision plugin for dsh, version **1.2.6**. Jev scores opti
 
 1.2.6 adds explicit plan dispatch (`mode: plan`) with separately stored route learning; DSH GPT-family models on `openai-codex` as allowed alternatives with theoretical list-price cost; closed-step seeds from the parent's current turn and an inherited-context note for newly routed delegation children in `auto` mode; routed delegation ownership and parent result-consumption tracking; and prior overrides for configured-route capability text.
 
+**1.2.6 evaluation takeaway:** On this fixed sample, `deepseek-v4.1-flash` with AutoCTX passed official grading on **18/24 cases (75.0%)**, versus **14/24 (58.3%)** for a single agent and **13/24 (54.2%)** for native subagents: **4 and 5 more resolved cases**, respectively. All three `gpt-6.1-sol` arms resolved the same 18 cases; AutoCTX had about 37% lower theoretical cost than native subagents, but still cost more than a single agent. The DeepSeek paired differences were not statistically significant, and infra reruns occurred; this is not proof of general superiority or savings. See the benchmark and limitations below.
+
 ## Environment and accounts
 
 Unit tests pass on **dsh `0.2.0-rc.2` and `0.2.1-rc.2`**, using Node 22; the new 1.2.6 benchmark below ran on **dsh `0.2.1-rc.2`**, the earlier 1.2.5 benchmark on `0.2.0-rc.2`, and real smoke runs were verified on `0.2.1-rc.2`. Peer dependencies for the `@deepseek-ai/dsh-*` packages accept `^0.1.5-rc.1 || ^0.2.0-rc.1 || ^0.2.1-rc.1`. The plugin decides thinking/effort at decision points per trigger, using evidence and a cost estimate per option, as detailed under “How it works”; compatibility with dsh 0.2.1's subagent start API (`startActivation`) and 0.2.0 is kept. The npm package is `dsh-autoctx`, its entry is `index.js`, and its web client is `./client.js`.
@@ -136,7 +138,7 @@ A transient Jev gateway/network failure is retried once, then Jev pauses for 60 
 - `auto` (BETA, off by default): applies bounded updates automatically.
 - `manual`: collects proposals into one approval card.
 
-Automatic learning is expected to maintain quality while lowering cost over time, but that has not been demonstrated; auto did not outperform frozen in the earlier 1.2.5 evaluation below.
+Automatic learning is expected to maintain quality while lowering cost over time, but that has not been demonstrated. The **1.2.6 evaluation below used `frozen` learning**: the additional DeepSeek cases resolved reflect the AutoCTX decision mechanism on that sample, not gains from automatic learning. Auto did not outperform frozen in the earlier 1.2.5 evaluation.
 
 ## Extra calls and cost
 
@@ -196,9 +198,13 @@ GPT A was faster than B in 5/24 pairs. Sensitivity excluding any pair where eith
 | GPT A vs B | 0 | +0.037 [+0.014, +0.064] | Resolved outcomes remain identical |
 | GPT A vs C | 0 | −0.135 [−0.182, −0.093] | A cheaper in 16/16 pairs |
 
-With `deepseek-v4.1-flash`, AutoCTX resolved more cases (18 vs 14 and 13), but the paired differences are not statistically significant at 24 cases (p=0.22 and 0.063); without rerun pairs the difference against B shrinks (+0.11 over 13 pairs) and the one against C stays similar (+0.22, p=0.25). Theoretical cost per case is about 2.8× B and 1.25× C; per resolved case it is cheaper than C and about 2× B. Many DeepSeek cases hit the 600-second timeout in every arm.
+#### 1.2.6 conclusions
 
-With `gpt-6.1-sol`, all three arms resolved the same 18 cases. AutoCTX costs about 37% less than native subagents C (cheaper in 24/24 pairs) at similar wall time; it costs about 40% more than single-agent B and is about 30 seconds slower on average. This is one set of 12 pytest tasks, 2 executors and 2 repeats, with the infra reruns above, not evidence of general superiority.
+**DeepSeek: more resolved cases on this sample, not generally lower cost.** With `deepseek-v4.1-flash`, AutoCTX achieved **18/24 officially resolved cases (75.0%)**, versus **14/24 (58.3%)** for single-agent B and **13/24 (54.2%)** for native-subagent C: net gains of **4 and 5 cases**, or **16.7 and 20.8 percentage points**. Resolved means passing official tests, not finishing the solver run normally; even a timed-out run can leave a passing patch. The paired differences at 24 cases are not statistically significant (p=0.22 and 0.063). Without rerun pairs, the difference against B shrinks (13 pairs, task-mean difference +0.11), while the one against C stays similar (+0.22, p=0.25). Theoretical cost per case is about 2.8× B and 1.25× C; per resolved case it is about 10% cheaper than C but about 2.1× B. Many DeepSeek cases hit the 600-second timeout in every arm.
+
+**GPT: identical resolved outcomes, lower cost than native subagents.** With `gpt-6.1-sol`, all three arms resolved the same **18/24 cases (75.0%)**; no resolved-rate gain was observed. AutoCTX costs about 37% less than native subagents C (cheaper in 24/24 pairs) at similar wall time; it costs about 40% more than single-agent B and is about 30 seconds slower on average.
+
+**Scope:** These are 1.2.6 observations on 12 fixed pytest tasks, 2 executors and 2 repeats, including the infra reruns above. Costs are theoretical, with the additional missing-usage limitation for GPT A. They do not generalize to all DeepSeek/GPT models. Nor can a direct subtraction from the earlier 1.2.5 results establish a version gain: the host, executor mix, request budget and cost accounting differ.
 
 ### 1.2.5 on dsh 0.2.0-rc.2, request cap 64 including Jev (earlier evaluation)
 
@@ -235,7 +241,7 @@ With the `log` method applied to every arm, the theoretical total is $1.547 for 
 
 AutoCTX resolves more cases than B, C and H on this sample and costs more; on theoretical cost, 1.2.5 frozen is about 70–80% more than C overall and ~48% more per resolved case. Comparing 1.2.5 with 1.2.3 frozen, lane-matched and `exact`: 53 vs 52 resolved (6 wins / 5 losses, no quality difference); theoretical total cost is down 4.0% ($1.738 vs $1.810), theoretical executor cache rate is 87.0% vs 85.4%, and theoretical Jev cost is up $0.006.
 
-1.2.5 effort decisions across 72 cases: 201 cheap (no Jev call), 86 skip, 51 phase, 9 pulse, 11 after context replacement, and 11 fell back after the effort budget was spent; 19 cases reached the 64-request limit (1.2.3: 18). The limit counts Jev calls, so AutoCTX reaches it with fewer executor requests than the baselines: 10 of those 19 cases were unresolved, and Jev made 77 of their 640 requests (12%). B/C/H also hit the limit (17/20/16 cases), with executor requests only. This benchmark keeps the shared limit; a rerun excluding Jev from it has not been done.
+1.2.5 effort decisions across 72 cases: 201 cheap (no Jev call), 86 skip, 51 phase, 9 pulse, 11 after context replacement, and 11 fell back after the effort budget was spent; 19 cases reached the 64-request limit (1.2.3: 18). The limit counts Jev calls, so AutoCTX reaches it with fewer executor requests than the baselines: 10 of those 19 cases were unresolved, and Jev made 77 of their 640 requests (12%). B/C/H also hit the limit (17/20/16 cases), with executor requests only. This historical evaluation retains that shared limit; it was not rerun under the original configuration with only Jev accounting changed. The 1.2.6 evaluation above uses a 256 execution-request cap excluding Jev, but is not that single-variable comparison.
 
 | Executor (24 cases per model per arm; resolved / 24) | AutoCTX 1.2.5 frozen | AutoCTX 1.2.3 frozen | AutoCTX 1.2.3 auto | B | C | H |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
